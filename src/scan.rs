@@ -57,7 +57,9 @@ impl Agg {
             .collect();
         let bucket_junk = lower.iter().any(|c| c == "node_modules");
         let bucket_target = lower.iter().any(|c| c == "target" || c == "deriveddata");
-        let bucket_other = lower.iter().any(|c| BUILD_DIRS.contains(&c.as_str()));
+        let bucket_other = lower
+            .iter()
+            .any(|c| BUILD_DIRS.contains(&c.as_str()) || c == ".git");
 
         if bucket_junk {
             self.nm += len;
@@ -152,13 +154,13 @@ fn count_lines(path: &Path) -> u64 {
     total
 }
 
-/// Walk one project folder with `ignore`, in parallel. Ignore files are off on purpose:
-/// the disk-footprint story needs node_modules and target counted, and line counting is
-/// gated by extension and size anyway, so junk never gets read.
+/// Walk one project folder with `ignore`, in parallel. Nothing is filtered: hidden files
+/// (`.git` history) and ignored files (`node_modules`, `target`) are real bytes on disk, and
+/// line counting is gated by extension and size anyway, so junk never gets read.
 fn walk_project(dir: &Path) -> Agg {
     let agg = std::sync::Mutex::new(Agg::default());
     let mut builder = ignore::WalkBuilder::new(dir);
-    builder.hidden(true).git_ignore(false).git_global(false).ignore(false).threads(4);
+    builder.hidden(false).git_ignore(false).git_global(false).ignore(false).threads(4);
     builder.build_parallel().run(|| {
         let agg = &agg;
         Box::new(move |entry| {

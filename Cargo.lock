@@ -2466,6 +2466,7 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "rune",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

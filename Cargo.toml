@@ -7,6 +7,9 @@ edition = "2024"
 rune = { path = "../rune/crates/rune" } # pinned to rune dev rev 14eb362e4e56aadf9b64c82640417ab0c9da5fe0
 ignore = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 # Rune requires these vendor patches (its [patch] doesn't cross workspaces).
 [patch.crates-io]
 wgpu-hal = { path = "../rune/vendor/wgpu-hal" }

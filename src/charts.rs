@@ -2,7 +2,6 @@
 
 use rune::{Color, Shape};
 
-use crate::model::gb;
 
 pub struct Tile {
     pub name: String,

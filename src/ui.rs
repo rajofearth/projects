@@ -15,6 +15,11 @@ const INNER_W: f32 = CONTENT_W - 32.0;
 const MAP_H: f32 = 300.0;
 const SCATTER_H: f32 = 300.0;
 
+/// Figures and meta set in the mono face: tabular by nature, one format everywhere.
+fn mono_fig(size: f32) -> TextStyle {
+    TextStyle::new(size, 400.0).mono()
+}
+
 fn label(s: &str, c: Color) -> El {
     text(s.to_string()).font(type_::SECTION).color(c)
 }
@@ -28,9 +33,9 @@ fn card(t: &tok::Theme, title: &str, sub: &str, content: El) -> El {
         .w_full()
         .fill(t.card)
         .border(1.0, t.card_border)
-        .radius(10.0)
+        .radius(12.0)
         .px(16.0)
-        .py(14.0)
+        .py(16.0)
         .gap(8.0)
         .child(label(title, t.text))
         .child(caption(sub, t.text_secondary))
@@ -42,10 +47,10 @@ fn kpi(value: &str, name: &str, sub: &str, t: &tok::Theme) -> El {
         .grow(1.0)
         .fill(t.card)
         .border(1.0, t.card_border)
-        .radius(10.0)
+        .radius(12.0)
         .px(12.0)
-        .py(10.0)
-        .child(text(value.to_string()).font(TextStyle::new(19.0, 700.0)).color(t.text))
+        .py(12.0)
+        .child(text(value.to_string()).font(TextStyle::new(19.0, 600.0).mono()).color(t.text))
         .child(text(name.to_string()).font(TextStyle::new(10.0, 500.0)).color(t.text_secondary))
         .child(caption(sub, t.text_secondary))
 }
@@ -141,10 +146,27 @@ fn header(s: &State, t: &tok::Theme) -> El {
         format!("{n} folders · not scanned yet")
     };
 
+    let subtitle_row = if s.scanning {
+        // The signature detail: a live pulse while the scan runs, still the moment it ends.
+        row()
+            .gap(6.0)
+            .items_center()
+            .child(
+                el()
+                    .size(6.0, 6.0)
+                    .radius(3.0)
+                    .fill(tok::accent(0, true))
+                    .looping(rune::LoopSpec::opacity(1.6, 0.0, 0.3, 1.0)),
+            )
+            .child(text(subtitle).font(TextStyle::new(11.5, 400.0)).color(t.text_secondary))
+    } else {
+        row().child(text(subtitle).font(TextStyle::new(11.5, 400.0)).color(t.text_secondary))
+    };
+
     let mut left = col()
         .gap(2.0)
-        .child(text(format!("State of {}", s.root)).font(TextStyle::new(15.0, 650.0)).color(t.text))
-        .child(text(subtitle).font(TextStyle::new(11.5, 400.0)).color(t.text_secondary));
+        .child(text(format!("State of {}", s.root)).font(TextStyle::new(15.0, 600.0)).color(t.text))
+        .child(subtitle_row);
 
     if let Some(err) = &s.error {
         left = left.child(text(err.clone()).font(type_::SECTION).color(rune::color::hex("#ef4444").unwrap()));
@@ -155,7 +177,7 @@ fn header(s: &State, t: &tok::Theme) -> El {
         .role("button")
         .label("Rescan")
         .cursor(Cursor::Pointer)
-        .h(26.0)
+        .h(28.0)
         .px(12.0)
         .radius(6.0)
         .fill(t.control_off)
@@ -218,7 +240,7 @@ fn treemap(ps: &[Project], t: &tok::Theme) -> El {
         if show_size {
             inner = inner.child(
                 text(gb(tile.bytes))
-                    .font(TextStyle::new((fs - 3.0).max(7.0), 400.0))
+                    .font(mono_fig((fs - 3.0).max(7.0)))
                     .color(t.text_secondary),
             );
         }
@@ -235,7 +257,7 @@ fn treemap(ps: &[Project], t: &tok::Theme) -> El {
         );
     }
 
-    let mut legend = row().w_full().flex_wrap().gaps(4.0, 11.0);
+    let mut legend = row().w_full().flex_wrap().gaps(4.0, 12.0);
     let mut cats: Vec<(&str, usize)> = Vec::new();
     for p in ps {
         match cats.iter_mut().find(|(c, _)| *c == p.cat) {
@@ -273,7 +295,7 @@ fn lang_bars(ps: &[Project], t: &tok::Theme) -> El {
         col_ = col_.child(
             row()
                 .w_full()
-                .gap(6.0)
+                .gap(8.0)
                 .items_center()
                 .child(text(lang.clone()).font(TextStyle::new(9.5, 400.0)).color(t.text).w(96.0))
                 .child(
@@ -282,9 +304,9 @@ fn lang_bars(ps: &[Project], t: &tok::Theme) -> El {
                         .grow(*lines as f32 / max as f32)
                         .min_w(2.0)
                         .radius(3.0)
-                        .fill(lang_color_or(lang)),
+                        .fill(lang_color_or(lang).alpha(0.8)),
                 )
-                .child(text(format!("{pct:.1}%")).font(TextStyle::new(8.5, 400.0)).color(t.text_secondary).w(46.0)),
+                .child(text(format!("{pct:.1}%")).font(mono_fig(8.5)).color(t.text_secondary).w(46.0)),
         );
     }
     col_
@@ -320,7 +342,7 @@ fn pulse_donut(t: &Totals, theme: &tok::Theme) -> El {
         ("over a year", t.stale, "#ef4444"),
         ("no git", t.no_git, "#64748b"),
     ];
-    let mut legend = row().w_full().flex_wrap().gaps(4.0, 11.0);
+    let mut legend = row().w_full().flex_wrap().gaps(4.0, 12.0);
     for (name, n, hex) in labels {
         legend = legend.child(
             row()
@@ -344,7 +366,7 @@ fn pulse_donut(t: &Totals, theme: &tok::Theme) -> El {
                         .absolute(cx - 40.0, cy - 18.0)
                         .w(80.0)
                         .items_center()
-                        .child(text(fmt(t.folders as u64)).font(TextStyle::new(26.0, 700.0)).color(theme.text))
+                        .child(text(fmt(t.folders as u64)).font(TextStyle::new(26.0, 600.0).mono()).color(theme.text))
                         .child(text("folders").font(TextStyle::new(9.0, 400.0)).color(theme.text_secondary)),
                 ),
         )
@@ -378,7 +400,7 @@ fn scatter(ps: &[Project], t: &tok::Theme) -> El {
         parts.push(el().absolute(x, TOP).w(1.0).h(ih).fill(t.separator));
         parts.push(
             text(if d == 660 { "660+".to_string() } else { d.to_string() })
-                .font(TextStyle::new(9.0, 400.0))
+                .font(mono_fig(9.0))
                 .color(t.text_secondary)
                 .absolute(x - 12.0, TOP + ih + 4.0)
                 .w(24.0)
@@ -393,7 +415,7 @@ fn scatter(ps: &[Project], t: &tok::Theme) -> El {
         parts.push(el().absolute(L, y).w(iw).h(1.0).fill(t.separator));
         parts.push(
             text(if v >= 1000 { format!("{}k", v / 1000) } else { v.to_string() })
-                .font(TextStyle::new(9.0, 400.0))
+                .font(mono_fig(9.0))
                 .color(t.text_secondary)
                 .absolute(0.0, y - 5.0)
                 .w(L - 6.0)
@@ -454,7 +476,7 @@ fn composition(ps: &[Project], t: &tok::Theme) -> El {
         ("target", "#ef4444"),
         ("other", "#64748b"),
     ];
-    let mut rows = col().w_full().gap(5.0);
+    let mut rows = col().w_full().gap(4.0);
     for p in &top {
         let mut seg = row().h(16.0).grow(1.0).gap(1.0);
         for (key, hex) in parts {
@@ -484,11 +506,11 @@ fn composition(ps: &[Project], t: &tok::Theme) -> El {
                 .items_center()
                 .child(text(p.name.clone()).font(TextStyle::new(9.5, 400.0)).color(t.text).w(150.0))
                 .child(seg)
-                .child(text(format!("{:.1}", gib(p.bytes))).font(TextStyle::new(9.0, 400.0)).color(t.text_secondary).w(44.0)),
+                .child(text(format!("{:.1}", gib(p.bytes))).font(mono_fig(9.0)).color(t.text_secondary).w(44.0)),
         );
     }
     let total = |key: &str| ps.iter().map(|p| match key { "src" => p.src, "nm" => p.nm, "target" => p.target, _ => p.other }).sum::<u64>();
-    let mut legend = row().w_full().flex_wrap().gaps(4.0, 11.0);
+    let mut legend = row().w_full().flex_wrap().gaps(4.0, 12.0);
     for (key, hex) in parts {
         legend = legend.child(
             row()
@@ -575,9 +597,9 @@ fn insights(ps: &[Project], t: &Totals, theme: &tok::Theme) -> El {
                     .grow(1.0)
                     .fill(theme.card)
                     .radius(8.0)
-                    .px(11.0)
-                    .py(10.0)
-                    .gap(3.0)
+                    .px(12.0)
+                    .py(12.0)
+                    .gap(4.0)
                     .child(text(head.clone()).font(TextStyle::new(11.5, 500.0)).color(theme.text))
                     .child(text(body.clone()).font(TextStyle::new(10.5, 400.0)).color(theme.text_secondary)),
             );
@@ -587,26 +609,41 @@ fn insights(ps: &[Project], t: &Totals, theme: &tok::Theme) -> El {
     col().w_full().gap(8.0).children(rows)
 }
 
+// ---- footer ----
+
+fn footer(s: &State, t: &tok::Theme) -> El {
+    let mut line = row().w_full().gap(8.0).items_center();
+    // Gauges appear once sampled; demo snapshots never show placeholder dashes.
+    let engine = s.engine_line();
+    if !engine.is_empty() {
+        line = line.child(text(engine).font(mono_fig(10.0)).color(t.text_secondary));
+    }
+    line.child(caption("auto-rescans every 5 min", t.text_secondary))
+}
+
 // ---- view ----
 
 pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
     let t = tok::theme(true);
     let tt = totals(&s.projects);
 
+    // Before the first scan lands, the figures read as dashes, not zeros.
+    let has = !s.projects.is_empty();
+    let fig = |v: String| if has { v } else { "—".to_string() };
     let kpis = [
-        kpi(&format!("{:.1} GiB", gib(tt.bytes)), "on disk", &format!("{} files", fmt(tt.files)), &t),
-        kpi(&format!("{:.2}M", tt.loc as f64 / 1e6), "lines of code", "vendored excluded", &t),
-        kpi(&fmt(tt.commits), "commits", &format!("{} git repos", tt.repos), &t),
-        kpi(&fmt(tt.folders as u64), "folders", &format!("{} without git", tt.no_git), &t),
-        kpi(&fmt(tt.dirty), "uncommitted files", "work in progress", &t),
-        kpi(&fmt(tt.active as u64), "active in 30 days", &format!("{} dormant, {} stale", tt.dormant, tt.stale), &t),
+        kpi(&fig(format!("{:.1} GiB", gib(tt.bytes))), "on disk", &fig(format!("{} files", fmt(tt.files))), &t),
+        kpi(&fig(format!("{:.2}M", tt.loc as f64 / 1e6)), "lines of code", "vendored excluded", &t),
+        kpi(&fig(fmt(tt.commits)), "commits", &fig(format!("{} git repos", tt.repos)), &t),
+        kpi(&fig(fmt(tt.folders as u64)), "folders", &fig(format!("{} without git", tt.no_git)), &t),
+        kpi(&fig(fmt(tt.dirty)), "uncommitted files", "work in progress", &t),
+        kpi(&fig(fmt(tt.active as u64)), "active in 30 days", &fig(format!("{} dormant, {} stale", tt.dormant, tt.stale)), &t),
     ];
     let kpi_rows = row().w_full().gap(8.0).children(kpis.iter().take(3).cloned().collect::<Vec<El>>());
     let kpi_rows2 = row().w_full().gap(8.0).children(kpis.iter().skip(3).cloned().collect::<Vec<El>>());
 
     let content = col()
         .w(CONTENT_W)
-        .gap(14.0)
+        .gap(16.0)
         .child(header(s, &t))
         .child(kpi_rows)
         .child(kpi_rows2)
@@ -621,7 +658,14 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
         .child(card(&t, "Momentum map", "Left = recently touched, up = more code, bubble size = disk footprint. Dashed line = one year stale.", scatter(&s.projects, &t)))
         .child(card(&t, "What the bytes actually are", "Top 10 folders: real content vs regenerable build junk.", composition(&s.projects, &t)))
         .child(insights(&s.projects, &tt, &t))
-        .child(caption("Auto-rescans every 5 minutes · built with Rune", t.text_secondary));
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(text(s.engine_line()).font(mono_fig(10.0)).color(t.text_secondary))
+                .child(caption("· auto-rescans every 5 min", t.text_secondary)),
+        );
 
     col()
         .w_full()
@@ -635,7 +679,7 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .scroll(ScrollSpec { stick_bottom: false })
                 .items_center()
-                .py(20.0)
+                .py(24.0)
                 .child(content),
         )
 }

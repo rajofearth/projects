@@ -16,10 +16,19 @@ cargo run -p projects-stats -- --scene demo # deterministic fixture, no scanning
 
 The window opens and a background scan starts immediately; projects fill in as they finish.
 It auto-rescans every 5 minutes, and the Rescan button forces one. The scan walks every folder
-in parallel (8 workers), buckets bytes into source / `node_modules` / `target` / other build
-output, counts hand-written lines by extension (code files < 256 KiB only), and asks git for
-commits, last-commit age and dirty-file counts. Measured on this machine: 88 folders, 58 GiB,
-2.7 M LOC in ~5 s warm (~30 s cold).
+in parallel (8 workers, hidden files included — `.git` history is real disk usage), buckets
+bytes into source / `node_modules` / `target` / other build output (`.git` lands in other),
+counts hand-written lines by extension (code files < 256 KiB only), and asks git for commits,
+last-commit age and dirty-file counts. Measured on this machine: 88 folders, 82.0 GiB
+(verified against robocopy's 88,039,170,366 bytes), 2.97 M LOC in ~13 s.
+
+## Footprint
+
+- Frame CPU p50 2.4 ms / p95 3.0 ms (headless, 768 instances) against a 16.6 ms budget
+- Idle: 0.0% CPU — Rune draws nothing when nothing changes; gauge commits only fire when a
+  displayed fps/ram value actually changes
+- 128 MB working set at rest, ~175 MB peak while scanning
+- Footer shows live `fps · MB · scan` in mono, sampled once a second
 
 ## Check headlessly
 

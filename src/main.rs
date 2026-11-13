@@ -32,6 +32,12 @@ pub struct State {
     pub waker: Option<Waker>,
     /// The `demo` scene: fixture data, no live scanning.
     pub demo: bool,
+    /// Frames per second over the last whole second of app clock.
+    pub fps: f32,
+    /// This process's working set, sampled once a second.
+    pub ram_bytes: u64,
+    fps_frames: u32,
+    fps_since: f64,
 }
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
@@ -53,7 +59,27 @@ impl State {
             rx: None,
             waker: None,
             demo: false,
+            fps: 0.0,
+            ram_bytes: 0,
+            fps_frames: 0,
+            fps_since: 0.0,
         }
+    }
+
+    /// The footer's engine line: fps, resident memory, last scan duration.
+    pub fn engine_line(&self) -> String {
+        let fps = if self.fps >= 1.0 { format!("{:.0} fps", self.fps) } else { "— fps".into() };
+        let ram = if self.ram_bytes > 0 {
+            format!("{:.0} MB", self.ram_bytes as f64 / 1048576.0)
+        } else {
+            "— MB".into()
+        };
+        let scan = if self.scan_secs > 0.0 {
+            format!("scan {}", crate::charts::scan_time(self.scan_secs))
+        } else {
+            "scan —".into()
+        };
+        format!("{fps} · {ram} · {scan}")
     }
 
     fn load_demo(&mut self) {
@@ -126,12 +152,63 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
 
 fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
     let mut changed = s.drain(clock);
+
+    // Engine gauges: fps over each whole second of app clock, ram sampled with it. The
+    // footer only commits when a displayed value actually changes, so a steady frame
+    // rate costs nothing.
+    s.fps_frames += 1;
+    let elapsed = clock - s.fps_since;
+    if elapsed >= 1.0 {
+        let fps = (s.fps_frames as f32 / elapsed as f32).round();
+        let ram = process_ram() / 1048576;
+        s.fps_frames = 0;
+        s.fps_since = clock;
+        let fps_shown = s.fps as u32;
+        let ram_shown = s.ram_bytes / 1048576;
+        if fps != fps_shown as f32 || ram != ram_shown {
+            s.fps = fps;
+            s.ram_bytes = ram * 1048576;
+            changed = true;
+        }
+    }
+
     // Live: rescan every five minutes (demo data never rescans).
     if !s.scanning && !s.demo && s.last_done.is_none_or(|t| clock - t >= RESCAN_EVERY) {
         s.request_scan();
         changed = true;
     }
     changed
+}
+
+/// Working set of this process, via GetProcessMemoryInfo.
+#[cfg(windows)]
+fn process_ram() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut pmc = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        PageFaultCount: 0,
+        PeakWorkingSetSize: 0,
+        WorkingSetSize: 0,
+        QuotaPeakPagedPoolUsage: 0,
+        QuotaPagedPoolUsage: 0,
+        QuotaPeakNonPagedPoolUsage: 0,
+        QuotaNonPagedPoolUsage: 0,
+        PagefileUsage: 0,
+        PeakPagefileUsage: 0,
+    };
+    unsafe {
+        if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+            pmc.WorkingSetSize as u64
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn process_ram() -> u64 {
+    0
 }
 
 /// "13 Nov 14:32" from the wall clock (UTC).
@@ -177,6 +254,9 @@ fn main() {
         scenes: &[("demo", State::load_demo)],
         setup: Some(setup),
         poll: Some(poll),
+        // The mono slot is the platform's monospaced UI font: Cascadia Mono on Windows.
+        // Every figure and axis label sets in it, tabular by nature.
+        families: ("Inter", "ui-monospace"),
         ..AppSpec::new("Projects — Live Stats", (1100.0, 780.0), State::new, view)
     });
 }
@@ -285,7 +365,11 @@ mod tests {
         assert_eq!(p.name, "demo-one");
         assert_eq!(p.cat, "Web App", "package.json with next");
         assert!(p.stack.contains("Next.js"));
-        assert_eq!(p.files, 4);
+        assert!(p.files >= 4, "hidden .git files count too: {}", p.files);
+        assert_eq!(p.nm, 4096, "node_modules bytes bucketed");
+        if git_ok {
+            assert!(p.other > 0, ".git history lands in the other bucket");
+        }
         assert_eq!(p.nm, 4096, "node_modules bytes bucketed");
         assert!(p.loc >= 5, "hand-written lines counted: {}", p.loc);
         assert!(p.langs.iter().any(|(l, _)| l == "Rust"));
