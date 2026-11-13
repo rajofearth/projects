@@ -23,7 +23,6 @@ pub const R_SURFACE: f32 = 18.0;
 pub struct Theme {
     pub bg: Color,
     pub surface: Color,
-    pub raised: Color,
     pub fg: Color,
     pub text2: Color,
     pub text3: Color,
@@ -33,10 +32,8 @@ pub struct Theme {
     pub control_on: Color,
     pub control_glyph: Color,
     pub accent: Color,
-    pub accent_strong: Color,
     pub success: Color,
     pub info: Color,
-    pub warning: Color,
     pub danger: Color,
     /// The series palette: blue, orange, aqua, violet, yellow, magenta at one shared
     /// lightness, so no series shouts over another.
@@ -47,7 +44,6 @@ pub fn theme() -> Theme {
     Theme {
         bg: oklch(0.18, 0.0, 0.0),
         surface: oklch(0.21, 0.0, 0.0),
-        raised: oklch(0.24, 0.0, 0.0),
         fg: oklch(0.96, 0.0, 0.0),
         text2: oklch(0.77, 0.0, 0.0),
         text3: oklch(0.64, 0.0, 0.0),
@@ -57,10 +53,8 @@ pub fn theme() -> Theme {
         control_on: oklch(0.93, 0.0, 0.0),
         control_glyph: oklch(0.19, 0.0, 0.0),
         accent: rune::color::hex("#53dca6").unwrap(),
-        accent_strong: rune::color::hex("#93efd0").unwrap(),
         success: oklch(0.79, 0.14, 162.0),
         info: oklch(0.79, 0.095, 236.0),
-        warning: oklch(0.83, 0.12, 78.0),
         danger: oklch(0.70, 0.16, 24.0),
         series: [
             rune::color::hex("#73aff1").unwrap(),
@@ -148,7 +142,9 @@ pub fn button_primary(
         .h(H_MD)
         .px(14.0)
         .radius(R_CONTROL)
-        .fill(t.control_on)
+        // Frosted: blurs whatever sits behind it, so it reads as glass on the sticky bar.
+        .backdrop_blur(8.0)
+        .fill(t.control_on.alpha(0.82))
         .items_center()
         .justify_center()
         .on_press(on_press)
@@ -204,21 +200,28 @@ pub fn dot(color: Color, size: f32) -> El {
 
 /// A meter: fully-round track with a fill; `lead` gets the accent, the rest stay neutral.
 
-/// A bar list row: label, growing bar keyed by value, right-aligned mono figure.
-/// Ranked by value; rows keyed by label so a value change animates the bar, not the order.
+/// A bar list row: label, growing bar keyed by value, then right-aligned mono columns for
+/// the count and the share. The whole row is a hover target, so its tooltip and hover
+/// pill work anywhere on it, not just over the filled bar.
 pub fn bar_list_row(
     t: &Theme,
+    key: &str,
     label: &str,
     frac: f32,
-    value: &str,
+    count: &str,
+    pct: &str,
     lead: bool,
     label_w: f32,
 ) -> El {
     rune::row()
+        .key(key.to_string())
         .w_full()
         .h(H_SM)
         .items_center()
         .gap(12.0)
+        .px(6.0)
+        .radius(R_CONTROL)
+        .hover(t.hover())
         .child(
             text(label.to_string())
                 .font(TextStyle::new(12.5, 400.0))
@@ -234,5 +237,6 @@ pub fn bar_list_row(
                     .fill(if lead { t.accent } else { t.text3 }),
             ),
         )
-        .child(mono_text(value, 11.5, t.text3).w(90.0).align(Align::End))
+        .child(mono_text(count, 11.5, t.text2).w(76.0).align(Align::End))
+        .child(mono_text(pct, 11.5, t.text3).w(44.0).align(Align::End))
 }

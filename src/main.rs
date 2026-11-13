@@ -36,6 +36,10 @@ pub struct State {
     pub waker: Option<Waker>,
     /// The `demo` scene: fixture data, no live scanning.
     pub demo: bool,
+    /// Names already delivered by the scan in flight, for upserting rows in place.
+    refreshing: std::collections::HashSet<String>,
+    /// The donut wedge under the pointer, if any.
+    pub hover_seg: Option<usize>,
     /// Frames per second over the last 2 s window.
     pub fps: f32,
     /// This process's working set, sampled once a second.
@@ -66,6 +70,8 @@ impl State {
             error: None,
             rx: None,
             waker: None,
+            refreshing: std::collections::HashSet::new(),
+            hover_seg: None,
             demo: false,
             fps: 0.0,
             ram_bytes: 0,
@@ -109,7 +115,9 @@ impl State {
         }
         self.scanning = true;
         self.error = None;
-        self.projects.clear();
+        // The last scan's data stays on screen until each folder's new numbers land,
+        // so a rescan never blanks the dashboard.
+        self.refreshing.clear();
         self.done_count = 0;
         self.total = 0;
         self.current.clear();
@@ -124,7 +132,8 @@ impl State {
 }
 
 impl State {
-    /// Drain the scanner's channel into state; true when anything arrived.
+    /// Drain the scanner's channel into state; true when anything arrived. Each folder's
+    /// row upserts in place the moment its numbers land, so the dashboard fills in live.
     pub fn drain(&mut self, clock: f64) -> bool {
         let mut changed = false;
         while let Some(rx) = self.rx.as_ref() {
@@ -136,12 +145,17 @@ impl State {
                 Ok(ScanEvent::Project(p)) => {
                     self.current = p.name.clone();
                     self.done_count += 1;
-                    self.projects.push(*p);
+                    self.refreshing.insert(p.name.clone());
+                    match self.projects.iter_mut().find(|old| old.name == p.name) {
+                        Some(old) => *old = *p,
+                        None => self.projects.push(*p),
+                    }
                     changed = true;
                 }
                 Ok(ScanEvent::Done { seconds }) => {
                     eprintln!("scan done in {seconds:.1}s");
                     self.scanning = false;
+                    self.refreshing.clear();
                     self.scan_secs = seconds;
                     self.last_done = Some(clock);
                     self.done_at = Some(wallclock());
@@ -163,8 +177,13 @@ impl State {
     }
 }
 
-fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
+fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = s.drain(clock);
+    if changed {
+        // Data a scan brought is a change no input asked for, which would land at once;
+        // ask for the animated kind so rows and figures ease into place.
+        tx.animated();
+    }
 
     // Engine gauges: frame rate over a 2 s window (a 1 s window flickers between 59 and
     // 61) and resident memory sampled with it. The footer only commits when a displayed
@@ -650,6 +669,149 @@ mod tooltip_tests {
                 .iter()
                 .any(|t| t.contains("hover a tile") || t.contains("pinned")),
             "no inspector bar anywhere"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+    use rune::Runtime;
+
+    fn demo() -> Runtime<State> {
+        let env = rune::Env {
+            system_dark: true,
+            scale: 2.0,
+        };
+        let mut state = State::new();
+        state.load_demo();
+        let mut rt = Runtime::new(state, ui::view, (1100.0, 2400.0), env);
+        rt.frame(0.0);
+        rt
+    }
+
+    /// Hover a spot and settle past the tooltip delay.
+    fn hover(rt: &mut Runtime<State>, x: f32, y: f32) {
+        rt.pointer_move(x, y);
+        for _ in 0..90 {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn language_row_tooltip_fires_across_the_whole_row() {
+        let mut rt = demo();
+        let info = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("lang/C++"))
+            .expect("language row has a key");
+        let [x, y, w, h] = info.rect;
+        // Sweep the row from its label through its bar to its value columns: the
+        // tooltip must fire everywhere on the row, not only on the filled bar.
+        for frac in [0.03f32, 0.25, 0.5, 0.75, 0.97] {
+            hover(&mut rt, x + w * frac, y + h * 0.5);
+            let tip = rt.help_tooltip().map(|(t, _)| t.to_string());
+            assert!(
+                tip.as_deref().is_some_and(|t| t.contains("C++")),
+                "tooltip at {:.0}% of the row should name C++, got {tip:?}",
+                frac * 100.0
+            );
+            rt.pointer_leave();
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn momentum_bubbles_carry_tooltips() {
+        let mut rt = demo();
+        let cell = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("sc/")) && e.help.is_some())
+            .expect("scatter has tooltip cells");
+        assert!(
+            cell.help.unwrap().contains("LOC"),
+            "momentum tooltip names the project and its numbers"
+        );
+    }
+
+    #[test]
+    fn donut_wedge_hover_names_the_segment() {
+        let mut rt = demo();
+        let cell = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("seg/")))
+            .expect("donut has wedge cells");
+        let (x, y) = rt
+            .find(cell.key.as_deref().expect("keyed"))
+            .expect("cell is placed");
+        hover(&mut rt, x, y);
+        let mut seg = None;
+        rt.update(|s, _| seg = s.hover_seg);
+        assert!(seg.is_some(), "hovering a wedge cell names a segment");
+        // The middle readout switched to that segment: its key names the index, not the
+        // resting leader's.
+        let keys: Vec<String> = rt
+            .elements()
+            .into_iter()
+            .filter_map(|e| e.key)
+            .filter(|k| k.starts_with("segcenter/"))
+            .collect();
+        let resting = format!("segcenter/{}", usize::MAX);
+        assert!(
+            keys.iter().any(|k| *k != resting),
+            "center shows the hovered segment, keys were {keys:?}"
+        );
+        rt.pointer_leave();
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut seg = Some(usize::MAX);
+        rt.update(|s, _| seg = s.hover_seg);
+        assert!(seg.is_none(), "leaving clears the hover");
+    }
+}
+
+#[cfg(test)]
+mod scan_flow_tests {
+    use super::*;
+
+    #[test]
+    fn rescan_keeps_the_old_rows_until_new_numbers_land() {
+        let mut s = State::new();
+        s.load_demo();
+        let before = s.projects.len();
+        s.scanning = true;
+        // A fresh folder's numbers land as one row the moment they arrive, replacing
+        // any row of the same name; the old list is never cleared mid-scan.
+        let root = std::env::temp_dir().join("ps-rescan-keep");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fresh/.git")).unwrap();
+        std::fs::write(root.join("fresh/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            scan::scan(root, tx, GitCache::default(), || {});
+        });
+        s.rx = Some(rx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut landed = 0;
+        while std::time::Instant::now() < deadline {
+            if s.drain(0.0) {
+                landed += 1;
+            } else if s.projects.iter().any(|p| p.name == "fresh") {
+                break;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(landed > 0, "events drain");
+        assert!(s.projects.iter().any(|p| p.name == "fresh"));
+        assert_eq!(
+            s.projects.len(),
+            before + 1,
+            "old rows stay, fresh row joins"
         );
     }
 }

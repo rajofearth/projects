@@ -142,10 +142,19 @@ fn header(s: &State, t: &Theme) -> El {
         format!("{} folders", s.projects.len())
     };
     row()
+        .key("header")
         .w_full()
-        .h(40.0)
+        .h(44.0)
         .items_center()
         .gap(10.0)
+        .px(12.0)
+        // Sticky and frosted: content scrolls underneath and blurs behind the bar.
+        .sticky_top(0.0)
+        .raise()
+        .backdrop_blur(12.0)
+        .fill(t.bg.alpha(0.72))
+        .border(1.0, t.border_subtle)
+        .radius(12.0)
         .child(
             text("Projects")
                 .font(TextStyle::new(16.0, 500.0))
@@ -264,13 +273,11 @@ fn overview(s: &State, t: &Theme, tt: &Totals) -> El {
         lang_rows = lang_rows.child(
             cui::bar_list_row(
                 t,
+                &format!("lang/{lang}"),
                 lang,
                 *lines as f32 / max_lang,
-                &format!(
-                    "{} · {:.0}%",
-                    fmt(*lines),
-                    *lines as f64 / lang_total.max(1) as f64 * 100.0
-                ),
+                &fmt(*lines),
+                &format!("{:.0}%", *lines as f64 / lang_total.max(1) as f64 * 100.0),
                 i == 0,
                 110.0,
             )
@@ -296,8 +303,8 @@ fn overview(s: &State, t: &Theme, tt: &Totals) -> El {
     let share_card = cui::card(
         t,
         "Share of code",
-        "The six largest languages.",
-        viz::donut(t, &segments, 190.0),
+        "The six largest languages; hover a wedge or a row to name it.",
+        viz::donut(t, &segments, 190.0, s.hover_seg),
     );
 
     col()
@@ -347,6 +354,21 @@ fn momentum(s: &State, t: &Theme) -> El {
         .iter()
         .map(|(n, x, y, sz, c)| (n.clone(), *x, *y, 3.0 + *sz / max_size * 13.0, *c))
         .collect();
+    // One tooltip line per bubble, same order, with the folder's real footprint.
+    let tips: Vec<String> = s
+        .projects
+        .iter()
+        .filter(|p| p.days.is_some())
+        .map(|p| {
+            format!(
+                "{} — {} LOC · {}d · {} on disk",
+                p.name,
+                fmt(p.loc),
+                p.days.unwrap_or(0),
+                gb(p.bytes)
+            )
+        })
+        .collect();
     // Y ticks evenly spaced in log space from the floor up to the max, labelled compactly.
     let floor = 2000.0f64;
     let step = (floor / max_loc).powf(0.25);
@@ -377,6 +399,7 @@ fn momentum(s: &State, t: &Theme) -> El {
         max_loc,
         true,
         true,
+        &tips,
     )
 }
 
@@ -521,7 +544,6 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
                 .max_w(MAX_W)
                 .min_h(0.0)
                 .gap(12.0)
-                .child(header(s, &t))
                 .child(
                     col()
                         .grow(1.0)
@@ -530,6 +552,7 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
                             stick_bottom: false,
                         })
                         .gap(12.0)
+                        .child(header(s, &t))
                         .child(overview(s, &t, &tt)),
                 ),
         )
