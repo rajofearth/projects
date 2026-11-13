@@ -4,6 +4,7 @@
 use rune::tok::{self, type_};
 use rune::{Color, Cx, El, ScrollSpec, Shape, canvas, col, el, row, text};
 use rune::{Align, Cursor, TextStyle};
+use rune::Tx;
 
 use crate::charts::{squarify, tile_label_area};
 use crate::model::{Project, cat_color, fmt, fit, gb, gib, lang_color_or};
@@ -252,7 +253,8 @@ fn treemap(ps: &[Project], t: &tok::Theme) -> El {
                 .radius(3.0)
                 .fill(color.alpha(0.22))
                 .border(1.0, color.alpha(0.55))
-                .help(format!("{} · {} · {} · {}", tile.name, tile.cat, gb(tile.bytes), fmt(tile.bytes)))
+                .on_hover_change(hover_name(tile.name.to_string()))
+                .on_press(pin_name(tile.name.to_string()))
                 .child(inner.px(5.0).py(4.0)),
         );
     }
@@ -456,7 +458,8 @@ fn scatter(ps: &[Project], t: &tok::Theme) -> El {
                 .radius(r)
                 .fill(color.alpha(0.45))
                 .border(1.0, color.alpha(0.8))
-                .help(format!("{} — {}, {} LOC, {}d ago", p.name, gb(p.bytes), fmt(p.loc), days)),
+                .on_hover_change(hover_name(p.name.clone()))
+                .on_press(pin_name(p.name.clone())),
         );
     }
 
@@ -495,15 +498,25 @@ fn composition(ps: &[Project], t: &tok::Theme) -> El {
                     .grow(bytes as f32)
                     .min_w(1.0)
                     .radius(2.0)
-                    .fill(rune::color::hex(hex).unwrap().alpha(0.85))
-                    .help(format!("{} · {key}: {:.2} GiB", p.name, gib(bytes))),
+                    .fill(rune::color::hex(hex).unwrap().alpha(0.85)),
             );
         }
+        let name = p.name.clone();
+        let _info = format!(
+            "{} · src {} · node_modules {} · target {} · other {}",
+            gb(p.bytes),
+            gb(p.src),
+            gb(p.nm),
+            gb(p.target),
+            gb(p.other)
+        );
         rows = rows.child(
             row()
                 .w_full()
                 .gap(6.0)
                 .items_center()
+                .on_hover_change(hover_name(name.clone()))
+                .on_press(pin_name(name))
                 .child(text(p.name.clone()).font(TextStyle::new(9.5, 400.0)).color(t.text).w(150.0))
                 .child(seg)
                 .child(text(format!("{:.1}", gib(p.bytes))).font(mono_fig(9.0)).color(t.text_secondary).w(44.0)),
@@ -623,6 +636,73 @@ fn footer(s: &State, t: &tok::Theme) -> El {
 
 // ---- view ----
 
+/// Hover handlers for charts: entering an item names it in the inspector bar; pressing
+/// pins it there until pressed again. Tooltips stayed flaky, so the bar is the surface.
+fn hover_name(name: String) -> impl Fn(&mut State, bool, &mut Tx) + 'static {
+    move |s: &mut State, entered, _tx| {
+        if entered {
+            s.hover = Some(name.clone());
+        } else if s.hover.as_deref() == Some(name.as_str()) {
+            s.hover = None;
+        }
+    }
+}
+
+fn pin_name(name: String) -> impl Fn(&mut State) + 'static {
+    move |s: &mut State| {
+        if s.pinned.as_deref() == Some(name.as_str()) {
+            s.pinned = None;
+        } else {
+            s.pinned = Some(name.clone());
+        }
+    }
+}
+
+/// A sticky strip under the header that always names what the cursor is on — hover
+/// previews, a click pins. One quiet line instead of pop-up tooltips.
+fn inspector(s: &State, t: &tok::Theme) -> El {
+    let active = s.pinned.as_ref().or(s.hover.as_ref());
+    let (lead, info) = match active.and_then(|n| s.projects.iter().find(|p| &p.name == n)) {
+        Some(p) => {
+            let days = match p.days {
+                Some(d) => format!("last commit {}d ago", d),
+                None => "no git".to_string(),
+            };
+            let pinned = if s.pinned.is_some() { " · pinned" } else { "" };
+            (
+                p.name.clone(),
+                format!(
+                    "{} · {} · {} files · {} LOC · {} commits · {} · {} dirty{}",
+                    p.cat,
+                    gb(p.bytes),
+                    fmt(p.files),
+                    fmt(p.loc),
+                    fmt(p.commits),
+                    days,
+                    fmt(p.dirty),
+                    pinned
+                ),
+            )
+        }
+        None => (
+            "Inspector".to_string(),
+            "hover a tile, dot or bar for details — click to pin".to_string(),
+        ),
+    };
+    row()
+        .sticky_top(0.0)
+        .w_full()
+        .h(30.0)
+        .items_center()
+        .gap(8.0)
+        .px(12.0)
+        .radius(6.0)
+        .fill(t.card)
+        .border(1.0, t.card_border)
+        .child(text(lead).font(TextStyle::new(10.5, 600.0)).color(t.text))
+        .child(text(info).font(mono_fig(10.0)).color(t.text_secondary))
+}
+
 pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
     let t = tok::theme(true);
     let tt = totals(&s.projects);
@@ -645,6 +725,7 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
         .w(CONTENT_W)
         .gap(16.0)
         .child(header(s, &t))
+        .child(inspector(s, &t))
         .child(kpi_rows)
         .child(kpi_rows2)
         .child(card(&t, "Disk footprint", "Area = bytes on disk, colour = project type.", treemap(&s.projects, &t)))
@@ -663,8 +744,7 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
                 .w_full()
                 .gap(8.0)
                 .items_center()
-                .child(text(s.engine_line()).font(mono_fig(10.0)).color(t.text_secondary))
-                .child(caption("· auto-rescans every 5 min", t.text_secondary)),
+                .child(footer(s, &t)),
         );
 
     col()

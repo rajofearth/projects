@@ -8,6 +8,7 @@ mod model;
 mod scan;
 mod ui;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -33,12 +34,23 @@ pub struct State {
     /// The `demo` scene: fixture data, no live scanning.
     pub demo: bool,
     /// Frames per second over the last whole second of app clock.
+    /// Frames per second over the last 2 s window.
     pub fps: f32,
     /// This process's working set, sampled once a second.
     pub ram_bytes: u64,
+    /// Name of the item under the cursor, if any (drives the inspector bar).
+    pub hover: Option<String>,
+    /// Name of the clicked/pinned item — survives cursor movement until clicked again.
+    pub pinned: Option<String>,
     fps_frames: u32,
     fps_since: f64,
+    last_trim: f64,
+    /// Git facts carried between scans, keyed by project path with a refs-mtime validity
+    /// key — rescans skip the history walk for repos that haven't moved.
+    pub git_cache: Arc<std::sync::Mutex<HashMap<PathBuf, scan::GitFactsKeyed>>>,
 }
+
+pub type GitCache = Arc<std::sync::Mutex<HashMap<PathBuf, scan::GitFactsKeyed>>>;
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
 
@@ -61,25 +73,30 @@ impl State {
             demo: false,
             fps: 0.0,
             ram_bytes: 0,
+            hover: None,
+            pinned: None,
             fps_frames: 0,
             fps_since: 0.0,
+            last_trim: 0.0,
+            git_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
-    /// The footer's engine line: fps, resident memory, last scan duration.
+    /// The footer's engine line: frame time in µs, resident memory, last scan duration.
+    /// Parts unknown are left out, so a fresh window or the demo scene shows no
+    /// placeholder dashes.
     pub fn engine_line(&self) -> String {
-        let fps = if self.fps >= 1.0 { format!("{:.0} fps", self.fps) } else { "— fps".into() };
-        let ram = if self.ram_bytes > 0 {
-            format!("{:.0} MB", self.ram_bytes as f64 / 1048576.0)
-        } else {
-            "— MB".into()
-        };
-        let scan = if self.scan_secs > 0.0 {
-            format!("scan {}", crate::charts::scan_time(self.scan_secs))
-        } else {
-            "scan —".into()
-        };
-        format!("{fps} · {ram} · {scan}")
+        let mut parts: Vec<String> = Vec::new();
+        if self.fps > 0.0 {
+            parts.push(format!("{:.0} fps", self.fps));
+        }
+        if self.ram_bytes > 0 {
+            parts.push(format!("{:.0} MB", self.ram_bytes as f64 / 1048576.0));
+        }
+        if self.scan_secs > 0.0 {
+            parts.push(format!("scan {}", crate::charts::scan_time(self.scan_secs)));
+        }
+        parts.join(" · ")
     }
 
     fn load_demo(&mut self) {
@@ -107,7 +124,8 @@ impl State {
         // Tests and headless fixture runs have no loop to wake; a no-op waker is fine there.
         let waker: Waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| ()));
         let root = PathBuf::from(&self.root);
-        std::thread::spawn(move || scan::scan(root, tx, move || waker()));
+        let cache = self.git_cache.clone();
+        std::thread::spawn(move || scan::scan(root, tx, cache, move || waker()));
     }
 }
 
@@ -132,6 +150,10 @@ impl State {
                     self.scan_secs = seconds;
                     self.last_done = Some(clock);
                     self.done_at = Some(wallclock());
+                    // The scan's walkers and buffers just peaked the working set; hand
+                    // those pages back so the app idles small.
+                    trim_ram();
+                    self.last_trim = clock;
                     changed = true;
                 }
                 Ok(ScanEvent::Failed(e)) => {
@@ -153,12 +175,12 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
 fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
     let mut changed = s.drain(clock);
 
-    // Engine gauges: fps over each whole second of app clock, ram sampled with it. The
-    // footer only commits when a displayed value actually changes, so a steady frame
-    // rate costs nothing.
+    // Engine gauges: frame rate over a 2 s window (a 1 s window flickers between 59 and
+    // 61) and resident memory sampled with it. The footer only commits when a displayed
+    // value actually changes, so a steady frame rate costs nothing.
     s.fps_frames += 1;
     let elapsed = clock - s.fps_since;
-    if elapsed >= 1.0 {
+    if elapsed >= 2.0 {
         let fps = (s.fps_frames as f32 / elapsed as f32).round();
         let ram = process_ram() / 1048576;
         s.fps_frames = 0;
@@ -170,6 +192,13 @@ fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
             s.ram_bytes = ram * 1048576;
             changed = true;
         }
+    }
+    // At rest, hand pages back to Windows every 30 s: the working set creeps up as the
+    // GPU driver and allocator touch pages, and a dashboard that is sitting still has no
+    // use for them.
+    if !s.scanning && clock - s.last_trim >= 30.0 {
+        trim_ram();
+        s.last_trim = clock;
     }
 
     // Live: rescan every five minutes (demo data never rescans).
@@ -210,6 +239,19 @@ fn process_ram() -> u64 {
 fn process_ram() -> u64 {
     0
 }
+
+/// Hand the scan's peak pages back to Windows: min = max working set trims to standby.
+#[cfg(windows)]
+fn trim_ram() {
+    use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0);
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_ram() {}
 
 /// "13 Nov 14:32" from the wall clock (UTC).
 fn wallclock() -> String {
@@ -346,7 +388,8 @@ mod tests {
 
         let (tx, rx) = channel();
         let scan_root = root.clone();
-        let handle = std::thread::spawn(move || scan::scan(scan_root, tx, || {}));
+        let cache: GitCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let handle = std::thread::spawn(move || scan::scan(scan_root, tx, cache, || {}));
         let mut projects = Vec::new();
         let mut done = false;
         while !done {
@@ -386,7 +429,8 @@ mod tests {
     fn real_root_scan_smoke() {
         let root = PathBuf::from(std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into()));
         let (tx, rx) = channel();
-        let handle = std::thread::spawn(move || scan::scan(root, tx, || {}));
+        let cache: GitCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let handle = std::thread::spawn(move || scan::scan(root, tx, cache, || {}));
         let mut n = 0;
         let mut bytes = 0u64;
         let mut loc = 0u64;
@@ -454,5 +498,90 @@ mod tests {
         assert_eq!(rt.state.projects[0].name, "demo-one");
         // The dashboard now shows the scanned folder.
         assert!(rt.find("tile/demo-one").is_some(), "scanned folder gets a tile");
+    }
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::*;
+    use rune::Runtime;
+
+    fn demo() -> Runtime<State> {
+        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let mut state = State::new();
+        state.load_demo();
+        let mut rt = Runtime::new(state, view, (1100.0, 780.0), env);
+        rt.frame(0.0);
+        rt
+    }
+
+    fn inspector_text(rt: &Runtime<State>) -> String {
+        rt.elements()
+            .into_iter()
+            .filter_map(|e| e.text)
+            .find(|t| t.contains("hover a tile") || t.contains("\u{b7} pinned") || t.contains("dirty"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn hover_names_the_item_and_leaving_clears_it() {
+        let mut rt = demo();
+        assert!(inspector_text(&rt).contains("hover a tile"), "hint first");
+        let (x, y) = rt.find("tile/chinchilla").expect("tile");
+        rt.pointer_move(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.hover.as_deref(), Some("chinchilla"));
+        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
+        assert!(texts.iter().any(|t| t == "chinchilla"), "inspector leads with the name");
+        assert!(texts.iter().any(|t| t.contains("dirty")), "inspector shows the details");
+        rt.pointer_leave();
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.hover, None, "leaving clears the preview");
+    }
+
+    #[test]
+    fn click_pins_and_click_again_unpins() {
+        // The scatter sits below the fold at the default window height.
+        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let mut state = State::new();
+        state.load_demo();
+        let mut rt = Runtime::new(state, view, (1100.0, 2500.0), env);
+        rt.frame(0.0);
+        let (x, y) = rt.find("dot/whirl").expect("dot");
+        rt.pointer_move(x, y);
+        rt.frame(1.0 / 60.0);
+
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.pinned.as_deref(), Some("whirl"));
+        rt.pointer_leave();
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.pinned.as_deref(), Some("whirl"), "pin survives leaving");
+        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
+        assert!(texts.iter().any(|t| t.contains("\u{b7} pinned")), "inspector shows the pin");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.pinned, None, "second click unpins");
+    }
+
+    #[test]
+    fn fixture_languages_are_merged_by_language_not_syntax() {
+        let rt = demo();
+        for p in &rt.state.projects {
+            assert!(
+                p.langs.iter().all(|(l, _)| l != "TSX" && l != "JSX"),
+                "{} still splits TS/TSX: {:?}",
+                p.name,
+                p.langs
+            );
+        }
+        let whirl = rt.state.projects.iter().find(|p| p.name == "whirl").unwrap();
+        assert_eq!(
+            whirl.langs.iter().find(|(l, _)| *l == "TypeScript").map(|(_, n)| *n),
+            Some(114_056),
+            "TSX folded into TypeScript"
+        );
     }
 }

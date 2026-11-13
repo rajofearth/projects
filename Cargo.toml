@@ -4,11 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rune = { path = "../rune/crates/rune" } # pinned to rune dev rev 14eb362e4e56aadf9b64c82640417ab0c9da5fe0
-ignore = "0.4"
+rune = { path = "../rune/crates/rune", features = ["tooling"] } # pinned to rune dev rev 14eb362e4e56aadf9b64c82640417ab0c9da5fe0
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 # Rune requires these vendor patches (its [patch] doesn't cross workspaces).
 [patch.crates-io]
@@ -18,3 +17,6 @@ parley_engine = { path = "../rune/vendor/parley_engine" }
 
 [profile.release]
 opt-level = 2
+lto = "thin"
+panic = "abort"
+strip = "symbols"

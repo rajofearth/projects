@@ -82,7 +82,6 @@ pub fn cat_color(cat: &str) -> Color {
 // Language colours, matched to GitHub's linguistic palette.
 fn lang_color(name: &str) -> Color {
     let hex = match name {
-        "TSX" => "#4f8cff",
         "TypeScript" => "#3178c6",
         "C++" => "#f34b7d",
         "C" => "#94a3b8",
