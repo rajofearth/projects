@@ -12,7 +12,7 @@ mod viz;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 
 use model::ScanEvent;
@@ -134,8 +134,12 @@ impl State {
 impl State {
     /// Drain the scanner's channel into state; true when anything arrived. Each folder's
     /// row upserts in place the moment its numbers land, so the dashboard fills in live.
+    /// A scanner that dies without a Done or Failed (a panic) ends the scanning state too,
+    /// so the UI can never sit waiting for a scan that will never finish.
     pub fn drain(&mut self, clock: f64) -> bool {
         let mut changed = false;
+        let mut dead = false;
+        let mut finished = false;
         while let Some(rx) = self.rx.as_ref() {
             match rx.try_recv() {
                 Ok(ScanEvent::Start { total }) => {
@@ -163,15 +167,35 @@ impl State {
                     // those pages back so the app idles small.
                     trim_ram();
                     self.last_trim = clock;
+                    finished = true;
                     changed = true;
+                    break;
                 }
                 Ok(ScanEvent::Failed(e)) => {
                     self.scanning = false;
                     self.error = Some(e);
+                    finished = true;
                     changed = true;
+                    break;
                 }
-                Err(_) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    dead = true;
+                    break;
+                }
             }
+        }
+        if finished {
+            self.rx = None;
+        }
+        if dead {
+            self.scanning = false;
+            self.refreshing.clear();
+            self.rx = None;
+            if self.error.is_none() && !self.demo {
+                self.error = Some("the scan stopped unexpectedly".to_string());
+            }
+            changed = true;
         }
         changed
     }
@@ -813,5 +837,35 @@ mod scan_flow_tests {
             before + 1,
             "old rows stay, fresh row joins"
         );
+    }
+
+    #[test]
+    fn a_dead_scanner_never_leaves_the_app_scanning() {
+        let mut s = State::new();
+        s.scanning = true;
+        let (tx, rx) = channel();
+        s.rx = Some(rx);
+        drop(tx);
+        assert!(s.drain(0.0), "the scanner's death is a visible change");
+        assert!(!s.scanning, "the scanning state ends");
+        assert!(s.error.is_some(), "the user sees why");
+        assert!(s.rx.is_none(), "the dead channel is dropped");
+        // And it stays ended: draining again is quiet.
+        assert!(!s.drain(0.0));
+    }
+
+    #[test]
+    fn a_finished_scan_leaves_no_channel_behind() {
+        let mut s = State::new();
+        s.scanning = true;
+        let (tx, rx) = channel();
+        s.rx = Some(rx);
+        tx.send(ScanEvent::Done { seconds: 1.0 }).unwrap();
+        drop(tx);
+        assert!(s.drain(0.0));
+        assert!(!s.scanning && s.rx.is_none());
+        // The Done was already handled: the later disconnect must not raise a fake error.
+        assert!(!s.drain(0.0));
+        assert!(s.error.is_none());
     }
 }

@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::model::{Project, ScanEvent};
 
@@ -283,6 +283,23 @@ fn mtime_nanos(p: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Drop the calling thread to below-normal CPU priority, so the scan's workers always
+/// yield to everything the user is running — music, other apps, and this app's own UI —
+/// while still making normal progress. Combined with the modest worker counts, the scan
+/// stops being the thing that makes the machine lag. No-op off Windows.
+#[cfg(windows)]
+fn enter_background_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn enter_background_priority() {}
+
 fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     // --no-optional-locks: concurrent `git status` must never fight over index.lock.
@@ -299,15 +316,46 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        // BELOW_NORMAL: the scan's git work yields CPU to everything the user is running.
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
     }
-    let out = cmd.output().ok()?;
+    // A hung git (a stale index.lock, a credential prompt) must not stall the scan
+    // forever: poll with a deadline and kill the child when it passes. Stdin is null so
+    // a prompt cannot block on the terminal, and the pipes carry the output we parse.
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => break None,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break None,
+        }
+    };
+    let out = match finished {
+        // Collect whatever the exited child wrote.
+        Some(_) => child.wait_with_output().ok()?,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         None
     }
 }
+
+/// How long one git call may take before it is killed and treated as "no facts".
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Git facts via the git CLI. `cache` short-circuits the two history calls when refs
 /// haven't moved since the last scan; dirty is always recomputed.
@@ -500,7 +548,7 @@ pub fn scan(
                     .filter(|(_, d)| d.join(".git").exists())
                     .map(|(i, d)| (i, d.clone()))
                     .collect();
-                let workers = 8.min(repos.len().max(1));
+                let workers = 4.min(repos.len().max(1));
                 let locals: Vec<(Vec<(usize, GitFacts)>, HashMap<PathBuf, GitFactsKeyed>)> =
                     std::thread::scope(|s| {
                         let mut handles = Vec::new();
@@ -513,6 +561,7 @@ pub fn scan(
                                 .collect();
                             let cache = cache.clone();
                             handles.push(s.spawn(move || {
+                                enter_background_priority();
                                 // Seed from the shared cache so rescans skip the history
                                 // work; entries written this scan land in `local` and are
                                 // merged back when the workers join.
@@ -682,12 +731,13 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
         });
     }
 
-    let workers = 32;
+    let workers = 24;
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let queue = queue.clone();
             let aggs = aggs.clone();
             scope.spawn(move || {
+                enter_background_priority();
                 let mut local: HashMap<usize, Agg> = HashMap::new();
                 while let Some(task) = queue.pop() {
                     let agg = local.entry(task.proj).or_default();
