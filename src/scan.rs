@@ -216,8 +216,19 @@ fn count_lines(path: &Path) -> u64 {
     total
 }
 
-/// Git facts per project: is a repo, commit count, days since last commit, dirty files.
-pub type GitFacts = (bool, u64, Option<u64>, u64);
+/// Git facts per project: is a repo, commit count, days since last commit, dirty files,
+/// plus commit activity buckets for the calendar and weekday-hour heatmaps.
+#[derive(Debug, Clone, Default)]
+pub struct GitFacts {
+    pub repo: bool,
+    pub commits: u64,
+    pub days: Option<u64>,
+    pub dirty: u64,
+    /// Commits per day, oldest first: index 0 is 363 days ago, 363 is today. Empty without git.
+    pub per_day: Vec<u32>,
+    /// Commits by weekday and local hour: index `weekday * 24 + hour`, weekday 0 = Monday.
+    pub by_hour: Vec<u32>,
+}
 
 /// A cached fact set with its refs-mtime validity key.
 pub type GitFactsKeyed = (GitFacts, u64);
@@ -274,31 +285,102 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
 /// haven't moved since the last scan; dirty is always recomputed.
 fn git_facts(dir: &Path, cache: &mut HashMap<PathBuf, GitFactsKeyed>) -> GitFacts {
     if !dir.join(".git").exists() {
-        return (false, 0, None, 0);
+        return GitFacts::default();
     }
     let key = git_cache_key(dir);
-    let (commits, days) = match cache.get(dir) {
-        Some(((true, c, d, _), k)) if *k == key => (*c, *d),
-        _ => {
-            let commits = git_output(dir, &["rev-list", "--count", "HEAD"])
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let days = git_output(dir, &["log", "-1", "--format=%ct"]).map(|s| {
-                let t: u64 = s.trim().parse().unwrap_or(0);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                now.saturating_sub(t) / 86_400
-            });
-            (commits, days)
+    if let Some((facts, k)) = cache.get(dir) {
+        if *k == key {
+            return facts.clone();
         }
-    };
-    let dirty = git_output(dir, &["status", "--porcelain"])
+    }
+    let mut facts = git_history(dir);
+    facts.dirty = git_output(dir, &["status", "--porcelain"])
         .map(|s| s.lines().count() as u64)
         .unwrap_or(0);
-    let facts = (true, commits, days, dirty);
-    cache.insert(dir.to_path_buf(), (facts, key));
+    cache.insert(dir.to_path_buf(), (facts.clone(), key));
+    facts
+}
+
+/// Days from civil (Hinnant): converts a calendar date to days since 1970-01-01.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Weekday of a day count since 1970-01-01 (a Thursday): 0 = Monday.
+fn weekday_of(epoch_days: i64) -> i64 {
+    (epoch_days + 3).rem_euclid(7)
+}
+
+/// The scanner's local UTC offset, so commit dates resolve to local calendar days.
+#[cfg(windows)]
+pub fn local_utc_offset_secs() -> i64 {
+    use windows_sys::Win32::System::Time::GetTimeZoneInformation;
+    unsafe {
+        let mut tzi: windows_sys::Win32::System::Time::TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let id = GetTimeZoneInformation(&mut tzi);
+        let mut bias = tzi.Bias as i64; // minutes; UTC = local + bias
+        // TIME_ZONE_ID_DAYLIGHT == 2: the system is currently on daylight saving time.
+        if id == 2 {
+            bias += tzi.DaylightBias as i64;
+        }
+        -bias * 60
+    }
+}
+
+#[cfg(not(windows))]
+pub fn local_utc_offset_secs() -> i64 {
+    0
+}
+
+/// Git history in a single `git log` pass: commit count, days since the last commit, and
+/// per-day / weekday-hour commit buckets over the trailing year, all in the scanner's local time.
+fn git_history(dir: &Path) -> GitFacts {
+    let mut facts = GitFacts {
+        repo: true,
+        ..Default::default()
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let today_days = (now_secs + local_utc_offset_secs()).div_euclid(86_400);
+    if let Some(log) = git_output(dir, &["log", "--pretty=%cI", "-n", "40000"]) {
+        facts.per_day = vec![0; 364];
+        facts.by_hour = vec![0; 168];
+        for line in log.lines() {
+            // ISO 8601: YYYY-MM-DDTHH:MM:SS(+/-)HH:MM
+            if line.len() < 19 {
+                continue;
+            }
+            let y: i64 = line[0..4].parse().unwrap_or(0);
+            let m: i64 = line[5..7].parse().unwrap_or(0);
+            let d: i64 = line[8..10].parse().unwrap_or(0);
+            if y == 0 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+                continue;
+            }
+            let day = days_from_civil(y, m, d);
+            let ago = today_days - day;
+            if (0..364).contains(&ago) {
+                facts.per_day[363 - ago as usize] += 1;
+            }
+            if let Ok(hour) = line[11..13].parse::<usize>() {
+                if hour < 24 {
+                    facts.by_hour[(weekday_of(day) as usize) * 24 + hour] += 1;
+                }
+            }
+            facts.commits += 1;
+        }
+        facts.days = facts
+            .per_day
+            .iter()
+            .rposition(|&n| n > 0)
+            .map(|i| (363 - i) as u64);
+    }
     facts
 }
 
@@ -438,8 +520,13 @@ pub fn scan(
                                 .filter(|(j, _)| j % workers == w)
                                 .map(|(_, (i, d))| (*i, d.clone()))
                                 .collect();
+                            let cache = cache.clone();
                             handles.push(s.spawn(move || {
-                                let mut local: HashMap<PathBuf, GitFactsKeyed> = HashMap::new();
+                                // Seed from the shared cache so rescans skip the history
+                                // work; entries written this scan land in `local` and are
+                                // merged back when the workers join.
+                                let mut local: HashMap<PathBuf, GitFactsKeyed> =
+                                    cache.lock().unwrap().clone();
                                 let mut out: Vec<(usize, GitFacts)> = Vec::with_capacity(mine.len());
                                 for (i, d) in mine {
                                     out.push((i, git_facts(&d, &mut local)));
@@ -471,8 +558,12 @@ pub fn scan(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let (git, commits, days, dirty) = git_all[i].unwrap_or((false, 0, None, 0));
+            let facts = git_all[i].clone().unwrap_or_default();
             let (cat, stack) = classify(dir, &aggs[i]);
+            let activity = facts.repo.then(|| crate::model::Activity {
+                per_day: facts.per_day.clone(),
+                by_hour: facts.by_hour.clone(),
+            });
             let mut langs: Vec<(String, u64)> =
                 aggs[i].langs.iter().map(|(l, n)| (l.to_string(), *n)).collect();
             langs.sort_by(|a, b| b.1.cmp(&a.1));
@@ -489,10 +580,11 @@ pub fn scan(
                 target: aggs[i].target,
                 other: aggs[i].other,
                 langs,
-                git,
-                commits,
-                days,
-                dirty,
+                git: facts.repo,
+                commits: facts.commits,
+                days: facts.days,
+                dirty: facts.dirty,
+                activity,
             };
             let _ = tx.send(ScanEvent::Project(Box::new(project)));
             wake();

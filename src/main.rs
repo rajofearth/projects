@@ -3,10 +3,12 @@
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
 mod charts;
+mod cui;
 mod fixture;
 mod model;
 mod scan;
 mod ui;
+mod viz;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,6 +44,8 @@ pub struct State {
     pub hover: Option<String>,
     /// Name of the clicked/pinned item — survives cursor movement until clicked again.
     pub pinned: Option<String>,
+    /// Which sidebar page is showing.
+    pub page: Page,
     fps_frames: u32,
     fps_since: f64,
     last_trim: f64,
@@ -51,6 +55,28 @@ pub struct State {
 }
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
+
+/// The sidebar's pages: the main view carries the highlights, the rest each carry one
+/// kind of information to dig into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Page {
+    Overview,
+    Projects,
+    Languages,
+    Activity,
+}
+
+impl Page {
+    pub const ALL: [(Page, &'static str); 4] = [
+        (Page::Overview, "Overview"),
+        (Page::Projects, "Projects"),
+        (Page::Languages, "Languages"),
+        (Page::Activity, "Activity"),
+    ];
+    pub fn title(self) -> &'static str {
+        Self::ALL.iter().find(|(p, _)| *p == self).map(|(_, t)| *t).unwrap_or("Overview")
+    }
+}
 
 impl State {
     fn new() -> State {
@@ -73,6 +99,7 @@ impl State {
             ram_bytes: 0,
             hover: None,
             pinned: None,
+            page: Page::Overview,
             fps_frames: 0,
             fps_since: 0.0,
             last_trim: 0.0,
@@ -340,8 +367,9 @@ mod tests {
     fn treemap_tiles_lay_out_inside_the_map() {
         let rt = demo_runtime();
         let (rect, _) = rt.presented("treemap").expect("treemap laid out");
-        assert!((rect[2] - 1008.0).abs() < 2.0, "treemap width {}", rect[2]);
-        assert!((rect[3] - 300.0).abs() < 2.0, "treemap height {}", rect[3]);
+        let want_w = 1100.0 - ui::SIDE_W - 48.0 - 40.0;
+        assert!((rect[2] - want_w).abs() < 2.0, "treemap width {} want {want_w}", rect[2]);
+        assert!((rect[3] - 280.0).abs() < 2.0, "treemap height {}", rect[3]);
         let (tile, _) = rt
             .presented("tile/chinchilla")
             .unwrap_or_else(|| panic!("biggest tile present"));
@@ -350,22 +378,34 @@ mod tests {
         for info in rt.elements() {
             if info.key.as_deref().is_some_and(|k| k.starts_with("tile/")) {
                 let key = info.key.clone().unwrap();
-                assert!(info.rect[2] <= 1008.0 + 0.5 && info.rect[3] <= 300.0 + 0.5,
+                assert!(info.rect[2] <= want_w + 0.5 && info.rect[3] <= 280.0 + 0.5,
                     "{key} overflows: {:?}", info.rect);
             }
         }
     }
 
     #[test]
-    fn kpi_card_shows_the_summed_disk_total() {
+    fn overview_readout_shows_the_summed_disk_total() {
         let rt = demo_runtime();
         let bytes: u64 = rt.state.projects.iter().map(|p| p.bytes).sum();
-        let want = format!("{:.1} GiB", model::gib(bytes));
+        let want = format!("{:.1}", model::gib(bytes));
         let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
         assert!(
             texts.iter().any(|t| *t == want),
-            "on-disk KPI should read {want}: {texts:?}"
+            "on-disk readout should read {want}: {texts:?}"
         );
+    }
+
+    #[test]
+    fn sidebar_switches_pages() {
+        let mut rt = demo_runtime();
+        assert!(rt.find("page-projects").is_none(), "projects page hidden at first");
+        let (x, y) = rt.find("nav/Projects").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.page, Page::Projects, "nav click switches page");
+        assert!(rt.find("projrow/chinchilla").is_some(), "projects list laid out");
     }
 
     #[test]
@@ -507,6 +547,7 @@ mod tests {
             commits: 5,
             days: Some(3),
             dirty: 1,
+            activity: None,
         })))
         .unwrap();
         tx.send(ScanEvent::Done { seconds: 1.0 }).unwrap();

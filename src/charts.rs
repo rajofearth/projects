@@ -5,7 +5,6 @@ use rune::{Color, Shape};
 pub struct Tile {
     pub name: String,
     pub bytes: u64,
-    pub cat: String,
     pub x: f32,
     pub y: f32,
     pub w: f32,
@@ -29,18 +28,18 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
     if total <= 0.0 || w <= 0.0 || h <= 0.0 {
         return Vec::new();
     }
-    // (name, bytes, scaled area, category)
-    let mut rest: Vec<(String, u64, f64, String)> = items
+    // (name, bytes, scaled area)
+    let mut rest: Vec<(String, u64, f64)> = items
         .iter()
         .filter(|i| i.1 > 0)
-        .map(|(n, v, c)| (n.clone(), *v, *v as f64 / total * (w as f64) * (h as f64), c.clone()))
+        .map(|(n, v, _)| (n.clone(), *v, *v as f64 / total * (w as f64) * (h as f64)))
         .collect();
     rest.sort_by(|a, b| b.1.cmp(&a.1));
     let mut out = Vec::new();
     let (mut rx, mut ry, mut rw, mut rh) = (x, y, w, h);
-    let mut row: Vec<(String, u64, f64, String)> = Vec::new();
+    let mut row: Vec<(String, u64, f64)> = Vec::new();
 
-    let flush = |row: &mut Vec<(String, u64, f64, String)>,
+    let flush = |row: &mut Vec<(String, u64, f64)>,
                  out: &mut Vec<Tile>,
                  rx: &mut f32,
                  ry: &mut f32,
@@ -55,7 +54,7 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
             let mut cy = *ry;
             for r in row.drain(..) {
                 let ih = (r.2 / cw as f64) as f32;
-                out.push(Tile { name: r.0, bytes: r.1, cat: r.3, x: *rx, y: cy, w: cw, h: ih });
+                out.push(Tile { name: r.0, bytes: r.1, x: *rx, y: cy, w: cw, h: ih });
                 cy += ih;
             }
             *rx += cw;
@@ -65,7 +64,7 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
             let mut cx = *rx;
             for r in row.drain(..) {
                 let iw = (r.2 / ch as f64) as f32;
-                out.push(Tile { name: r.0, bytes: r.1, cat: r.3, x: cx, y: *ry, w: iw, h: ch });
+                out.push(Tile { name: r.0, bytes: r.1, x: cx, y: *ry, w: iw, h: ch });
                 cx += iw;
             }
             *ry += ch;

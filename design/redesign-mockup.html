@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P:\Projects — redesign mockup</title>
+<style>
+  :root {
+    --bg: #141415;
+    --card: #19191b;
+    --raised: #232325;
+    --hairline: rgba(237,237,237,0.08);
+    --text: #ededed;
+    --text2: #a1a1a6;
+    --muted: #85858b;
+    --accent: #4f8cff;
+    --active: #4cc38a;
+    --dormant: #5b9dff;
+    --stale: #e5484d;
+    --nogit: #85858b;
+    --mono: "Cascadia Mono", ui-monospace, Consolas, monospace;
+    --sans: Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1104px; margin: 0 auto; padding: 24px 32px 40px; display: flex; flex-direction: column; gap: 16px; }
+
+  /* header */
+  header { display: flex; justify-content: space-between; align-items: flex-start; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: 0; }
+  .meta { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 11.5px; color: var(--text2); }
+  .meta .sep { color: var(--muted); }
+  .btn-rescan {
+    background: var(--text); color: #141415; border: 0; border-radius: 6px;
+    height: 28px; padding: 0 12px; font: 500 12.5px var(--sans); cursor: pointer;
+  }
+  .btn-rescan:hover { background: #d9d9d9; }
+  .btn-rescan:active { transform: scale(0.98); }
+
+  /* inspector strip */
+  .inspector {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 8px;
+    height: 30px; padding: 0 12px; border-radius: 6px;
+    background: var(--card); border: 1px solid var(--hairline);
+  }
+  .inspector .lead { font-size: 10.5px; font-weight: 600; }
+  .inspector .info { font: 10px var(--mono); color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* KPI strip: numbers, not cards */
+  .kpis { display: flex; }
+  .kpi { flex: 1; padding: 2px 20px; }
+  .kpi:first-child { padding-left: 0; }
+  .kpi + .kpi { border-left: 1px solid var(--hairline); }
+  .kpi .fig { font: 500 26px/1.1 var(--mono); font-variant-numeric: tabular-nums; }
+  .kpi .name { font-size: 11px; color: var(--text2); margin-top: 3px; }
+  .kpi .sub { font: 10.5px var(--mono); color: var(--muted); margin-top: 1px; }
+
+  /* cards */
+  .card { background: var(--card); border: 1px solid var(--hairline); border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 12.5px; font-weight: 500; }
+  .card .sub { font-size: 10.5px; color: var(--muted); margin: 1px 0 10px; }
+  .duo { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+
+  /* treemap */
+  .treemap { position: relative; height: 300px; overflow: hidden; }
+  .tile {
+    position: absolute; border-radius: 3px; padding: 5px 5px 4px;
+    display: flex; flex-direction: column; gap: 1px; overflow: hidden; cursor: default;
+  }
+  .tile .tname { font-size: 11px; font-weight: 600; line-height: 1.15; }
+  .tile .tsize { font: 10px var(--mono); color: var(--text2); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 10px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--text2); }
+  .dot { width: 7px; height: 7px; border-radius: 2px; }
+
+  /* language mix */
+  .langrow { display: flex; align-items: center; gap: 8px; height: 20px; margin-bottom: 6px; }
+  .langrow .lname { width: 96px; font-size: 9.5px; color: var(--text); white-space: nowrap; }
+  .langrow .barwrap { flex: 1; display: flex; }
+  .langrow .bar { height: 16px; border-radius: 3px; background: var(--text2); opacity: 0.55; }
+  .langrow .bar.lead { background: var(--accent); opacity: 0.9; }
+  .langrow .pct { width: 46px; font: 8.5px var(--mono); color: var(--text2); text-align: right; }
+
+  /* pulse: stacked bar + state rows */
+  .pulsebar { display: flex; height: 14px; border-radius: 4px; overflow: hidden; gap: 1px; margin-bottom: 12px; }
+  .pulsebar i { display: block; }
+  .staterow { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-top: 1px solid var(--hairline); font-size: 11px; color: var(--text2); }
+  .staterow b { font: 500 12px var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
+  .staterow .lbl { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* scatter */
+  .scatter { position: relative; height: 300px; overflow: hidden; }
+  .gridline { position: absolute; background: var(--hairline); }
+  .axislabel { position: absolute; font: 9px var(--mono); color: var(--muted); }
+  .scatterdot { position: absolute; border-radius: 50%; cursor: default; }
+
+  /* composition */
+  .comprow { display: flex; align-items: center; gap: 6px; height: 20px; margin-bottom: 4px; }
+  .comprow .cname { width: 150px; font-size: 9.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .comprow .segs { flex: 1; display: flex; gap: 1px; height: 16px; }
+  .comprow .segs i { display: block; border-radius: 2px; }
+  .comprow .cgb { width: 44px; font: 9px var(--mono); color: var(--text2); text-align: right; }
+  .seg-src { background: var(--accent); opacity: 0.85; }
+  .seg-nm { background: #6b6b70; }
+  .seg-target { background: #4a4a4f; }
+  .seg-other { background: #333338; }
+
+  /* insights: quiet text, hairline separated */
+  .insights { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
+  .insight { padding: 10px 0; border-top: 1px solid var(--hairline); }
+  .insight h3 { font-size: 11.5px; font-weight: 500; }
+  .insight p { font-size: 10.5px; color: var(--text2); margin-top: 2px; }
+
+  /* footer */
+  footer { display: flex; gap: 8px; align-items: center; font: 10px var(--mono); color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div>
+      <h1>P:\Projects</h1>
+      <div class="meta"><span id="meta-folders"></span><span class="sep">·</span><span>demo fixture</span><span class="sep">·</span><span>scanned 13 Nov 14:32</span><span class="sep">·</span><span id="meta-scan">4.0s</span></div>
+    </div>
+    <button class="btn-rescan">Rescan</button>
+  </header>
+
+  <div class="inspector">
+    <span class="lead" id="ins-lead">Inspector</span>
+    <span class="info" id="ins-info">hover a tile, dot or bar for details — click to pin</span>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="card">
+    <h2>Disk footprint</h2>
+    <div class="sub">Area = bytes on disk, colour = last commit. The one place colour carries meaning.</div>
+    <div class="treemap" id="treemap"></div>
+    <div class="legend" id="map-legend"></div>
+  </div>
+
+  <div class="duo">
+    <div class="card">
+      <h2>Language mix</h2>
+      <div class="sub">Hand-written lines, vendored and minified code excluded</div>
+      <div id="langs"></div>
+    </div>
+    <div class="card">
+      <h2>Project pulse</h2>
+      <div class="sub">How recently each folder was touched</div>
+      <div class="pulsebar" id="pulsebar"></div>
+      <div id="states"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Momentum map</h2>
+    <div class="sub">Left = recently touched, up = more code, bubble size = disk footprint</div>
+    <div class="scatter" id="scatter"></div>
+  </div>
+
+  <div class="card">
+    <h2>What the bytes actually are</h2>
+    <div class="sub">Top 10 folders: real content vs regenerable build junk</div>
+    <div id="composition"></div>
+    <div class="legend" id="comp-legend"></div>
+  </div>
+
+  <div class="insights" id="insights"></div>
+
+  <footer><span id="engine">60 fps · 212 MB · scan 4.0s</span><span>·</span><span>auto-rescans every 5 min</span></footer>
+
+</div>
+<script>
+// Fixture data from src/fixture.rs: name, cat, stack, bytes, files, loc, src, nm, target, other, commits, days, dirty, langs
+const P = [
+ ["chinchilla","AI / ML","Python, PyTorch, Modal",29989306270,54448,25480,16997903231,0,0,12991403039,39,86,116,[["Python",21000],["TypeScript",4480]]],
+ ["ply","Native Desktop","Rust, GPUI, Win32",20180869831,36227,22687,3289539,0,20172547517,5032775,69,17,7,[["Rust",22687]]],
+ ["yotes","Web App","Next.js, React, SQLite",5392191943,55760,27652,23292848,637392110,4325998877,405508108,18,0,53,[["TypeScript",27652]]],
+ ["messenger","Mobile","Expo, Convex, SQLite",2588247010,41909,39597,713040710,1206035976,0,669170324,71,10,5,[["TypeScript",27597],["Kotlin",12000]]],
+ ["messenger-relay-next","Mobile","Expo, Convex, WebRTC",2117295322,38558,39421,323966571,1125190671,0,668138080,73,9,0,[["TypeScript",39421]]],
+ ["ply-research","Native Desktop","Rust, GPUI",2049152253,3473,20164,3250494,0,2045901759,0,49,23,5,[["Rust",20164]]],
+ ["messenger-now","Mobile","Expo, Convex, TS",1835757152,36576,36464,197914108,1008872288,0,628970756,58,9,0,[["TypeScript",36464]]],
+ ["camx2","AI / ML","Next.js, ONNX, WebGPU",1357629566,1294,41413,643199605,0,0,714429961,90,151,1,[["TypeScript",41413]]],
+ ["raycast-dictation-clone","Native Desktop","Rust, GPUI",1280782372,545,14312,1247188309,0,0,33594063,64,60,11,[["Rust",14312]]],
+ ["llama.cpp","Clone / Fork","C, C++, ggml",615538240,4759,719112,170210228,0,0,445328012,9606,152,2,[["C++",560000],["C",90000]]],
+ ["eves-eye","AI / ML","Next.js, Cerebras, SQLite",562948358,4961,16167,378158816,0,0,184789542,37,136,4,[["TypeScript",16167]]],
+ ["whirl","Web App","Next.js, Convex, Bun",477918394,4589,114056,9313391,27974764,0,440630239,23,38,1,[["TypeScript",114056]]],
+ ["notes","Web App","Next.js, MDX, Biome",210901503,1181,23627,1707414,0,0,209194089,40,173,216,[["TypeScript",23627]]],
+ ["clai","AI Tooling","TypeScript, Ink, AI SDK",209069540,2951,37312,74913548,0,0,134155992,54,97,1,[["TypeScript",37312]]],
+ ["winamp-player","Native Desktop","Rust, GPUI, rodio",9489804,3651,9454,1006009,0,0,8483795,139,30,4,[["Rust",9454]]],
+ ["sentinel","AI Tooling","Rust, GPUI, CDP",737329,44,8936,737329,0,0,0,0,null,0,[["Rust",8936]]],
+].map(a => ({name:a[0],cat:a[1],stack:a[2],bytes:a[3],files:a[4],loc:a[5],src:a[6],nm:a[7],target:a[8],other:a[9],commits:a[10],days:a[11],dirty:a[12],langs:a[13],
+  git: a[11] !== null || a[10] > 0}));
+
+const GIB = 1073741824, MIB = 1048576;
+const fmt = n => n.toLocaleString("en-US");
+const gib = b => b / GIB;
+const gb = b => gib(b) >= 1 ? gib(b).toFixed(1) + " GiB" : Math.round(b / MIB) + " MiB";
+
+// Recency state replaces the 14-hue category palette. Four toned hues, each means something.
+function state(p) {
+  if (!p.git) return ["no git", "#85858b"];
+  if (p.days <= 30) return ["built recently", "#4cc38a"];
+  if (p.days <= 365) return ["dormant", "#5b9dff"];
+  return ["over a year", "#e5484d"];
+}
+const stateHex = { "built recently": "#4cc38a", "dormant": "#5b9dff", "over a year": "#e5484d", "no git": "#85858b" };
+
+// ---- totals ----
+const t = { bytes:0, files:0, loc:0, commits:0, dirty:0, repos:0, active:0, dormant:0, stale:0, no_git:0, nm:0, target:0, other:0, src:0 };
+for (const p of P) {
+  t.bytes += p.bytes; t.files += p.files; t.loc += p.loc; t.commits += p.commits; t.dirty += p.dirty;
+  t.nm += p.nm; t.target += p.target; t.other += p.other; t.src += p.src;
+  if (p.git) { t.repos++; if (p.days <= 30) t.active++; else if (p.days <= 365) t.dormant++; else t.stale++; }
+  else t.no_git++;
+}
+
+document.getElementById("meta-folders").textContent = P.length + " folders";
+document.getElementById("meta-scan").textContent = "4.0s";
+
+// ---- inspector ----
+const insLead = document.getElementById("ins-lead"), insInfo = document.getElementById("ins-info");
+let pinned = null;
+function inspect(name) {
+  const p = P.find(x => x.name === name);
+  if (!p) { insLead.textContent = "Inspector"; insInfo.textContent = "hover a tile, dot or bar for details — click to pin"; return; }
+  const st = state(p)[0];
+  const days = p.git ? `last commit ${p.days}d ago` : "no git";
+  insLead.textContent = p.name;
+  insInfo.textContent = `${p.cat} · ${p.stack} · ${gb(p.bytes)} · ${fmt(p.files)} files · ${fmt(p.loc)} LOC · ${fmt(p.commits)} commits · ${days} · ${fmt(p.dirty)} dirty · ${st}`;
+}
+function bind(el, name) {
+  el.addEventListener("mousemove", () => inspect(name));
+  el.addEventListener("mouseleave", () => inspect(pinned));
+  el.addEventListener("click", () => { pinned = (pinned === name ? null : name); inspect(pinned || name); });
+}
+
+// ---- KPI strip ----
+const dirtiest = [...P].sort((a,b) => b.dirty - a.dirty).slice(0,3).map(p => `${p.name} (${p.dirty})`).join(", ");
+const kpis = [
+  [gb(t.bytes), "on disk", `${fmt(t.files)} files`],
+  [(t.loc/1e6).toFixed(2) + "M", "lines of code", "vendored excluded"],
+  [fmt(t.commits), "commits", `${t.repos} git repos`],
+  [fmt(t.dirty), "uncommitted files", "mostly in " + dirtiest.split(",")[0]],
+];
+document.getElementById("kpis").innerHTML = kpis.map(k =>
+  `<div class="kpi"><div class="fig">${k[0]}</div><div class="name">${k[1]}</div><div class="sub">${k[2]}</div></div>`).join("");
+
+// ---- squarified treemap (port of src/charts.rs) ----
+function worst(row, side) {
+  if (!row.length) return Infinity;
+  const total = row.reduce((s,r) => s + r, 0);
+  const mx = Math.max(...row), mn = Math.min(...row);
+  return Math.max(side*side*mx/(total*total), total*total/(side*side*mn));
+}
+function squarify(items, x, y, w, h) {
+  const total = items.reduce((s,i) => s + i[1], 0);
+  if (total <= 0 || w <= 0 || h <= 0) return [];
+  // (name, bytes, scaled area, category)
+  let rest = items.map(i => [i[0], i[1], i[1]*w*h/total, i[2]]).sort((a,b) => b[2]-a[2]);
+  const out = []; let rx=x, ry=y, rw=w, rh=h, row=[];
+  const flush = () => {
+    if (!row.length) return;
+    const s = row.reduce((sum,r) => sum + r[2], 0);
+    if (rw >= rh) {
+      const cw = s/rh; let cy = ry;
+      for (const r of row) { const ih = r[2]/cw; out.push([r[0], r[1], r[3], rx, cy, cw, ih]); cy += ih; }
+      rx += cw; rw -= cw;
+    } else {
+      const ch = s/rw; let cx = rx;
+      for (const r of row) { const iw = r[2]/ch; out.push([r[0], r[1], r[3], cx, ry, iw, ch]); cx += iw; }
+      ry += ch; rh -= ch;
+    }
+    row = [];
+  };
+  while (rest.length) {
+    const item = rest.shift();
+    const side = Math.min(rw, rh);
+    const areas = row.map(r => r[2]);
+    const withItem = areas.concat([item[2]]);
+    if (!row.length || worst(withItem, side) <= worst(areas, side)) row.push(item);
+    else { rest.unshift(item); flush(); }
+  }
+  flush();
+  return out;
+}
+const tm = document.getElementById("treemap");
+const W = tm.clientWidth || 1006;
+for (const [name, bytes, cat, x, y, w, h] of squarify(P.filter(p => p.bytes > 0).map(p => [p.name, p.bytes, p.cat]), 0, 0, W, 300)) {
+  const tw = w - 2, th = h - 2;
+  if (tw < 2 || th < 2) continue;
+  const st = state(P.find(p => p.name === name));
+  const area = tw * th, fs = Math.max(7, Math.min(12, Math.sqrt(area)/9));
+  const el = document.createElement("div");
+  el.className = "tile";
+  el.style.cssText = `left:${x+1}px;top:${y+1}px;width:${tw}px;height:${th}px;background:${st[1]}22;border:1px solid ${st[1]}88`;
+  let inner = "";
+  if (area > 3400) inner += `<div class="tname" style="font-size:${fs}px">${name}</div>`;
+  if (area > 14000) inner += `<div class="tsize" style="font-size:${Math.max(7,fs-3)}px">${gb(bytes)}</div>`;
+  el.innerHTML = inner;
+  bind(el, name);
+  tm.appendChild(el);
+}
+const counts = { "built recently":0, "dormant":0, "over a year":0, "no git":0 };
+for (const p of P) counts[state(p)[0]]++;
+document.getElementById("map-legend").innerHTML =
+  Object.entries(counts).filter(([,n]) => n > 0).map(([k,n]) => `<span><i class="dot" style="background:${stateHex[k]}"></i>${k} ${n}</span>`).join("");
+
+// ---- language mix: neutral bars, one accent on the leader ----
+const mix = {};
+for (const p of P) for (const [l,n] of p.langs) mix[l] = (mix[l]||0) + n;
+const langs = Object.entries(mix).sort((a,b) => b[1]-a[1]).slice(0,10);
+const totalL = langs.reduce((s,l) => s+l[1], 0), maxL = langs[0][1];
+document.getElementById("langs").innerHTML = langs.map(([l,n],i) => {
+  const pct = (n/totalL*100).toFixed(1);
+  return `<div class="langrow"><span class="lname">${l}</span><span class="barwrap"><i class="bar ${i===0?"lead":""}" style="width:${(n/maxL*100).toFixed(1)}%"></i></span><span class="pct">${pct}%</span></div>`;
+}).join("");
+
+// ---- pulse: one stacked bar, four state rows ----
+const segs = [["built recently",t.active,"#4cc38a"],["dormant",t.dormant,"#5b9dff"],["over a year",t.stale,"#e5484d"],["no git",t.no_git,"#85858b"]];
+document.getElementById("pulsebar").innerHTML = segs.filter(s=>s[1]>0).map(s => `<i style="flex:${s[1]};background:${s[2]}"></i>`).join("");
+document.getElementById("states").innerHTML = segs.map(s =>
+  `<div class="staterow"><span class="lbl"><i class="dot" style="background:${s[2]}"></i>${s[0]}</span><b>${s[1]}</b></div>`).join("");
+
+// ---- momentum scatter ----
+const sc = document.getElementById("scatter");
+const L=44, R=14, TOP=12, BOT=30, iw=W-L-R, ih=300-TOP-BOT, MAXD=660;
+const maxLoc = Math.max(2000, ...P.map(p=>p.loc));
+const xOf = d => L + (Math.log(1+Math.min(d,MAXD))/Math.log(1+MAXD))*iw;
+const yOf = l => TOP + ih - ((Math.log(Math.max(l,2000))-Math.log(2000))/(Math.log(maxLoc)-Math.log(2000)))*ih;
+for (const d of [0,7,30,90,180,365,MAXD]) {
+  const x = xOf(d);
+  sc.insertAdjacentHTML("beforeend", `<i class="gridline" style="left:${x}px;top:${TOP}px;width:1px;height:${ih}px"></i>`);
+  sc.insertAdjacentHTML("beforeend", `<span class="axislabel" style="left:${x-12}px;top:${TOP+ih+4}px;width:24px;text-align:center">${d===MAXD?"660+":d}</span>`);
+}
+for (const v of [5000,20000,50000,150000,700000]) {
+  if (v > maxLoc) continue;
+  const y = yOf(v);
+  sc.insertAdjacentHTML("beforeend", `<i class="gridline" style="left:${L}px;top:${y}px;width:${iw}px;height:1px"></i>`);
+  sc.insertAdjacentHTML("beforeend", `<span class="axislabel" style="left:0;top:${y-5}px;width:${L-6}px;text-align:right">${v>=1000?(v/1000)+"k":v}</span>`);
+}
+const sx = xOf(365);
+sc.insertAdjacentHTML("beforeend", `<i class="gridline" style="left:${sx}px;top:${TOP}px;width:1px;height:${ih}px;background:var(--stale);opacity:.6"></i>`);
+sc.insertAdjacentHTML("beforeend", `<span class="axislabel" style="left:${sx+4}px;top:${TOP}px;color:var(--stale)">1 year stale</span>`);
+sc.insertAdjacentHTML("beforeend", `<span class="axislabel" style="left:${L}px;top:${300-14}px;width:${iw}px;text-align:center;font-family:var(--sans)">days since last commit</span>`);
+for (const p of P.filter(p => p.days !== null).sort((a,b) => b.loc-a.loc)) {
+  const r = Math.max(2.6, Math.min(14, Math.sqrt(gib(p.bytes))*3.4+1.8));
+  const st = state(p);
+  const d = document.createElement("div");
+  d.className = "scatterdot";
+  d.style.cssText = `left:${xOf(p.days)-r}px;top:${yOf(p.loc)-r}px;width:${2*r}px;height:${2*r}px;background:${st[1]}55;border:1px solid ${st[1]}bb`;
+  bind(d, p.name);
+  sc.appendChild(d);
+}
+
+// ---- composition: src in the accent, junk in grey steps ----
+const top10 = [...P].sort((a,b) => b.bytes-a.bytes).slice(0,10);
+const maxB = top10[0].bytes;
+document.getElementById("composition").innerHTML = top10.map(p => {
+  const seg = (v, cls) => v > 0 ? `<i class="${cls}" style="width:${(v/maxB*100).toFixed(2)}%"></i>` : "";
+  return `<div class="comprow"><span class="cname">${p.name}</span><span class="segs">${seg(p.src,"seg-src")}${seg(p.nm,"seg-nm")}${seg(p.target,"seg-target")}${seg(p.other,"seg-other")}</span><span class="cgb">${gib(p.bytes).toFixed(1)}</span></div>`;
+}).join("");
+const tot = k => P.reduce((s,p) => s + p[k], 0);
+document.getElementById("comp-legend").innerHTML =
+  `<span><i class="dot" style="background:var(--accent)"></i>src ${gib(tot("src")).toFixed(1)} GiB</span>` +
+  `<span><i class="dot" style="background:#6b6b70"></i>node_modules ${gib(tot("nm")).toFixed(1)} GiB</span>` +
+  `<span><i class="dot" style="background:#4a4a4f"></i>target ${gib(tot("target")).toFixed(1)} GiB</span>` +
+  `<span><i class="dot" style="background:#333338"></i>other ${gib(tot("other")).toFixed(1)} GiB</span>`;
+
+// ---- insights: quiet text, no boxes ----
+const rebuildable = gib(t.nm + t.target + t.other);
+const biggest = [...P].sort((a,b) => b.loc-a.loc)[0];
+const topLang = langs[0];
+const insights = [
+  ["Only " + t.active + " are alive", t.active + " of " + t.repos + " repos touched in 30 days. " + t.dormant + " dormant, " + t.stale + " past a year."],
+  ["~" + rebuildable.toFixed(0) + " GiB is rebuildable", gib(t.target).toFixed(0) + " GiB target, " + gib(t.nm).toFixed(1) + " GiB node_modules, " + gib(t.other).toFixed(0) + " GiB other build output."],
+  ["One folder dwarfs the rest", biggest.name + " is " + fmt(biggest.loc) + " lines, " + (biggest.loc/t.loc*100).toFixed(0) + "% of all code here."],
+  ["What the code is written in", topLang[0] + " leads with " + fmt(topLang[1]) + " lines, " + (topLang[1]/t.loc*100).toFixed(0) + "% of all code here."],
+  [fmt(t.dirty) + " dirty files", "Uncommitted work, mostly in " + dirtiest + "."],
+  [t.no_git === 1 ? "1 folder has no git" : t.no_git + " folders have no git", "Worth a git init before history is lost."],
+];
+document.getElementById("insights").innerHTML = insights.map(i => `<div class="insight"><h3>${i[0]}</h3><p>${i[1]}</p></div>`).join("");
+</script>
+</body>
+</html>

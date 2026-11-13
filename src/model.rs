@@ -1,6 +1,21 @@
 //! Data model shared by the scanner, the fixture and the UI.
 
-use rune::Color;
+
+/// Commit activity buckets from git history, shared by the calendar heatmap and the
+/// weekday-hour heatmap. Empty when there is no git history.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Activity {
+    /// Commits per day, oldest first: index 0 is 363 days ago, index 363 is today.
+    pub per_day: Vec<u32>,
+    /// Commits by weekday and local hour: index `weekday * 24 + hour`, weekday 0 = Monday.
+    pub by_hour: Vec<u32>,
+}
+
+impl Activity {
+    pub fn total(&self) -> u64 {
+        self.per_day.iter().map(|&n| n as u64).sum()
+    }
+}
 
 /// One folder under the projects root.
 #[derive(Debug, Clone)]
@@ -24,6 +39,8 @@ pub struct Project {
     /// Days since the last commit; `None` when there is no git history.
     pub days: Option<u64>,
     pub dirty: u64,
+    /// Per-day and weekday-hour commit buckets; `None` without git history.
+    pub activity: Option<Activity>,
 }
 
 /// A scan event, sent from the scanner thread to the UI thread.
@@ -36,51 +53,8 @@ pub enum ScanEvent {
 }
 
 // Category palette, matched to the mock dashboard.
-pub fn cat_color(cat: &str) -> Color {
-    let hex = match cat {
-        "Web App" => "#4f8cff",
-        "AI / ML" => "#a855f7",
-        "Native Desktop" => "#22c55e",
-        "Mobile" => "#f59e0b",
-        "Client Site" => "#06b6d4",
-        "Portfolio" => "#ec4899",
-        "Clone / Fork" => "#ef4444",
-        "Learning" => "#64748b",
-        "Experiment" => "#8b5cf6",
-        "AI Tooling" => "#14b8a6",
-        "Browser Ext" => "#eab308",
-        "Docs / Research" => "#78716c",
-        "Desktop App" => "#34d399",
-        "Tooling" => "#475569",
-        _ => "#64748b",
-    };
-    rune::color::hex(hex).unwrap_or(Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 })
-}
 
 // Language colours, matched to GitHub's linguistic palette.
-pub fn lang_color(name: &str) -> Color {
-    let hex = match name {
-        "TypeScript" => "#3178c6",
-        "C++" => "#f34b7d",
-        "C" => "#94a3b8",
-        "JavaScript" => "#f1e05a",
-        "Python" => "#3572A5",
-        "Rust" => "#dea584",
-        "Kotlin" => "#a97bff",
-        "HTML" => "#e34c26",
-        "CSS" => "#8b5cf6",
-        "PHP" => "#4F5D95",
-        "Swift" => "#F05138",
-        "Go" => "#00ADD8",
-        "C#" => "#178600",
-        "Java" => "#b07219",
-        "Shell" => "#89e051",
-        "Vue" => "#41b883",
-        "Markdown" => "#78716c",
-        _ => "#64748b",
-    };
-    rune::color::hex(hex).unwrap_or(Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 })
-}
 
 // ---- formatting helpers ----
 
