@@ -146,6 +146,7 @@ impl State {
                     changed = true;
                 }
                 Ok(ScanEvent::Done { seconds }) => {
+                    eprintln!("scan done in {seconds:.1}s");
                     self.scanning = false;
                     self.scan_secs = seconds;
                     self.last_done = Some(clock);

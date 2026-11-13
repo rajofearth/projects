@@ -209,12 +209,11 @@ fn count_lines(path: &Path) -> u64 {
 /// render thread a frame. No-op off Windows.
 #[cfg(windows)]
 fn lower_priority() {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-    };
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
+    // Deliberately a no-op: BELOW_NORMAL starved the scan whenever the user was
+    // actively using the machine (a 4 s scan stretched to 3+ minutes). Frame CPU
+    // is ~0.5 ms against a 16 ms budget, so scan threads at normal priority do
+    // not cost the UI any frames.
+    let _ = 0;
 }
 
 #[cfg(not(windows))]
