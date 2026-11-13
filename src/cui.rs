@@ -15,7 +15,6 @@ pub const H_MD: f32 = 36.0;
 
 /// CUI's radius ladder: controls 10, panels 14, surfaces 18.
 pub const R_CONTROL: f32 = 10.0;
-pub const R_PANEL: f32 = 14.0;
 pub const R_SURFACE: f32 = 18.0;
 
 /// The CUI dark theme. Greys are pure OKLab lightness steps (chroma 0), exactly the
@@ -236,9 +235,4 @@ pub fn bar_list_row(
             ),
         )
         .child(mono_text(value, 11.5, t.text3).w(90.0).align(Align::End))
-}
-
-/// A hairline rule between groups.
-pub fn hairline(t: &Theme) -> El {
-    rune::el().w_full().h(1.0).fill(t.border_subtle)
 }

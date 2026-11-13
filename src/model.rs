@@ -1,22 +1,5 @@
 //! Data model shared by the scanner, the fixture and the UI.
 
-
-/// Commit activity buckets from git history, shared by the calendar heatmap and the
-/// weekday-hour heatmap. Empty when there is no git history.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Activity {
-    /// Commits per day, oldest first: index 0 is 363 days ago, index 363 is today.
-    pub per_day: Vec<u32>,
-    /// Commits by weekday and local hour: index `weekday * 24 + hour`, weekday 0 = Monday.
-    pub by_hour: Vec<u32>,
-}
-
-impl Activity {
-    pub fn total(&self) -> u64 {
-        self.per_day.iter().map(|&n| n as u64).sum()
-    }
-}
-
 /// One folder under the projects root.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -39,8 +22,6 @@ pub struct Project {
     /// Days since the last commit; `None` when there is no git history.
     pub days: Option<u64>,
     pub dirty: u64,
-    /// Per-day and weekday-hour commit buckets; `None` without git history.
-    pub activity: Option<Activity>,
 }
 
 /// A scan event, sent from the scanner thread to the UI thread.

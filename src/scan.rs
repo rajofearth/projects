@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::process::Command;
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use crate::model::{Project, ScanEvent};
@@ -28,8 +28,22 @@ const CODE_EXT: &[&str] = &[
 
 /// Directories whose bytes are regenerable build output (other than node_modules / target).
 const BUILD_DIRS: &[&str] = &[
-    "dist", "build", "out", ".next", ".turbo", ".cache", "__pycache__", ".venv", "venv",
-    "coverage", ".expo", ".output", ".svelte-kit", ".parcel-cache", "site-packages", ".gradle",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".turbo",
+    ".cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "coverage",
+    ".expo",
+    ".output",
+    ".svelte-kit",
+    ".parcel-cache",
+    "site-packages",
+    ".gradle",
 ];
 
 /// Max bytes of a source file we will read to count lines.
@@ -56,7 +70,10 @@ impl CiEq for str {
 impl CiEq for [u16] {
     fn eq_ci(&self, other: &str) -> bool {
         self.len() == other.len()
-            && self.iter().zip(other.as_bytes()).all(|(&a, &b)| a == b as u16 || a == (b.to_ascii_uppercase()) as u16)
+            && self
+                .iter()
+                .zip(other.as_bytes())
+                .all(|(&a, &b)| a == b as u16 || a == (b.to_ascii_uppercase()) as u16)
     }
 }
 
@@ -87,12 +104,14 @@ fn lang_of(name: &str) -> Option<&'static str> {
     if dot == 0 {
         return None;
     }
-    CODE_EXT.iter().find(|e| ext.eq_ignore_ascii_case(e)).map(|e| canonical_lang(e))
+    CODE_EXT
+        .iter()
+        .find(|e| ext.eq_ignore_ascii_case(e))
+        .map(|e| canonical_lang(e))
 }
 
 fn ends_with_ci(name: &str, suffix: &str) -> bool {
-    name.len() >= suffix.len()
-        && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    name.len() >= suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 #[derive(Default)]
@@ -137,7 +156,13 @@ impl Agg {
 
     /// The accounting core: bucket decides where the bytes land; `lang` + `abs` opt into a
     /// line count.
-    fn add_classified(&mut self, len: u64, bucket: Bucket, lang: Option<&'static str>, abs: Option<&Path>) {
+    fn add_classified(
+        &mut self,
+        len: u64,
+        bucket: Bucket,
+        lang: Option<&'static str>,
+        abs: Option<&Path>,
+    ) {
         self.bytes += len;
         self.files += 1;
         // Bit tests, not an exact match: buckets OR together down the tree, and junk wins
@@ -196,7 +221,9 @@ fn canonical_lang(ext: &str) -> &'static str {
 }
 
 fn count_lines(path: &Path) -> u64 {
-    let Ok(mut f) = fs::File::open(path) else { return 0 };
+    let Ok(mut f) = fs::File::open(path) else {
+        return 0;
+    };
     let mut total = 0u64;
     let mut take = MAX_READ;
     let mut chunk = [0u8; 128 * 1024];
@@ -216,18 +243,13 @@ fn count_lines(path: &Path) -> u64 {
     total
 }
 
-/// Git facts per project: is a repo, commit count, days since last commit, dirty files,
-/// plus commit activity buckets for the calendar and weekday-hour heatmaps.
+/// Git facts per project: is a repo, commit count, days since last commit, dirty files.
 #[derive(Debug, Clone, Default)]
 pub struct GitFacts {
     pub repo: bool,
     pub commits: u64,
     pub days: Option<u64>,
     pub dirty: u64,
-    /// Commits per day, oldest first: index 0 is 363 days ago, 363 is today. Empty without git.
-    pub per_day: Vec<u32>,
-    /// Commits by weekday and local hour: index `weekday * 24 + hour`, weekday 0 = Monday.
-    pub by_hour: Vec<u32>,
 }
 
 /// A cached fact set with its refs-mtime validity key.
@@ -264,9 +286,15 @@ fn mtime_nanos(p: &Path) -> u64 {
 fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     // --no-optional-locks: concurrent `git status` must never fight over index.lock.
-    cmd.args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"])
-        .args(args)
-        .current_dir(dir);
+    cmd.args([
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+    ])
+    .args(args)
+    .current_dir(dir);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -301,85 +329,43 @@ fn git_facts(dir: &Path, cache: &mut HashMap<PathBuf, GitFactsKeyed>) -> GitFact
     facts
 }
 
-/// Days from civil (Hinnant): converts a calendar date to days since 1970-01-01.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// Weekday of a day count since 1970-01-01 (a Thursday): 0 = Monday.
-fn weekday_of(epoch_days: i64) -> i64 {
-    (epoch_days + 3).rem_euclid(7)
-}
-
-/// The scanner's local UTC offset, so commit dates resolve to local calendar days.
-#[cfg(windows)]
-pub fn local_utc_offset_secs() -> i64 {
-    use windows_sys::Win32::System::Time::GetTimeZoneInformation;
-    unsafe {
-        let mut tzi: windows_sys::Win32::System::Time::TIME_ZONE_INFORMATION = std::mem::zeroed();
-        let id = GetTimeZoneInformation(&mut tzi);
-        let mut bias = tzi.Bias as i64; // minutes; UTC = local + bias
-        // TIME_ZONE_ID_DAYLIGHT == 2: the system is currently on daylight saving time.
-        if id == 2 {
-            bias += tzi.DaylightBias as i64;
-        }
-        -bias * 60
-    }
-}
-
-#[cfg(not(windows))]
-pub fn local_utc_offset_secs() -> i64 {
-    0
-}
-
-/// Git history in a single `git log` pass: commit count, days since the last commit, and
-/// per-day / weekday-hour commit buckets over the trailing year, all in the scanner's local time.
+/// Git facts via two cheap calls: the commit count and the last commit's age. The
+/// cache in `git_facts` short-circuits both when refs haven't moved.
 fn git_history(dir: &Path) -> GitFacts {
     let mut facts = GitFacts {
         repo: true,
         ..Default::default()
     };
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let today_days = (now_secs + local_utc_offset_secs()).div_euclid(86_400);
-    if let Some(log) = git_output(dir, &["log", "--pretty=%cI", "-n", "40000"]) {
-        facts.per_day = vec![0; 364];
-        facts.by_hour = vec![0; 168];
-        for line in log.lines() {
-            // ISO 8601: YYYY-MM-DDTHH:MM:SS(+/-)HH:MM
-            if line.len() < 19 {
-                continue;
+    if let Some(out) = git_output(dir, &["rev-list", "--count", "HEAD"]) {
+        facts.commits = out.lines().next().and_then(|l| l.parse().ok()).unwrap_or(0);
+    }
+    if let Some(out) = git_output(dir, &["log", "-1", "--format=%cI"]) {
+        // ISO 8601: YYYY-MM-DDTHH:MM:SS...
+        if out.len() >= 10 {
+            let (y, m, d) = (
+                out[0..4].parse::<i64>().unwrap_or(0),
+                out[5..7].parse::<i64>().unwrap_or(0),
+                out[8..10].parse::<i64>().unwrap_or(0),
+            );
+            if y > 0 && (1..=12).contains(&m) && (1..=31).contains(&d) {
+                let then = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|e| e.as_secs() as i64)
+                    .unwrap_or(0);
+                // Days since, via the civil date difference against today in UTC.
+                let now_days = then.div_euclid(86_400);
+                let then_days = {
+                    // days_from_civil (Hinnant)
+                    let yy = if m <= 2 { y - 1 } else { y };
+                    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+                    let yoe = yy - era * 400;
+                    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+                    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                    era * 146_097 + doe - 719_468
+                };
+                facts.days = Some((now_days - then_days).max(0) as u64);
             }
-            let y: i64 = line[0..4].parse().unwrap_or(0);
-            let m: i64 = line[5..7].parse().unwrap_or(0);
-            let d: i64 = line[8..10].parse().unwrap_or(0);
-            if y == 0 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-                continue;
-            }
-            let day = days_from_civil(y, m, d);
-            let ago = today_days - day;
-            if (0..364).contains(&ago) {
-                facts.per_day[363 - ago as usize] += 1;
-            }
-            if let Ok(hour) = line[11..13].parse::<usize>() {
-                if hour < 24 {
-                    facts.by_hour[(weekday_of(day) as usize) * 24 + hour] += 1;
-                }
-            }
-            facts.commits += 1;
         }
-        facts.days = facts
-            .per_day
-            .iter()
-            .rposition(|&n| n > 0)
-            .map(|i| (363 - i) as u64);
     }
     facts
 }
@@ -487,7 +473,10 @@ pub fn scan(
     let started = Instant::now();
     let dirs = list_projects(&root);
     if dirs.is_empty() {
-        let _ = tx.send(ScanEvent::Failed(format!("no folders under {}", root.display())));
+        let _ = tx.send(ScanEvent::Failed(format!(
+            "no folders under {}",
+            root.display()
+        )));
         wake();
         return;
     }
@@ -497,7 +486,9 @@ pub fn scan(
     std::thread::scope(|scope| {
         // Git facts: repos round-robined over 8 workers.
         let git_results: std::sync::Arc<std::sync::Mutex<Vec<Option<GitFacts>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new((0..dirs.len()).map(|_| None).collect()));
+            std::sync::Arc::new(std::sync::Mutex::new(
+                (0..dirs.len()).map(|_| None).collect(),
+            ));
         let git_handle = {
             let git_results = git_results.clone();
             let cache = git_cache.clone();
@@ -527,7 +518,8 @@ pub fn scan(
                                 // merged back when the workers join.
                                 let mut local: HashMap<PathBuf, GitFactsKeyed> =
                                     cache.lock().unwrap().clone();
-                                let mut out: Vec<(usize, GitFacts)> = Vec::with_capacity(mine.len());
+                                let mut out: Vec<(usize, GitFacts)> =
+                                    Vec::with_capacity(mine.len());
                                 for (i, d) in mine {
                                     out.push((i, git_facts(&d, &mut local)));
                                 }
@@ -560,12 +552,11 @@ pub fn scan(
                 .unwrap_or_default();
             let facts = git_all[i].clone().unwrap_or_default();
             let (cat, stack) = classify(dir, &aggs[i]);
-            let activity = facts.repo.then(|| crate::model::Activity {
-                per_day: facts.per_day.clone(),
-                by_hour: facts.by_hour.clone(),
-            });
-            let mut langs: Vec<(String, u64)> =
-                aggs[i].langs.iter().map(|(l, n)| (l.to_string(), *n)).collect();
+            let mut langs: Vec<(String, u64)> = aggs[i]
+                .langs
+                .iter()
+                .map(|(l, n)| (l.to_string(), *n))
+                .collect();
             langs.sort_by(|a, b| b.1.cmp(&a.1));
             langs.truncate(8);
             let project = Project {
@@ -584,7 +575,6 @@ pub fn scan(
                 commits: facts.commits,
                 days: facts.days,
                 dirty: facts.dirty,
-                activity,
             };
             let _ = tx.send(ScanEvent::Project(Box::new(project)));
             wake();
@@ -595,7 +585,6 @@ pub fn scan(
     });
     wake();
 }
-
 
 /// Walk every project folder concurrently, one aggregate per project. Windows uses a
 /// hand-rolled `FindFirstFileW` traversal: sizes arrive with the directory enumeration (no
@@ -662,11 +651,16 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
 
     fn wide_ext(w: &[u16]) -> Option<&[u16]> {
         let i = w.iter().rposition(|&c| c == b'.' as u16)?;
-        if i == 0 { None } else { Some(&w[i + 1..]) }
+        if i == 0 {
+            None
+        } else {
+            Some(&w[i + 1..])
+        }
     }
 
-    let aggs: Arc<Mutex<Vec<Agg>>> =
-        Arc::new(Mutex::new((0..dirs.len()).map(|_| Agg::default()).collect()));
+    let aggs: Arc<Mutex<Vec<Agg>>> = Arc::new(Mutex::new(
+        (0..dirs.len()).map(|_| Agg::default()).collect(),
+    ));
     let queue = Arc::new(Queue {
         tasks: Mutex::new((Vec::new(), 0)),
         cv: Condvar::new(),
@@ -681,7 +675,11 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
         } else {
             PathBuf::from(format!("\\\\\\?\\{}", abs.display()))
         };
-        queue.push(Task { proj: i, dir, bucket: 0 });
+        queue.push(Task {
+            proj: i,
+            dir,
+            bucket: 0,
+        });
     }
 
     let workers = 32;
@@ -732,12 +730,24 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
                                         // path allocation; the other ~400k entries never do.
                                         let candidate = len > 0
                                             && len <= MAX_READ
-                                            && wide_ext(name).is_some_and(|ext| CODE_EXT.iter().any(|e| ext.eq_ci(e)));
+                                            && wide_ext(name).is_some_and(|ext| {
+                                                CODE_EXT.iter().any(|e| ext.eq_ci(e))
+                                            });
                                         let lang = candidate.then(|| {
-                                            lang_of(OsString::from_wide(name).to_string_lossy().as_ref())
+                                            lang_of(
+                                                OsString::from_wide(name)
+                                                    .to_string_lossy()
+                                                    .as_ref(),
+                                            )
                                         });
-                                        let abs = candidate.then(|| task.dir.join(OsString::from_wide(name)));
-                                        agg.add_classified(len, bucket, lang.flatten(), abs.as_deref());
+                                        let abs = candidate
+                                            .then(|| task.dir.join(OsString::from_wide(name)));
+                                        agg.add_classified(
+                                            len,
+                                            bucket,
+                                            lang.flatten(),
+                                            abs.as_deref(),
+                                        );
                                     }
                                 }
                                 if FindNextFileW(handle, &mut fd) == 0 {
@@ -785,10 +795,6 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
     aggs
 }
 
-
-
-
-
 #[cfg(test)]
 mod lang_tests {
     use super::*;
@@ -811,6 +817,10 @@ mod lang_tests {
         assert_eq!(lang_of("bundle.js.map"), None);
         assert_eq!(lang_of(".rs"), None, "a dotfile has no extension");
         assert_eq!(lang_of("main.rs"), Some("Rust"));
-        assert_eq!(lang_of("MAIN.RS"), Some("Rust"), "extension match ignores case");
+        assert_eq!(
+            lang_of("MAIN.RS"),
+            Some("Rust"),
+            "extension match ignores case"
+        );
     }
 }

@@ -54,7 +54,14 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
             let mut cy = *ry;
             for r in row.drain(..) {
                 let ih = (r.2 / cw as f64) as f32;
-                out.push(Tile { name: r.0, bytes: r.1, x: *rx, y: cy, w: cw, h: ih });
+                out.push(Tile {
+                    name: r.0,
+                    bytes: r.1,
+                    x: *rx,
+                    y: cy,
+                    w: cw,
+                    h: ih,
+                });
                 cy += ih;
             }
             *rx += cw;
@@ -64,7 +71,14 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
             let mut cx = *rx;
             for r in row.drain(..) {
                 let iw = (r.2 / ch as f64) as f32;
-                out.push(Tile { name: r.0, bytes: r.1, x: cx, y: *ry, w: iw, h: ch });
+                out.push(Tile {
+                    name: r.0,
+                    bytes: r.1,
+                    x: cx,
+                    y: *ry,
+                    w: iw,
+                    h: ch,
+                });
                 cx += iw;
             }
             *ry += ch;
@@ -101,7 +115,16 @@ fn arc_points(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Vec<[f32; 2]> {
 }
 
 /// A donut ring segment between radii `ir` and `r`, from angle `a0` to `a1` (radians, y-down).
-pub fn ring(shape: Shape, cx: f32, cy: f32, ir: f32, r: f32, a0: f32, a1: f32, color: Color) -> Shape {
+pub fn ring(
+    shape: Shape,
+    cx: f32,
+    cy: f32,
+    ir: f32,
+    r: f32,
+    a0: f32,
+    a1: f32,
+    color: Color,
+) -> Shape {
     let mut outer = arc_points(cx, cy, r, a0, a1);
     let mut inner = arc_points(cx, cy, ir, a1, a0);
     outer.extend(inner.drain(..));
@@ -158,12 +181,25 @@ mod tests {
     #[test]
     fn arc_points_trace_the_requested_arc() {
         let pts = arc_points(0.0, 0.0, 10.0, 0.0, std::f32::consts::FRAC_PI_2);
-        assert!(pts.len() >= 16, "4° steps over a quarter circle: {}", pts.len());
-        assert!((pts[0][0] - 10.0).abs() < 1e-4 && pts[0][1].abs() < 1e-4, "starts at angle 0");
+        assert!(
+            pts.len() >= 16,
+            "4° steps over a quarter circle: {}",
+            pts.len()
+        );
+        assert!(
+            (pts[0][0] - 10.0).abs() < 1e-4 && pts[0][1].abs() < 1e-4,
+            "starts at angle 0"
+        );
         let last = pts.last().unwrap();
-        assert!(last[0].abs() < 1e-4 && (last[1] - 10.0).abs() < 1e-4, "ends at the end angle");
+        assert!(
+            last[0].abs() < 1e-4 && (last[1] - 10.0).abs() < 1e-4,
+            "ends at the end angle"
+        );
         for p in &pts {
-            assert!((p[0] * p[0] + p[1] * p[1] - 100.0).abs() < 1e-3, "every point on the r=10 circle");
+            assert!(
+                (p[0] * p[0] + p[1] * p[1] - 100.0).abs() < 1e-3,
+                "every point on the r=10 circle"
+            );
         }
     }
 

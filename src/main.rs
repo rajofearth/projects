@@ -12,11 +12,11 @@ mod viz;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
 
-use rune::{AppSpec, Waker};
 use model::ScanEvent;
+use rune::{AppSpec, Waker};
 use scan::GitCache;
 
 pub struct State {
@@ -40,12 +40,6 @@ pub struct State {
     pub fps: f32,
     /// This process's working set, sampled once a second.
     pub ram_bytes: u64,
-    /// Name of the item under the cursor, if any (drives the inspector bar).
-    pub hover: Option<String>,
-    /// Name of the clicked/pinned item — survives cursor movement until clicked again.
-    pub pinned: Option<String>,
-    /// Which sidebar page is showing.
-    pub page: Page,
     fps_frames: u32,
     fps_since: f64,
     last_trim: f64,
@@ -55,28 +49,6 @@ pub struct State {
 }
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
-
-/// The sidebar's pages: the main view carries the highlights, the rest each carry one
-/// kind of information to dig into.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Page {
-    Overview,
-    Projects,
-    Languages,
-    Activity,
-}
-
-impl Page {
-    pub const ALL: [(Page, &'static str); 4] = [
-        (Page::Overview, "Overview"),
-        (Page::Projects, "Projects"),
-        (Page::Languages, "Languages"),
-        (Page::Activity, "Activity"),
-    ];
-    pub fn title(self) -> &'static str {
-        Self::ALL.iter().find(|(p, _)| *p == self).map(|(_, t)| *t).unwrap_or("Overview")
-    }
-}
 
 impl State {
     fn new() -> State {
@@ -97,9 +69,6 @@ impl State {
             demo: false,
             fps: 0.0,
             ram_bytes: 0,
-            hover: None,
-            pinned: None,
-            page: Page::Overview,
             fps_frames: 0,
             fps_since: 0.0,
             last_trim: 0.0,
@@ -232,7 +201,9 @@ fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
 
 #[cfg(windows)]
 fn process_ram() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut pmc = PROCESS_MEMORY_COUNTERS {
         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
@@ -334,7 +305,12 @@ fn main() {
         // The mono slot is the platform's monospaced UI font: Cascadia Mono on Windows.
         // Every figure and axis label sets in it, tabular by nature.
         families: ("Inter", "ui-monospace"),
-        ..AppSpec::new("Projects — Live Stats", (1100.0, 780.0), State::new, ui::view)
+        ..AppSpec::new(
+            "Projects — Live Stats",
+            (1100.0, 780.0),
+            State::new,
+            ui::view,
+        )
     });
 }
 
@@ -345,7 +321,10 @@ mod tests {
     use std::process::Command;
 
     fn demo_runtime() -> Runtime<State> {
-        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let env = rune::Env {
+            system_dark: true,
+            scale: 2.0,
+        };
         let mut state = State::new();
         state.load_demo();
         let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
@@ -367,8 +346,12 @@ mod tests {
     fn treemap_tiles_lay_out_inside_the_map() {
         let rt = demo_runtime();
         let (rect, _) = rt.presented("treemap").expect("treemap laid out");
-        let want_w = 1100.0 - ui::SIDE_W - 48.0 - 40.0;
-        assert!((rect[2] - want_w).abs() < 2.0, "treemap width {} want {want_w}", rect[2]);
+        let want_w = ui::CHART_W;
+        assert!(
+            (rect[2] - want_w).abs() < 2.0,
+            "treemap width {} want {want_w}",
+            rect[2]
+        );
         assert!((rect[3] - 280.0).abs() < 2.0, "treemap height {}", rect[3]);
         let (tile, _) = rt
             .presented("tile/chinchilla")
@@ -378,8 +361,11 @@ mod tests {
         for info in rt.elements() {
             if info.key.as_deref().is_some_and(|k| k.starts_with("tile/")) {
                 let key = info.key.clone().unwrap();
-                assert!(info.rect[2] <= want_w + 0.5 && info.rect[3] <= 280.0 + 0.5,
-                    "{key} overflows: {:?}", info.rect);
+                assert!(
+                    info.rect[2] <= want_w + 0.5 && info.rect[3] <= 280.0 + 0.5,
+                    "{key} overflows: {:?}",
+                    info.rect
+                );
             }
         }
     }
@@ -397,15 +383,25 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_switches_pages() {
-        let mut rt = demo_runtime();
-        assert!(rt.find("page-projects").is_none(), "projects page hidden at first");
-        let (x, y) = rt.find("nav/Projects").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.page, Page::Projects, "nav click switches page");
-        assert!(rt.find("projrow/chinchilla").is_some(), "projects list laid out");
+    fn projects_table_has_headers_and_top_rows() {
+        let rt = demo_runtime();
+        assert!(
+            rt.find("projrow/chinchilla").is_some(),
+            "biggest project listed"
+        );
+        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
+        for col in ["PROJECT", "DISK", "LOC", "COMMITS", "LAST COMMIT"] {
+            assert!(
+                texts.iter().any(|t| t == col),
+                "table header {col} present: {texts:?}"
+            );
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("and") && t.contains("more")),
+            "more-note present"
+        );
     }
 
     #[test]
@@ -426,16 +422,49 @@ mod tests {
         let proj = root.join("demo-one");
         std::fs::create_dir_all(proj.join("src")).unwrap();
         std::fs::create_dir_all(proj.join("node_modules")).unwrap();
-        std::fs::write(proj.join("src/main.rs"), "fn main() {}\nfn a() {}\nfn b() {}\n").unwrap();
-        std::fs::write(proj.join("src/lib.ts"), "export const x = 1;\nexport const y = 2;\n").unwrap();
+        std::fs::write(
+            proj.join("src/main.rs"),
+            "fn main() {}\nfn a() {}\nfn b() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("src/lib.ts"),
+            "export const x = 1;\nexport const y = 2;\n",
+        )
+        .unwrap();
         std::fs::write(proj.join("node_modules/big.js"), "x".repeat(4096)).unwrap();
-        std::fs::write(proj.join("package.json"), r#"{ "dependencies": { "next": "1" } }"#).unwrap();
-        let git_ok = Command::new("git").args(["init", "-q"]).current_dir(&proj).status().map(|s| s.success()).unwrap_or(false);
+        std::fs::write(
+            proj.join("package.json"),
+            r#"{ "dependencies": { "next": "1" } }"#,
+        )
+        .unwrap();
+        let git_ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         if git_ok {
-            Command::new("git").args(["config", "user.email", "t@t"]).current_dir(&proj).status().unwrap();
-            Command::new("git").args(["config", "user.name", "t"]).current_dir(&proj).status().unwrap();
-            Command::new("git").args(["add", "."]).current_dir(&proj).status().unwrap();
-            Command::new("git").args(["commit", "-qm", "init"]).current_dir(&proj).status().unwrap();
+            Command::new("git")
+                .args(["config", "user.email", "t@t"])
+                .current_dir(&proj)
+                .status()
+                .unwrap();
+            Command::new("git")
+                .args(["config", "user.name", "t"])
+                .current_dir(&proj)
+                .status()
+                .unwrap();
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&proj)
+                .status()
+                .unwrap();
+            Command::new("git")
+                .args(["commit", "-qm", "init"])
+                .current_dir(&proj)
+                .status()
+                .unwrap();
         }
 
         let (tx, rx) = channel();
@@ -478,7 +507,9 @@ mod tests {
     #[test]
     #[ignore]
     fn real_root_scan_smoke() {
-        let root = PathBuf::from(std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into()));
+        let root = PathBuf::from(
+            std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into()),
+        );
         let cache: GitCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (first, cold) = run_real_scan(root.clone(), cache.clone());
         let (second, warm) = run_real_scan(root, cache);
@@ -523,7 +554,10 @@ mod tests {
 
     #[test]
     fn live_scan_drains_events_into_state() {
-        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let env = rune::Env {
+            system_dark: true,
+            scale: 2.0,
+        };
         let (tx, rx) = channel();
         let mut state = State::new();
         state.rx = Some(rx);
@@ -547,7 +581,6 @@ mod tests {
             commits: 5,
             days: Some(3),
             dirty: 1,
-            activity: None,
         })))
         .unwrap();
         tx.send(ScanEvent::Done { seconds: 1.0 }).unwrap();
@@ -565,17 +598,23 @@ mod tests {
         assert!(!rt.state.scanning, "Done clears the flag");
         assert_eq!(rt.state.projects[0].name, "demo-one");
         // The dashboard now shows the scanned folder.
-        assert!(rt.find("tile/demo-one").is_some(), "scanned folder gets a tile");
+        assert!(
+            rt.find("tile/demo-one").is_some(),
+            "scanned folder gets a tile"
+        );
     }
 }
 
 #[cfg(test)]
-mod inspector_tests {
+mod tooltip_tests {
     use super::*;
     use rune::Runtime;
 
     fn demo() -> Runtime<State> {
-        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let env = rune::Env {
+            system_dark: true,
+            scale: 2.0,
+        };
         let mut state = State::new();
         state.load_demo();
         let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
@@ -583,54 +622,34 @@ mod inspector_tests {
         rt
     }
 
-    fn inspector_text(rt: &Runtime<State>) -> String {
+    fn help_of(rt: &Runtime<State>, key: &str) -> String {
         rt.elements()
             .into_iter()
-            .filter_map(|e| e.text)
-            .find(|t| t.contains("hover a tile") || t.contains("\u{b7} pinned") || t.contains("dirty"))
+            .find(|e| e.key.as_deref() == Some(key))
+            .and_then(|e| e.help)
             .unwrap_or_default()
     }
 
     #[test]
-    fn hover_names_the_item_and_leaving_clears_it() {
-        let mut rt = demo();
-        assert!(inspector_text(&rt).contains("hover a tile"), "hint first");
-        let (x, y) = rt.find("tile/chinchilla").expect("tile");
-        rt.pointer_move(x, y);
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.hover.as_deref(), Some("chinchilla"));
+    fn tiles_and_rows_carry_tooltips_not_an_inspector() {
+        let rt = demo();
+        let tip = help_of(&rt, "tile/chinchilla");
+        assert!(
+            tip.contains("dirty") && tip.contains("commits"),
+            "tile tooltip has the details: {tip}"
+        );
+        let row_tip = help_of(&rt, "projrow/chinchilla");
+        assert!(
+            row_tip.contains("commits"),
+            "project row tooltip has the details: {row_tip}"
+        );
+        // The inspector bar is gone: nothing tells you to hover it.
         let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
-        assert!(texts.iter().any(|t| t == "chinchilla"), "inspector leads with the name");
-        assert!(texts.iter().any(|t| t.contains("dirty")), "inspector shows the details");
-        rt.pointer_leave();
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.hover, None, "leaving clears the preview");
-    }
-
-    #[test]
-    fn click_pins_and_click_again_unpins() {
-        // The scatter sits below the fold at the default window height.
-        let env = rune::Env { system_dark: true, scale: 2.0 };
-        let mut state = State::new();
-        state.load_demo();
-        let mut rt = Runtime::new(state, ui::view, (1100.0, 2500.0), env);
-        rt.frame(0.0);
-        let (x, y) = rt.find("dot/whirl").expect("dot");
-        rt.pointer_move(x, y);
-        rt.frame(1.0 / 60.0);
-
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.pinned.as_deref(), Some("whirl"));
-        rt.pointer_leave();
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.pinned.as_deref(), Some("whirl"), "pin survives leaving");
-        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
-        assert!(texts.iter().any(|t| t.contains("\u{b7} pinned")), "inspector shows the pin");
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.pinned, None, "second click unpins");
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("hover a tile") || t.contains("pinned")),
+            "no inspector bar anywhere"
+        );
     }
 }
