@@ -26,13 +26,6 @@ pub struct Project {
     pub dirty: u64,
 }
 
-impl Project {
-    /// The bucket a byte count belongs to, for the composition chart.
-    pub fn build_junk(&self) -> u64 {
-        self.nm + self.target + self.other
-    }
-}
-
 /// A scan event, sent from the scanner thread to the UI thread.
 #[derive(Debug)]
 pub enum ScanEvent {
@@ -43,44 +36,29 @@ pub enum ScanEvent {
 }
 
 // Category palette, matched to the mock dashboard.
-pub const C_WEB: &str = "#4f8cff";
-pub const C_AI: &str = "#a855f7";
-pub const C_NATIVE: &str = "#22c55e";
-pub const C_MOBILE: &str = "#f59e0b";
-pub const C_CLIENT: &str = "#06b6d4";
-pub const C_PORTFOLIO: &str = "#ec4899";
-pub const C_CLONE: &str = "#ef4444";
-pub const C_LEARN: &str = "#64748b";
-pub const C_EXP: &str = "#8b5cf6";
-pub const C_TOOL: &str = "#14b8a6";
-pub const C_EXT: &str = "#eab308";
-pub const C_DOCS: &str = "#78716c";
-pub const C_DESK: &str = "#34d399";
-pub const C_UTIL: &str = "#475569";
-
 pub fn cat_color(cat: &str) -> Color {
     let hex = match cat {
-        "Web App" => C_WEB,
-        "AI / ML" => C_AI,
-        "Native Desktop" => C_NATIVE,
-        "Mobile" => C_MOBILE,
-        "Client Site" => C_CLIENT,
-        "Portfolio" => C_PORTFOLIO,
-        "Clone / Fork" => C_CLONE,
-        "Learning" => C_LEARN,
-        "Experiment" => C_EXP,
-        "AI Tooling" => C_TOOL,
-        "Browser Ext" => C_EXT,
-        "Docs / Research" => C_DOCS,
-        "Desktop App" => C_DESK,
-        "Tooling" => C_UTIL,
-        _ => C_LEARN,
+        "Web App" => "#4f8cff",
+        "AI / ML" => "#a855f7",
+        "Native Desktop" => "#22c55e",
+        "Mobile" => "#f59e0b",
+        "Client Site" => "#06b6d4",
+        "Portfolio" => "#ec4899",
+        "Clone / Fork" => "#ef4444",
+        "Learning" => "#64748b",
+        "Experiment" => "#8b5cf6",
+        "AI Tooling" => "#14b8a6",
+        "Browser Ext" => "#eab308",
+        "Docs / Research" => "#78716c",
+        "Desktop App" => "#34d399",
+        "Tooling" => "#475569",
+        _ => "#64748b",
     };
     rune::color::hex(hex).unwrap_or(Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 })
 }
 
 // Language colours, matched to GitHub's linguistic palette.
-fn lang_color(name: &str) -> Color {
+pub fn lang_color(name: &str) -> Color {
     let hex = match name {
         "TypeScript" => "#3178c6",
         "C++" => "#f34b7d",
@@ -102,10 +80,6 @@ fn lang_color(name: &str) -> Color {
         _ => "#64748b",
     };
     rune::color::hex(hex).unwrap_or(Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 })
-}
-
-pub fn lang_color_or(name: &str) -> Color {
-    lang_color(name)
 }
 
 // ---- formatting helpers ----

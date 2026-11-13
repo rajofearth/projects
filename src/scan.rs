@@ -2,12 +2,12 @@
 //! classifies bytes into source vs build junk, counts hand-written lines per language, and asks
 //! git for the facts. Progress streams to the UI thread as [`ScanEvent`]s.
 //!
-//! Two speed decisions live here:
-//! - The walk is a hand-rolled `FindFirstFileW` traversal (Windows) with a shared work queue:
-//!   directory metadata comes straight from the directory enumeration, buckets are inherited
-//!   down the tree instead of re-derived per file, and nothing is allocated per entry.
-//! - Git facts come from libgit2 in-process (`git2`): spawning `git.exe` costs ~170 ms each on
-//!   Windows, which made 350 spawns the slowest part of the whole scan.
+//! The walk is a hand-rolled `FindFirstFileW` traversal (Windows) with a shared work queue:
+//! directory metadata comes straight from the directory enumeration, buckets are inherited
+//! down the tree instead of re-derived per file, and nothing is allocated per entry. Git facts
+//! come from the `git` CLI, run concurrently with the walk. Scan threads stay at normal
+//! priority: BELOW_NORMAL starved the scan whenever the user was actively using the machine
+//! (a 4 s scan stretched past 3 minutes), while frame CPU is ~0.5 ms against a 16 ms budget.
 
 use std::collections::HashMap;
 use std::fs;
@@ -26,11 +26,6 @@ const CODE_EXT: &[&str] = &[
     "sql", "toml", "dart", "cs", "lua", "zig",
 ];
 
-/// Files never worth counting as hand-written lines.
-const JUNK_NAMES: &[&str] = &[
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock", "bun.lockb", "bun.lock",
-];
-
 /// Directories whose bytes are regenerable build output (other than node_modules / target).
 const BUILD_DIRS: &[&str] = &[
     "dist", "build", "out", ".next", ".turbo", ".cache", "__pycache__", ".venv", "venv",
@@ -47,24 +42,54 @@ const JUNK: Bucket = 1;
 const TARGET: Bucket = 2;
 const OTHER: Bucket = 4;
 
-#[cfg(not(windows))]
-#[cfg(not(windows))]
-fn bucket_of(name: &str) -> Bucket {
-    if name.eq_ignore_ascii_case("node_modules") {
+/// Case-insensitive name match, over either a `&str` or a raw `FindFirstFileW` name.
+trait CiEq {
+    fn eq_ci(&self, other: &str) -> bool;
+}
+
+impl CiEq for str {
+    fn eq_ci(&self, other: &str) -> bool {
+        self.eq_ignore_ascii_case(other)
+    }
+}
+
+impl CiEq for [u16] {
+    fn eq_ci(&self, other: &str) -> bool {
+        self.len() == other.len()
+            && self.iter().zip(other.as_bytes()).all(|(&a, &b)| a == b as u16 || a == (b.to_ascii_uppercase()) as u16)
+    }
+}
+
+/// One bucket function for both walkers: the Windows one matches raw wide names without
+/// allocating, the fallback matches `&str`s.
+fn bucket_of(name: &(impl CiEq + ?Sized)) -> Bucket {
+    if name.eq_ci("node_modules") {
         return JUNK;
     }
     let mut b = 0;
-    if name.eq_ignore_ascii_case("target") || name.eq_ignore_ascii_case("deriveddata") {
+    if name.eq_ci("target") || name.eq_ci("deriveddata") {
         b |= TARGET;
     }
-    if name.eq_ignore_ascii_case(".git") || BUILD_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d)) {
+    if name.eq_ci(".git") || BUILD_DIRS.iter().any(|d| name.eq_ci(d)) {
         b |= OTHER;
     }
     b
 }
 
-#[cfg(not(windows))]
-#[cfg(not(windows))]
+/// Which language a countable file name maps to, or None when it isn't hand-written code.
+/// Lock files and source maps never pass the extension gate; minified bundles carry a `js`
+/// extension, so they need their own exclusion.
+fn lang_of(name: &str) -> Option<&'static str> {
+    if ends_with_ci(name, ".min.js") {
+        return None;
+    }
+    let (dot, ext) = name.rfind('.').map(|i| (i, &name[i + 1..]))?;
+    if dot == 0 {
+        return None;
+    }
+    CODE_EXT.iter().find(|e| ext.eq_ignore_ascii_case(e)).map(|e| canonical_lang(e))
+}
+
 fn ends_with_ci(name: &str, suffix: &str) -> bool {
     name.len() >= suffix.len()
         && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
@@ -97,33 +122,16 @@ impl Agg {
     }
 
     /// One file. `name` is the file's own name; `bucket` is the directory's inherited bucket.
-    #[cfg(not(windows))]
     /// `abs` is passed only for files that might get line-counted, so the walker can skip
     /// building paths for the other ~400k entries.
+    #[cfg(not(windows))]
     fn add(&mut self, name: &str, len: u64, bucket: Bucket, abs: Option<&Path>) {
-        // A file can carry its own bucket (a file literally named `target`), matching the
-        // old per-component behaviour.
-        let own = bucket_of(name);
-        let bucket = if own & JUNK != 0 { JUNK } else { bucket | own };
-
-        // Hand-written lines: known code extension, small enough, not a lock file. All
-        // case-insensitive, so no per-file lowercase allocation.
-        let mut lang = None;
-        if bucket & JUNK == 0
-            && len > 0
-            && len <= MAX_READ
-            && !JUNK_NAMES.iter().any(|j| name.eq_ignore_ascii_case(j))
-            && !ends_with_ci(name, ".min.js")
-            && !ends_with_ci(name, ".map")
-        {
-            if let Some((dot, ext)) = name.rfind('.').map(|i| (i, &name[i + 1..])) {
-                if dot > 0 {
-                    if let Some(e) = CODE_EXT.iter().find(|e| ext.eq_ignore_ascii_case(e)) {
-                        lang = Some(canonical_lang(e, name));
-                    }
-                }
-            }
-        }
+        let bucket = bucket | bucket_of(name);
+        let lang = if bucket & JUNK == 0 && len > 0 && len <= MAX_READ {
+            lang_of(name)
+        } else {
+            None
+        };
         self.add_classified(len, bucket, lang, abs);
     }
 
@@ -132,18 +140,21 @@ impl Agg {
     fn add_classified(&mut self, len: u64, bucket: Bucket, lang: Option<&'static str>, abs: Option<&Path>) {
         self.bytes += len;
         self.files += 1;
-        match bucket {
-            JUNK => self.nm += len,
-            TARGET => self.target += len,
-            OTHER => self.other += len,
-            _ => {
-                self.src += len;
-                if let (Some(lang), Some(abs)) = (lang, abs) {
-                    let lines = count_lines(abs);
-                    if lines > 0 {
-                        *self.langs.entry(lang).or_insert(0) += lines;
-                        self.loc += lines;
-                    }
+        // Bit tests, not an exact match: buckets OR together down the tree, and junk wins
+        // over whatever else the path picked up.
+        if bucket & JUNK != 0 {
+            self.nm += len;
+        } else if bucket & TARGET != 0 {
+            self.target += len;
+        } else if bucket & OTHER != 0 {
+            self.other += len;
+        } else {
+            self.src += len;
+            if let (Some(lang), Some(abs)) = (lang, abs) {
+                let lines = count_lines(abs);
+                if lines > 0 {
+                    *self.langs.entry(lang).or_insert(0) += lines;
+                    self.loc += lines;
                 }
             }
         }
@@ -152,7 +163,7 @@ impl Agg {
 
 /// `.cc`/`.cpp`/`.cxx`/`.hpp` fold into their display names; JSX is the same language as TS
 /// here, so `.tsx`/`.jsx` count as TypeScript too.
-fn canonical_lang(ext: &str, _name: &str) -> &'static str {
+fn canonical_lang(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
         "tsx" | "jsx" => "TypeScript",
         "ts" => "TypeScript",
@@ -205,25 +216,14 @@ fn count_lines(path: &Path) -> u64 {
     total
 }
 
-/// Scan threads yield to the UI: below-normal priority means a busy scan never costs the
-/// render thread a frame. No-op off Windows.
-#[cfg(windows)]
-fn lower_priority() {
-    // Deliberately a no-op: BELOW_NORMAL starved the scan whenever the user was
-    // actively using the machine (a 4 s scan stretched to 3+ minutes). Frame CPU
-    // is ~0.5 ms against a 16 ms budget, so scan threads at normal priority do
-    // not cost the UI any frames.
-    let _ = 0;
-}
-
-#[cfg(not(windows))]
-fn lower_priority() {}
-
 /// Git facts per project: is a repo, commit count, days since last commit, dirty files.
 pub type GitFacts = (bool, u64, Option<u64>, u64);
 
 /// A cached fact set with its refs-mtime validity key.
 pub type GitFactsKeyed = (GitFacts, u64);
+
+/// The cross-scan cache, shared between the scanner thread and the UI state.
+pub type GitCache = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, GitFactsKeyed>>>;
 
 /// Cheap validity key for cached git facts: commits and last-commit time only change when
 /// refs or the index do. Dirty files are recomputed every scan (they change constantly).
@@ -381,7 +381,7 @@ pub fn list_projects(root: &Path) -> Vec<PathBuf> {
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .map(|e| e.path())
                 .filter(|p| {
-                    // The rune checkout is a dependency, not a project; skip hidden and known junk.
+                    // Dot folders are tooling and dependency checkouts, not projects.
                     p.file_name()
                         .map(|n| !n.to_string_lossy().starts_with('.'))
                         .unwrap_or(false)
@@ -399,7 +399,7 @@ pub fn list_projects(root: &Path) -> Vec<PathBuf> {
 pub fn scan(
     root: PathBuf,
     tx: Sender<ScanEvent>,
-    git_cache: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, GitFactsKeyed>>>,
+    git_cache: GitCache,
     wake: impl Fn() + Send + Sync + 'static,
 ) {
     let started = Instant::now();
@@ -412,9 +412,8 @@ pub fn scan(
     let _ = tx.send(ScanEvent::Start { total: dirs.len() });
     wake();
 
-    lower_priority();
     std::thread::scope(|scope| {
-        // Git: in-process libgit2, repos round-robined over one thread per core.
+        // Git facts: repos round-robined over 8 workers.
         let git_results: std::sync::Arc<std::sync::Mutex<Vec<Option<GitFacts>>>> =
             std::sync::Arc::new(std::sync::Mutex::new((0..dirs.len()).map(|_| None).collect()));
         let git_handle = {
@@ -422,7 +421,6 @@ pub fn scan(
             let cache = git_cache.clone();
             let dirs = dirs.clone();
             scope.spawn(move || {
-                lower_priority();
                 let repos: Vec<(usize, PathBuf)> = dirs
                     .iter()
                     .enumerate()
@@ -441,7 +439,6 @@ pub fn scan(
                                 .map(|(_, (i, d))| (*i, d.clone()))
                                 .collect();
                             handles.push(s.spawn(move || {
-                                lower_priority();
                                 let mut local: HashMap<PathBuf, GitFactsKeyed> = HashMap::new();
                                 let mut out: Vec<(usize, GitFacts)> = Vec::with_capacity(mine.len());
                                 for (i, d) in mine {
@@ -571,57 +568,9 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
         }
     }
 
-    fn wide_eq_ci(w: &[u16], s: &str) -> bool {
-        w.len() == s.len()
-            && w.iter().zip(s.as_bytes()).all(|(&a, &b)| {
-                a == b as u16 || a == (b.to_ascii_uppercase()) as u16
-            })
-    }
-
     fn wide_ext(w: &[u16]) -> Option<&[u16]> {
         let i = w.iter().rposition(|&c| c == b'.' as u16)?;
         if i == 0 { None } else { Some(&w[i + 1..]) }
-    }
-
-    fn wide_ends_ci(w: &[u16], s: &str) -> bool {
-        let s = s.as_bytes();
-        w.len() >= s.len()
-            && w[w.len() - s.len()..]
-                .iter()
-                .zip(s)
-                .all(|(&a, &b)| a == b as u16 || a == (b.to_ascii_uppercase()) as u16)
-    }
-
-    fn bucket_of_wide(name: &[u16]) -> Bucket {
-        if wide_eq_ci(name, "node_modules") {
-            return JUNK;
-        }
-        let mut b = 0;
-        if wide_eq_ci(name, "target") || wide_eq_ci(name, "deriveddata") {
-            b |= TARGET;
-        }
-        if wide_eq_ci(name, ".git") || BUILD_DIRS.iter().any(|d| wide_eq_ci(name, d)) {
-            b |= OTHER;
-        }
-        b
-    }
-
-    /// The line-count gate, decided on the raw directory entry so only real candidates pay
-    /// for a path allocation.
-    fn code_candidate(name: &[u16], len: u64) -> bool {
-        if len == 0 || len > MAX_READ {
-            return false;
-        }
-        if JUNK_NAMES.iter().any(|j| wide_eq_ci(name, j))
-            || wide_ends_ci(name, ".min.js")
-            || wide_ends_ci(name, ".map")
-        {
-            return false;
-        }
-        match wide_ext(name) {
-            Some(ext) => CODE_EXT.iter().any(|e| wide_eq_ci(ext, e)),
-            None => false,
-        }
     }
 
     let aggs: Arc<Mutex<Vec<Agg>>> =
@@ -649,7 +598,6 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
             let queue = queue.clone();
             let aggs = aggs.clone();
             scope.spawn(move || {
-                lower_priority();
                 let mut local: HashMap<usize, Agg> = HashMap::new();
                 while let Some(task) = queue.pop() {
                     let agg = local.entry(task.proj).or_default();
@@ -680,46 +628,24 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
                                     if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
                                         // Junctions and symlinks: never descend (cycles), never count.
                                         if attrs & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-                                            let child_bucket =
-                                                if wide_eq_ci(name, "node_modules") {
-                                                    JUNK
-                                                } else {
-                                                    task.bucket | bucket_of_wide(name)
-                                                };
-                                            let mut child = task.dir.clone();
-                                            child.push(OsString::from_wide(name));
                                             queue.push(Task {
                                                 proj: task.proj,
-                                                dir: child,
-                                                bucket: child_bucket,
+                                                dir: task.dir.join(OsString::from_wide(name)),
+                                                bucket: task.bucket | bucket_of(name),
                                             });
                                         }
                                     } else {
-                                        let own = bucket_of_wide(name);
-                                        let bucket = if own & JUNK != 0 {
-                                            JUNK
-                                        } else {
-                                            task.bucket | own
-                                        };
-                                        let candidate = code_candidate(name, len);
-                                        let abs = candidate.then(|| {
-                                            let mut p = task.dir.clone();
-                                            p.push(OsString::from_wide(name));
-                                            p
-                                        });
+                                        let bucket = task.bucket | bucket_of(name);
+                                        // Only real line-count candidates pay for a name and
+                                        // path allocation; the other ~400k entries never do.
+                                        let candidate = len > 0
+                                            && len <= MAX_READ
+                                            && wide_ext(name).is_some_and(|ext| CODE_EXT.iter().any(|e| ext.eq_ci(e)));
                                         let lang = candidate.then(|| {
-                                            wide_ext(name)
-                                                .and_then(|ext| {
-                                                    CODE_EXT.iter().find(|e| wide_eq_ci(ext, e))
-                                                })
-                                                .map(|e| canonical_lang(e, ""))
+                                            lang_of(OsString::from_wide(name).to_string_lossy().as_ref())
                                         });
-                                        agg.add_classified(
-                                            len,
-                                            bucket,
-                                            lang.flatten(),
-                                            abs.as_deref(),
-                                        );
+                                        let abs = candidate.then(|| task.dir.join(OsString::from_wide(name)));
+                                        agg.add_classified(len, bucket, lang.flatten(), abs.as_deref());
                                     }
                                 }
                                 if FindNextFileW(handle, &mut fd) == 0 {
@@ -753,7 +679,7 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
             let name = e.file_name();
             let name = name.to_string_lossy();
             if ft.is_dir() {
-                rec(&e.path(), proj, bucket | bucket_of(&name), aggs);
+                rec(&e.path(), proj, bucket | bucket_of(name.as_ref()), aggs);
             } else if ft.is_file() {
                 let len = e.metadata().map(|m| m.len()).unwrap_or(0);
                 aggs[proj].add(&name, len, bucket, Some(&e.path()));
@@ -770,3 +696,29 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
 
 
 
+
+#[cfg(test)]
+mod lang_tests {
+    use super::*;
+
+    #[test]
+    fn tsx_and_jsx_count_as_typescript() {
+        assert_eq!(canonical_lang("tsx"), "TypeScript");
+        assert_eq!(canonical_lang("jsx"), "TypeScript");
+        assert_eq!(canonical_lang("ts"), "TypeScript");
+        assert_eq!(canonical_lang("cc"), "C++");
+        assert_eq!(canonical_lang("hpp"), "C/C++ headers");
+        assert_eq!(canonical_lang("h"), "C/C++ headers");
+    }
+
+    #[test]
+    fn lockfiles_minified_bundles_and_dotfiles_never_count() {
+        assert_eq!(lang_of("package-lock.json"), None);
+        assert_eq!(lang_of("yarn.lock"), None);
+        assert_eq!(lang_of("bundle.min.js"), None);
+        assert_eq!(lang_of("bundle.js.map"), None);
+        assert_eq!(lang_of(".rs"), None, "a dotfile has no extension");
+        assert_eq!(lang_of("main.rs"), Some("Rust"));
+        assert_eq!(lang_of("MAIN.RS"), Some("Rust"), "extension match ignores case");
+    }
+}

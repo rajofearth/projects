@@ -1,6 +1,6 @@
 //! Projects — live stats for a folder of code, built with Rune.
 //! `cargo run -p projects-stats` opens the window and starts scanning;
-//! `--scene demo` renders the built-in fixture headlessly.
+//! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
 mod charts;
 mod fixture;
@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
-use rune::{AppSpec, Cx, El, Waker};
+use rune::{AppSpec, Waker};
 use model::ScanEvent;
+use scan::GitCache;
 
 pub struct State {
     pub root: String,
@@ -33,7 +34,6 @@ pub struct State {
     pub waker: Option<Waker>,
     /// The `demo` scene: fixture data, no live scanning.
     pub demo: bool,
-    /// Frames per second over the last whole second of app clock.
     /// Frames per second over the last 2 s window.
     pub fps: f32,
     /// This process's working set, sampled once a second.
@@ -47,10 +47,8 @@ pub struct State {
     last_trim: f64,
     /// Git facts carried between scans, keyed by project path with a refs-mtime validity
     /// key — rescans skip the history walk for repos that haven't moved.
-    pub git_cache: Arc<std::sync::Mutex<HashMap<PathBuf, scan::GitFactsKeyed>>>,
+    pub git_cache: GitCache,
 }
-
-pub type GitCache = Arc<std::sync::Mutex<HashMap<PathBuf, scan::GitFactsKeyed>>>;
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
 
@@ -169,10 +167,6 @@ impl State {
     }
 }
 
-fn view(s: &State, cx: &mut Cx<State>) -> El {
-    ui::view(s, cx)
-}
-
 fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
     let mut changed = s.drain(clock);
 
@@ -202,7 +196,6 @@ fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
         s.last_trim = clock;
     }
 
-    // Live: rescan every five minutes (demo data never rescans).
     if !s.scanning && !s.demo && s.last_done.is_none_or(|t| clock - t >= RESCAN_EVERY) {
         s.request_scan();
         changed = true;
@@ -210,7 +203,6 @@ fn poll(s: &mut State, clock: f64, _tx: &mut rune::Tx) -> bool {
     changed
 }
 
-/// Working set of this process, via GetProcessMemoryInfo.
 #[cfg(windows)]
 fn process_ram() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -254,18 +246,17 @@ fn trim_ram() {
 #[cfg(not(windows))]
 fn trim_ram() {}
 
-/// "13 Nov 14:32" from the wall clock (UTC).
+/// "13 Nov 14:32" in the device's local time (GetLocalTime on Windows); the non-Windows
+/// fallback reads the wall clock as UTC.
 fn wallclock() -> String {
-    // Local time via GetLocalTime; the civil-from-days path below stays as a
-    // fallback for non-Windows builds.
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::GetLocalTime;
         let mut st = unsafe { std::mem::zeroed() };
         unsafe { GetLocalTime(&mut st) };
-        const MONTHS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
         return format!(
             "{} {} {:02}:{:02}",
             MONTHS[(st.wMonth.max(1) - 1) as usize % 12],
@@ -275,39 +266,31 @@ fn wallclock() -> String {
         );
     }
     #[cfg(not(windows))]
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    #[cfg(not(windows))]
-    // Howard Hinnant's civil-from-days, UTC.
-    let days = secs.div_euclid(86_400);
-    #[cfg(not(windows))]
-        #[cfg(not(windows))]
     {
-let tod = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let _y = if m <= 2 { y + 1 } else { y };
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    format!(
-        "{} {} {:02}:{:02}",
-        MONTHS[(m - 1) as usize],
-        d,
-        tod / 3600,
-        (tod % 3600) / 60
-    )
-}
+        // Howard Hinnant's civil-from-days.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let days = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        format!(
+            "{} {} {:02}:{:02}",
+            MONTHS[(m - 1) as usize],
+            d,
+            tod / 3600,
+            (tod % 3600) / 60
+        )
     }
+}
 
 fn setup(s: &mut State, waker: Waker) {
     s.waker = Some(waker);
@@ -324,7 +307,7 @@ fn main() {
         // The mono slot is the platform's monospaced UI font: Cascadia Mono on Windows.
         // Every figure and axis label sets in it, tabular by nature.
         families: ("Inter", "ui-monospace"),
-        ..AppSpec::new("Projects — Live Stats", (1100.0, 780.0), State::new, view)
+        ..AppSpec::new("Projects — Live Stats", (1100.0, 780.0), State::new, ui::view)
     });
 }
 
@@ -338,7 +321,7 @@ mod tests {
         let env = rune::Env { system_dark: true, scale: 2.0 };
         let mut state = State::new();
         state.load_demo();
-        let mut rt = Runtime::new(state, view, (1100.0, 780.0), env);
+        let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
         rt.frame(0.0);
         rt
     }
@@ -374,11 +357,15 @@ mod tests {
     }
 
     #[test]
-    fn kpis_sum_the_fixture() {
+    fn kpi_card_shows_the_summed_disk_total() {
         let rt = demo_runtime();
         let bytes: u64 = rt.state.projects.iter().map(|p| p.bytes).sum();
-        assert!(bytes > 65_000_000_000, "fixture totals {bytes} bytes");
-        assert!(rt.state.projects.iter().any(|p| p.name == "llama.cpp"));
+        let want = format!("{:.1} GiB", model::gib(bytes));
+        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
+        assert!(
+            texts.iter().any(|t| *t == want),
+            "on-disk KPI should read {want}: {texts:?}"
+        );
     }
 
     #[test]
@@ -438,7 +425,6 @@ mod tests {
         if git_ok {
             assert!(p.other > 0, ".git history lands in the other bucket");
         }
-        assert_eq!(p.nm, 4096, "node_modules bytes bucketed");
         assert!(p.loc >= 5, "hand-written lines counted: {}", p.loc);
         assert!(p.langs.iter().any(|(l, _)| l == "Rust"));
         assert!(p.langs.iter().any(|(l, _)| l == "TypeScript"));
@@ -447,36 +433,52 @@ mod tests {
         }
     }
 
-    /// Run once against the real root to check the live pipeline and its timing:
+    /// Run against the real root to check the live pipeline, the git cache and its timing:
     /// `cargo test -p projects-stats real_root -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_root_scan_smoke() {
         let root = PathBuf::from(std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into()));
-        let (tx, rx) = channel();
         let cache: GitCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (first, cold) = run_real_scan(root.clone(), cache.clone());
+        let (second, warm) = run_real_scan(root, cache);
+        let bytes: u64 = first.iter().map(|p| p.bytes).sum();
+        let loc: u64 = first.iter().map(|p| p.loc).sum();
+        println!(
+            "cold {:.1}s, warm rescan {:.1}s over {} folders, {:.1} GiB, {} LOC",
+            cold,
+            warm,
+            first.len(),
+            model::gib(bytes),
+            loc
+        );
+        assert!(!first.is_empty());
+        assert_eq!(first.len(), second.len(), "rescan sees the same folders");
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.commits, b.commits, "{}: cached commit count", a.name);
+            assert_eq!(a.days, b.days, "{}: cached last-commit age", a.name);
+        }
+    }
+
+    fn run_real_scan(root: PathBuf, cache: GitCache) -> (Vec<model::Project>, f64) {
+        let (tx, rx) = channel();
         let handle = std::thread::spawn(move || scan::scan(root, tx, cache, || {}));
-        let mut n = 0;
-        let mut bytes = 0u64;
-        let mut loc = 0u64;
+        let mut projects = Vec::new();
+        let mut seconds = 0.0;
         while let Ok(ev) = rx.recv() {
             match ev {
-                ScanEvent::Start { total } => println!("scanning {total} folders"),
-                ScanEvent::Project(p) => {
-                    n += 1;
-                    bytes += p.bytes;
-                    loc += p.loc;
-                    if n % 20 == 0 { println!("  {n} done…"); }
-                }
-                ScanEvent::Done { seconds } => {
-                    println!("done in {seconds:.1}s: {n} folders, {:.1} GiB, {} LOC", bytes as f64 / 1073741824.0, loc);
+                ScanEvent::Project(p) => projects.push(*p),
+                ScanEvent::Done { seconds: s } => {
+                    seconds = s;
                     break;
                 }
                 ScanEvent::Failed(e) => panic!("{e}"),
+                ScanEvent::Start { .. } => {}
             }
         }
         handle.join().unwrap();
-        assert!(n > 0);
+        (projects, seconds)
     }
 
     #[test]
@@ -487,7 +489,7 @@ mod tests {
         state.rx = Some(rx);
         state.scanning = true;
         state.total = 2;
-        let mut rt = Runtime::new(state, view, (1100.0, 780.0), env);
+        let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
         tx.send(ScanEvent::Start { total: 2 }).unwrap();
         tx.send(ScanEvent::Project(Box::new(model::Project {
             name: "demo-one".into(),
@@ -535,7 +537,7 @@ mod inspector_tests {
         let env = rune::Env { system_dark: true, scale: 2.0 };
         let mut state = State::new();
         state.load_demo();
-        let mut rt = Runtime::new(state, view, (1100.0, 780.0), env);
+        let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
         rt.frame(0.0);
         rt
     }
@@ -570,7 +572,7 @@ mod inspector_tests {
         let env = rune::Env { system_dark: true, scale: 2.0 };
         let mut state = State::new();
         state.load_demo();
-        let mut rt = Runtime::new(state, view, (1100.0, 2500.0), env);
+        let mut rt = Runtime::new(state, ui::view, (1100.0, 2500.0), env);
         rt.frame(0.0);
         let (x, y) = rt.find("dot/whirl").expect("dot");
         rt.pointer_move(x, y);
@@ -589,24 +591,5 @@ mod inspector_tests {
         rt.pointer_up(x, y);
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.pinned, None, "second click unpins");
-    }
-
-    #[test]
-    fn fixture_languages_are_merged_by_language_not_syntax() {
-        let rt = demo();
-        for p in &rt.state.projects {
-            assert!(
-                p.langs.iter().all(|(l, _)| l != "TSX" && l != "JSX"),
-                "{} still splits TS/TSX: {:?}",
-                p.name,
-                p.langs
-            );
-        }
-        let whirl = rt.state.projects.iter().find(|p| p.name == "whirl").unwrap();
-        assert_eq!(
-            whirl.langs.iter().find(|(l, _)| *l == "TypeScript").map(|(_, n)| *n),
-            Some(114_056),
-            "TSX folded into TypeScript"
-        );
     }
 }

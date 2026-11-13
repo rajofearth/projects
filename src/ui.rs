@@ -6,8 +6,8 @@ use rune::{Color, Cx, El, ScrollSpec, Shape, canvas, col, el, row, text};
 use rune::{Align, Cursor, TextStyle};
 use rune::Tx;
 
-use crate::charts::{squarify, tile_label_area};
-use crate::model::{Project, cat_color, fmt, fit, gb, gib, lang_color_or};
+use crate::charts::{scan_time, squarify, tile_label_area};
+use crate::model::{Project, cat_color, fmt, fit, gb, gib, lang_color};
 use crate::State;
 
 const CONTENT_W: f32 = 1040.0;
@@ -142,13 +142,13 @@ fn header(s: &State, t: &tok::Theme) -> El {
             "starting scan…".to_string()
         }
     } else if let Some(when) = &s.done_at {
-        format!("{} folders · scanned {} · {}", n, when, crate::charts::scan_time(s.scan_secs))
+        format!("{} folders · scanned {} · {}", n, when, scan_time(s.scan_secs))
     } else {
         format!("{n} folders · not scanned yet")
     };
 
     let subtitle_row = if s.scanning {
-        // The signature detail: a live pulse while the scan runs, still the moment it ends.
+        // A live pulse while the scan runs.
         row()
             .gap(6.0)
             .items_center()
@@ -210,12 +210,10 @@ fn header(s: &State, t: &tok::Theme) -> El {
 // ---- treemap ----
 
 fn treemap(ps: &[Project], t: &tok::Theme) -> El {
-    let mut items: Vec<(String, u64, String)> = ps
+    let items: Vec<(String, u64, String)> = ps
         .iter()
-        .filter(|p| p.bytes > 0)
         .map(|p| (p.name.clone(), p.bytes, p.cat.to_string()))
         .collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1));
     let tiles = squarify(&items, 0.0, 0.0, INNER_W, MAP_H);
 
     let mut rects: Vec<El> = Vec::new();
@@ -306,7 +304,7 @@ fn lang_bars(ps: &[Project], t: &tok::Theme) -> El {
                         .grow(*lines as f32 / max as f32)
                         .min_w(2.0)
                         .radius(3.0)
-                        .fill(lang_color_or(lang).alpha(0.8)),
+                        .fill(lang_color(lang).alpha(0.8)),
                 )
                 .child(text(format!("{pct:.1}%")).font(mono_fig(8.5)).color(t.text_secondary).w(46.0)),
         );
@@ -317,18 +315,19 @@ fn lang_bars(ps: &[Project], t: &tok::Theme) -> El {
 // ---- pulse donut ----
 
 fn pulse_donut(t: &Totals, theme: &tok::Theme) -> El {
-    let segments: Vec<(u64, &str)> = vec![
-        (t.active as u64, "#22c55e"),
-        (t.dormant as u64, "#4f8cff"),
-        (t.stale as u64, "#ef4444"),
-        (t.no_git as u64, "#64748b"),
+    // One list drives both the ring and its legend.
+    let segments = [
+        (t.active as u64, "#22c55e", "built recently"),
+        (t.dormant as u64, "#4f8cff", "dormant"),
+        (t.stale as u64, "#ef4444", "over a year"),
+        (t.no_git as u64, "#64748b", "no git"),
     ];
     let total: u64 = segments.iter().map(|s| s.0).sum();
     let (cx, cy, r, ir) = (120.0f32, 95.0f32, 72.0f32, 46.0f32);
     let mut shape = Shape::new();
     let mut ang = -std::f32::consts::FRAC_PI_2;
     if total > 0 {
-        for (n, hex) in &segments {
+        for (n, hex, _) in &segments {
             if *n == 0 {
                 continue;
             }
@@ -338,14 +337,8 @@ fn pulse_donut(t: &Totals, theme: &tok::Theme) -> El {
             ang = a1;
         }
     }
-    let labels = [
-        ("built recently", t.active, "#22c55e"),
-        ("dormant", t.dormant, "#4f8cff"),
-        ("over a year", t.stale, "#ef4444"),
-        ("no git", t.no_git, "#64748b"),
-    ];
     let mut legend = row().w_full().flex_wrap().gaps(4.0, 12.0);
-    for (name, n, hex) in labels {
+    for (n, hex, name) in segments {
         legend = legend.child(
             row()
                 .gap(4.0)
@@ -384,12 +377,12 @@ fn scatter(ps: &[Project], t: &tok::Theme) -> El {
     const BOT: f32 = 30.0;
     let iw = INNER_W - L - R;
     let ih = SCATTER_H - TOP - BOT;
-    let max_d = 660.0f64;
+    const MAX_DAYS: u64 = 660;
     let min_loc = 2000.0f64;
     let max_loc = ps.iter().map(|p| p.loc).max().unwrap_or(1).max(2000) as f64;
 
     let x_of = |days: u64| -> f32 {
-        L + (((1.0 + days.min(660) as f64).ln() / (1.0 + max_d).ln()) * iw as f64) as f32
+        L + (((1.0 + days.min(MAX_DAYS) as f64).ln() / (1.0 + MAX_DAYS as f64).ln()) * iw as f64) as f32
     };
     let y_of = |loc: u64| {
         let l = (loc as f64).max(min_loc);
@@ -397,11 +390,11 @@ fn scatter(ps: &[Project], t: &tok::Theme) -> El {
     };
 
     let mut parts: Vec<El> = Vec::new();
-    for d in [0u64, 7, 30, 90, 180, 365, 660] {
+    for d in [0, 7, 30, 90, 180, 365, MAX_DAYS] {
         let x = x_of(d) as f32;
         parts.push(el().absolute(x, TOP).w(1.0).h(ih).fill(t.separator));
         parts.push(
-            text(if d == 660 { "660+".to_string() } else { d.to_string() })
+            text(if d == MAX_DAYS { "660+".to_string() } else { d.to_string() })
                 .font(mono_fig(9.0))
                 .color(t.text_secondary)
                 .absolute(x - 12.0, TOP + ih + 4.0)
@@ -424,7 +417,6 @@ fn scatter(ps: &[Project], t: &tok::Theme) -> El {
                 .align(Align::End),
         );
     }
-    // One-year-stale line.
     let sx = x_of(365) as f32;
     parts.push(el().absolute(sx, TOP).w(1.0).h(ih).fill(rune::color::hex("#ef4444").unwrap().alpha(0.6)));
     parts.push(
@@ -472,7 +464,6 @@ fn composition(ps: &[Project], t: &tok::Theme) -> El {
     let mut top: Vec<&Project> = ps.iter().collect();
     top.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     top.truncate(10);
-    let _max = top.first().map(|p| p.bytes).unwrap_or(1).max(1) as f32;
     let parts: [(&str, &str); 4] = [
         ("src", "#4f8cff"),
         ("nm", "#f59e0b"),
@@ -502,14 +493,6 @@ fn composition(ps: &[Project], t: &tok::Theme) -> El {
             );
         }
         let name = p.name.clone();
-        let _info = format!(
-            "{} · src {} · node_modules {} · target {} · other {}",
-            gb(p.bytes),
-            gb(p.src),
-            gb(p.nm),
-            gb(p.target),
-            gb(p.other)
-        );
         rows = rows.child(
             row()
                 .w_full()
@@ -626,7 +609,6 @@ fn insights(ps: &[Project], t: &Totals, theme: &tok::Theme) -> El {
 
 fn footer(s: &State, t: &tok::Theme) -> El {
     let mut line = row().w_full().gap(8.0).items_center();
-    // Gauges appear once sampled; demo snapshots never show placeholder dashes.
     let engine = s.engine_line();
     if !engine.is_empty() {
         line = line.child(text(engine).font(mono_fig(10.0)).color(t.text_secondary));

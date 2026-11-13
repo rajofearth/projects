@@ -2,7 +2,6 @@
 
 use rune::{Color, Shape};
 
-
 pub struct Tile {
     pub name: String,
     pub bytes: u64,
@@ -23,21 +22,25 @@ fn worst(row: &[f64], side: f64) -> f64 {
     (side * side * mx / (total * total)).max((total * total) / (side * side * mn))
 }
 
-/// Squarified treemap (Bruls, Huizing & van Wijk), over items sorted big-to-small.
+/// Squarified treemap (Bruls, Huizing & van Wijk). Sorts big-to-small itself and skips
+/// zero-byte items, so callers can't hand it an order the algorithm can't use.
 pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32) -> Vec<Tile> {
     let total: f64 = items.iter().map(|i| i.1 as f64).sum();
     if total <= 0.0 || w <= 0.0 || h <= 0.0 {
         return Vec::new();
     }
-    let mut rest: Vec<(String, f64, String)> = items
+    // (name, bytes, scaled area, category)
+    let mut rest: Vec<(String, u64, f64, String)> = items
         .iter()
-        .map(|(n, v, c)| (n.clone(), *v as f64 / total * (w as f64) * (h as f64), c.clone()))
+        .filter(|i| i.1 > 0)
+        .map(|(n, v, c)| (n.clone(), *v, *v as f64 / total * (w as f64) * (h as f64), c.clone()))
         .collect();
+    rest.sort_by(|a, b| b.1.cmp(&a.1));
     let mut out = Vec::new();
     let (mut rx, mut ry, mut rw, mut rh) = (x, y, w, h);
-    let mut row: Vec<(String, f64, String)> = Vec::new();
+    let mut row: Vec<(String, u64, f64, String)> = Vec::new();
 
-    let flush = |row: &mut Vec<(String, f64, String)>,
+    let flush = |row: &mut Vec<(String, u64, f64, String)>,
                  out: &mut Vec<Tile>,
                  rx: &mut f32,
                  ry: &mut f32,
@@ -46,13 +49,13 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
         if row.is_empty() {
             return;
         }
-        let s: f64 = row.iter().map(|r| r.1).sum();
+        let s: f64 = row.iter().map(|r| r.2).sum();
         if *rw >= *rh {
             let cw = (s / *rh as f64) as f32;
             let mut cy = *ry;
             for r in row.drain(..) {
-                let ih = (r.1 / cw as f64) as f32;
-                out.push(Tile { name: r.0, bytes: 0, cat: r.2, x: *rx, y: cy, w: cw, h: ih });
+                let ih = (r.2 / cw as f64) as f32;
+                out.push(Tile { name: r.0, bytes: r.1, cat: r.3, x: *rx, y: cy, w: cw, h: ih });
                 cy += ih;
             }
             *rx += cw;
@@ -61,8 +64,8 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
             let ch = (s / *rw as f64) as f32;
             let mut cx = *rx;
             for r in row.drain(..) {
-                let iw = (r.1 / ch as f64) as f32;
-                out.push(Tile { name: r.0, bytes: 0, cat: r.2, x: cx, y: *ry, w: iw, h: ch });
+                let iw = (r.2 / ch as f64) as f32;
+                out.push(Tile { name: r.0, bytes: r.1, cat: r.3, x: cx, y: *ry, w: iw, h: ch });
                 cx += iw;
             }
             *ry += ch;
@@ -73,9 +76,9 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
     while let Some(item) = rest.first().cloned() {
         rest.remove(0);
         let side = rw.min(rh) as f64;
-        let areas: Vec<f64> = row.iter().map(|r| r.1).collect();
+        let areas: Vec<f64> = row.iter().map(|r| r.2).collect();
         let mut with = areas.clone();
-        with.push(item.1);
+        with.push(item.2);
         if row.is_empty() || worst(&with, side) <= worst(&areas, side) {
             row.push(item);
         } else {
@@ -84,12 +87,6 @@ pub fn squarify(items: &[(String, u64, String)], x: f32, y: f32, w: f32, h: f32)
         }
     }
     flush(&mut row, &mut out, &mut rx, &mut ry, &mut rw, &mut rh);
-    // Restore byte counts for labelling.
-    let by_name: std::collections::HashMap<&str, u64> =
-        items.iter().map(|(n, v, _)| (n.as_str(), *v)).collect();
-    for t in &mut out {
-        t.bytes = by_name.get(t.name.as_str()).cloned().unwrap_or(0);
-    }
     out
 }
 
@@ -160,15 +157,15 @@ mod tests {
     }
 
     #[test]
-    fn donut_ring_covers_its_angle() {
-        let shape = ring(Shape::new(), 120.0, 95.0, 46.0, 72.0, 0.0, std::f32::consts::PI, rune::color::hex("#4f8cff").unwrap());
-        // A full semicircle ring should have produced fills; shape internals are private,
-        // so just check it builds without panicking and the helper math holds.
+    fn arc_points_trace_the_requested_arc() {
         let pts = arc_points(0.0, 0.0, 10.0, 0.0, std::f32::consts::FRAC_PI_2);
-        assert!(pts.len() >= 16);
-        assert!((pts[0][0] - 10.0).abs() < 1e-4);
-        assert!((pts[0][1]).abs() < 1e-4);
-        drop(shape);
+        assert!(pts.len() >= 16, "4° steps over a quarter circle: {}", pts.len());
+        assert!((pts[0][0] - 10.0).abs() < 1e-4 && pts[0][1].abs() < 1e-4, "starts at angle 0");
+        let last = pts.last().unwrap();
+        assert!(last[0].abs() < 1e-4 && (last[1] - 10.0).abs() < 1e-4, "ends at the end angle");
+        for p in &pts {
+            assert!((p[0] * p[0] + p[1] * p[1] - 100.0).abs() < 1e-3, "every point on the r=10 circle");
+        }
     }
 
     #[test]
