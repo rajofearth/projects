@@ -256,13 +256,36 @@ fn trim_ram() {}
 
 /// "13 Nov 14:32" from the wall clock (UTC).
 fn wallclock() -> String {
+    // Local time via GetLocalTime; the civil-from-days path below stays as a
+    // fallback for non-Windows builds.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut st) };
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        return format!(
+            "{} {} {:02}:{:02}",
+            MONTHS[(st.wMonth.max(1) - 1) as usize % 12],
+            st.wDay,
+            st.wHour,
+            st.wMinute
+        );
+    }
+    #[cfg(not(windows))]
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    #[cfg(not(windows))]
     // Howard Hinnant's civil-from-days, UTC.
     let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
+    #[cfg(not(windows))]
+        #[cfg(not(windows))]
+    {
+let tod = secs.rem_euclid(86_400);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -284,6 +307,7 @@ fn wallclock() -> String {
         (tod % 3600) / 60
     )
 }
+    }
 
 fn setup(s: &mut State, waker: Waker) {
     s.waker = Some(waker);
