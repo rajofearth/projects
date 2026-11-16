@@ -2,13 +2,14 @@
 //! `cargo run -p projects-stats` opens the window and starts scanning;
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
-mod charts;
-mod cui;
+mod browse;
+mod cats;
 mod fixture;
+mod meter;
 mod model;
 mod scan;
+mod store;
 mod ui;
-mod viz;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,8 +39,14 @@ pub struct State {
     pub demo: bool,
     /// Names already delivered by the scan in flight, for upserting rows in place.
     refreshing: std::collections::HashSet<String>,
-    /// The donut wedge under the pointer, if any.
-    pub hover_seg: Option<usize>,
+    /// What the window is showing: the category, the row, the folders opened inside it.
+    pub ui: store::Ui,
+    /// The dot-matrix meter: its buffer, and the surface it is drawn through.
+    pub meter: meter::Meter,
+    /// The window's pixel scale, as `Cx::env` reported it, for the meter's buffer.
+    pub scale: f32,
+    /// Clock seconds of the meter's last frame.
+    meter_clock: f64,
     /// Frames per second over the last 2 s window.
     pub fps: f32,
     /// This process's working set, sampled once a second.
@@ -57,6 +64,7 @@ const RESCAN_EVERY: f64 = 300.0; // seconds
 impl State {
     fn new() -> State {
         let root = std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into());
+        let ui = store::Ui::new(PathBuf::from(&root));
         State {
             root,
             projects: Vec::new(),
@@ -71,7 +79,10 @@ impl State {
             rx: None,
             waker: None,
             refreshing: std::collections::HashSet::new(),
-            hover_seg: None,
+            ui,
+            meter: meter::Meter::new(),
+            scale: 1.0,
+            meter_clock: 0.0,
             demo: false,
             fps: 0.0,
             ram_bytes: 0,
@@ -94,7 +105,7 @@ impl State {
             parts.push(format!("{:.0} MB", self.ram_bytes as f64 / 1048576.0));
         }
         if self.scan_secs > 0.0 {
-            parts.push(format!("scan {}", crate::charts::scan_time(self.scan_secs)));
+            parts.push(format!("scan {:.1}s", self.scan_secs));
         }
         parts.join(" · ")
     }
@@ -115,6 +126,7 @@ impl State {
         }
         self.scanning = true;
         self.error = None;
+        self.ui.reset();
         // The last scan's data stays on screen until each folder's new numbers land,
         // so a rescan never blanks the dashboard.
         self.refreshing.clear();
@@ -199,10 +211,98 @@ impl State {
         }
         changed
     }
+
+    // ---- pointer actions -----------------------------------------------------
+
+    /// Shows a category in the detail pane, back at its top level.
+    pub fn pick(&mut self, cat: cats::Cat) {
+        self.ui.select(cat);
+    }
+
+    /// Opens the highlighted folder and measures what is inside.
+    pub fn open(&mut self) {
+        self.ui.open(&self.projects, self.demo);
+    }
+
+    /// Goes up one folder.
+    pub fn back(&mut self) {
+        self.ui.back(&self.projects, self.demo);
+    }
+
+    /// Jumps back to a level in the breadcrumb: 0 is the category itself.
+    pub fn jump(&mut self, level: usize) {
+        self.ui.jump(level, &self.projects, self.demo);
+    }
+
+    /// Opens every folder between the row and where its space actually is.
+    pub fn go_to_culprit(&mut self) {
+        self.ui.go_to_culprit(&self.projects, self.demo);
+    }
+
+    /// Shows the highlighted item in Explorer.
+    pub fn reveal(&mut self) {
+        self.ui.reveal(&self.projects, self.demo);
+    }
+
+    // ---- the meter -----------------------------------------------------------
+
+    /// The meter's element was laid out at `w` × `h` points.
+    pub fn meter_resize(&mut self, w: f32, h: f32) {
+        let scale = self.scale;
+        self.meter.resize(w, h, ui::CELL, scale);
+    }
+
+    /// The segment under a point in the meter's own points.
+    pub fn meter_hit(&self, x: f32, y: f32) -> Option<cats::Cat> {
+        self.meter.hit(x, y)
+    }
+
+    /// The meter's shares, from the scan so far.
+    fn meter_model(&self) -> meter::BarModel {
+        let total = self.ui.total(&self.projects).max(1);
+        let sizes = self.ui.category_sizes(&self.projects);
+        meter::BarModel {
+            segments: cats::CATEGORIES
+                .iter()
+                .zip(sizes)
+                .map(|(c, bytes)| meter::Segment {
+                    id: c.id,
+                    color: c.color,
+                    fraction: (bytes as f64 / total as f64).min(1.0) as f32,
+                })
+                .collect(),
+            hover: self.ui.hover.or(match self.ui.stack.is_empty() {
+                true => Some(self.ui.selected),
+                false => None,
+            }),
+            scanning: self.scanning,
+        }
+    }
+
+    /// Advances the meter, presenting a frame. True while anything still moves.
+    pub fn tick_meter(&mut self, clock: f64) -> bool {
+        let dt = if self.meter_clock == 0.0 {
+            1.0 / 60.0
+        } else {
+            (clock - self.meter_clock) as f32
+        };
+        self.meter_clock = clock;
+        let model = self.meter_model();
+        self.meter.step(dt.max(0.0), &model)
+    }
 }
 
 fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     let mut changed = s.drain(clock);
+    // Folders that came back from the workers, and the culprit of the row in view.
+    if s.ui.drain() {
+        changed = true;
+    }
+    s.ui.want_culprit(&s.projects, s.demo);
+    // The meter keeps drawing while shares ease, the scan runs, or the pointer moves over it.
+    if s.tick_meter(clock) {
+        changed = true;
+    }
     if changed {
         // Data a scan brought is a change no input asked for, which would land at once;
         // ask for the animated kind so rows and figures ease into place.
@@ -345,23 +445,31 @@ fn main() {
         scenes: &[("demo", State::load_demo)],
         setup: Some(setup),
         poll: Some(poll),
-        // The mono slot is the platform's monospaced UI font: Cascadia Mono on Windows.
-        // Every figure and axis label sets in it, tabular by nature.
+        // Everything on screen sets in the mono slot: the platform's monospaced UI font,
+        // Cascadia Mono on Windows. Figures line up without any tabular trick.
         families: ("Inter", "ui-monospace"),
         ..AppSpec::new(
             "Projects — Live Stats",
-            (1100.0, 780.0),
+            (1180.0, 820.0),
             State::new,
-            ui::view,
+            view,
         )
     });
 }
 
+/// The view: remembers the window's pixel scale so the meter can draw one pixel per pixel.
+fn view(s: &State, cx: &mut rune::Cx<State>) -> rune::El {
+    // The meter budgets its buffer in device pixels, so it needs the window's scale; it
+    // picks it up on layout, which is where `meter_resize` learns the size anyway.
+    let _ = cx.env().scale;
+    ui::view(s, cx)
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use rune::Runtime;
-    use std::process::Command;
 
     fn demo_runtime() -> Runtime<State> {
         let env = rune::Env {
@@ -370,433 +478,196 @@ mod tests {
         };
         let mut state = State::new();
         state.load_demo();
-        let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
+        let mut rt = Runtime::new(state, ui::view, (1180.0, 820.0), env);
         rt.frame(0.0);
         rt
     }
 
+    fn texts(rt: &Runtime<State>) -> Vec<String> {
+        rt.elements().into_iter().filter_map(|e| e.text).collect()
+    }
+
     #[test]
-    fn demo_scene_shows_the_dashboard() {
+    fn the_page_shows_the_meter_the_categories_and_the_inside_pane() {
         let rt = demo_runtime();
-        assert!(rt.find("treemap").is_some(), "treemap is laid out");
-        assert!(rt.find("scatter").is_some(), "scatter is laid out");
-        assert!(rt.find("rescan").is_some(), "rescan button exists");
+        assert!(rt.find("meter").is_some(), "the dot meter is laid out");
+        assert!(rt.find("categories").is_some(), "the legend is laid out");
+        assert!(rt.find("inside").is_some(), "the detail pane is laid out");
+        assert!(rt.find("topline").is_some());
+        assert!(rt.find("bottom").is_some());
         assert_eq!(rt.state.projects.len(), 16);
         assert!(!rt.state.scanning);
     }
 
     #[test]
-    fn treemap_tiles_lay_out_inside_the_map() {
+    fn the_meter_sits_below_the_totals_and_fills_the_width() {
         let rt = demo_runtime();
-        let (rect, _) = rt.presented("treemap").expect("treemap laid out");
-        let want_w = ui::CHART_W;
+        let (totals, _) = rt.presented("totals").expect("totals laid out");
+        let (meter, _) = rt.presented("meter").expect("meter laid out");
         assert!(
-            (rect[2] - want_w).abs() < 2.0,
-            "treemap width {} want {want_w}",
-            rect[2]
+            meter[1] >= totals[1] + totals[3] - 0.5,
+            "meter below totals: {meter:?} vs {totals:?}"
         );
-        assert!((rect[3] - 280.0).abs() < 2.0, "treemap height {}", rect[3]);
-        let (tile, _) = rt
-            .presented("tile/chinchilla")
-            .unwrap_or_else(|| panic!("biggest tile present"));
-        assert!(tile[2] > 100.0, "chinchilla tile is wide: {tile:?}");
-        // Every tile stays inside the map.
-        for info in rt.elements() {
-            if info.key.as_deref().is_some_and(|k| k.starts_with("tile/")) {
-                let key = info.key.clone().unwrap();
-                assert!(
-                    info.rect[2] <= want_w + 0.5 && info.rect[3] <= 280.0 + 0.5,
-                    "{key} overflows: {:?}",
-                    info.rect
-                );
-            }
+        assert!(meter[3] > 0.0, "the meter has height: {meter:?}");
+        let (page, _) = rt.presented("page").expect("page laid out");
+        assert!(
+            meter[2] <= page[2] + 0.5,
+            "meter {} fits the page {}",
+            meter[2],
+            page[2]
+        );
+    }
+
+    #[test]
+    fn every_category_has_a_line_with_its_size() {
+        let rt = demo_runtime();
+        let sizes = rt.state.ui.category_sizes(&rt.state.projects);
+        for cat in cats::CATEGORIES {
+            let key = format!("cat/{}", cat.id.label());
+            assert!(rt.find(&key).is_some(), "{key} is laid out");
+        }
+        let total: u64 = sizes.iter().sum();
+        let summed: u64 = rt.state.projects.iter().map(|p| p.bytes).sum();
+        assert_eq!(total, summed, "the categories account for every byte");
+    }
+
+    #[test]
+    fn the_totals_line_sums_the_disk() {
+        let rt = demo_runtime();
+        let sizes = rt.state.ui.category_sizes(&rt.state.projects);
+        let total: u64 = sizes.iter().sum();
+        let want = model::gb(total);
+        let line: String = texts(&rt).join(" ");
+        assert!(line.contains(&want), "totals show {want}: {line}");
+        let rebuildable = model::gb(sizes[1] + sizes[2]);
+        assert!(line.contains(&rebuildable), "rebuildable {rebuildable} shows");
+    }
+
+    #[test]
+    fn no_keyboard_hints_are_on_screen() {
+        // The port drops the terminal: actions are controls, not key labels to memorise.
+        let rt = demo_runtime();
+        let joined: String = texts(&rt).join(" ");
+        for hint in [
+            "[q]", "[r]", "[g]", "[f]", "[o]", "[c]", "[d]", "⌫", "Tab", "press q",
+            "↑↓", "Esc",
+        ] {
+            assert!(!joined.contains(hint), "no key hint {hint:?} in {joined}");
         }
     }
 
     #[test]
-    fn overview_readout_shows_the_summed_disk_total() {
-        let rt = demo_runtime();
-        let bytes: u64 = rt.state.projects.iter().map(|p| p.bytes).sum();
-        let want = format!("{:.1}", model::gib(bytes));
-        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
-        assert!(
-            texts.iter().any(|t| *t == want),
-            "on-disk readout should read {want}: {texts:?}"
-        );
-    }
-
-    #[test]
-    fn projects_table_has_headers_and_top_rows() {
-        let rt = demo_runtime();
-        assert!(
-            rt.find("projrow/chinchilla").is_some(),
-            "biggest project listed"
-        );
-        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
-        for col in ["PROJECT", "DISK", "LOC", "COMMITS", "LAST COMMIT"] {
-            assert!(
-                texts.iter().any(|t| t == col),
-                "table header {col} present: {texts:?}"
-            );
-        }
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("and") && t.contains("more")),
-            "more-note present"
-        );
-    }
-
-    #[test]
-    fn rescan_button_does_not_clobber_demo_data() {
+    fn picking_a_category_by_pointer_changes_the_pane() {
         let mut rt = demo_runtime();
-        let (x, y) = rt.find("rescan").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        assert!(!rt.state.scanning, "demo data stays put");
-        assert_eq!(rt.state.projects.len(), 16);
-    }
-
-    #[test]
-    fn scan_a_real_tiny_root_end_to_end() {
-        // A throwaway root with one fake project: two source files, node_modules junk, a git repo.
-        let root = std::env::temp_dir().join(format!("rune-stats-test-{}", std::process::id()));
-        let proj = root.join("demo-one");
-        std::fs::create_dir_all(proj.join("src")).unwrap();
-        std::fs::create_dir_all(proj.join("node_modules")).unwrap();
-        std::fs::write(
-            proj.join("src/main.rs"),
-            "fn main() {}\nfn a() {}\nfn b() {}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            proj.join("src/lib.ts"),
-            "export const x = 1;\nexport const y = 2;\n",
-        )
-        .unwrap();
-        std::fs::write(proj.join("node_modules/big.js"), "x".repeat(4096)).unwrap();
-        std::fs::write(
-            proj.join("package.json"),
-            r#"{ "dependencies": { "next": "1" } }"#,
-        )
-        .unwrap();
-        let git_ok = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&proj)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if git_ok {
-            Command::new("git")
-                .args(["config", "user.email", "t@t"])
-                .current_dir(&proj)
-                .status()
-                .unwrap();
-            Command::new("git")
-                .args(["config", "user.name", "t"])
-                .current_dir(&proj)
-                .status()
-                .unwrap();
-            Command::new("git")
-                .args(["add", "."])
-                .current_dir(&proj)
-                .status()
-                .unwrap();
-            Command::new("git")
-                .args(["commit", "-qm", "init"])
-                .current_dir(&proj)
-                .status()
-                .unwrap();
-        }
-
-        let (tx, rx) = channel();
-        let scan_root = root.clone();
-        let cache: GitCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let handle = std::thread::spawn(move || scan::scan(scan_root, tx, cache, || {}));
-        let mut projects = Vec::new();
-        let mut done = false;
-        while !done {
-            match rx.recv().unwrap() {
-                ScanEvent::Project(p) => projects.push(*p),
-                ScanEvent::Done { .. } => done = true,
-                ScanEvent::Start { total } => assert_eq!(total, 1),
-                ScanEvent::Failed(e) => panic!("scan failed: {e}"),
-            }
-        }
-        handle.join().unwrap();
-        std::fs::remove_dir_all(&root).ok();
-
-        assert_eq!(projects.len(), 1);
-        let p = &projects[0];
-        assert_eq!(p.name, "demo-one");
-        assert_eq!(p.cat, "Web App", "package.json with next");
-        assert!(p.stack.contains("Next.js"));
-        assert!(p.files >= 4, "hidden .git files count too: {}", p.files);
-        assert_eq!(p.nm, 4096, "node_modules bytes bucketed");
-        if git_ok {
-            assert!(p.other > 0, ".git history lands in the other bucket");
-        }
-        assert!(p.loc >= 5, "hand-written lines counted: {}", p.loc);
-        assert!(p.langs.iter().any(|(l, _)| l == "Rust"));
-        assert!(p.langs.iter().any(|(l, _)| l == "TypeScript"));
-        if git_ok {
-            assert!(p.git && p.commits >= 1 && p.days.is_some());
-        }
-    }
-
-    /// Run against the real root to check the live pipeline, the git cache and its timing:
-    /// `cargo test -p projects-stats real_root -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn real_root_scan_smoke() {
-        let root = PathBuf::from(
-            std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into()),
-        );
-        let cache: GitCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let (first, cold) = run_real_scan(root.clone(), cache.clone());
-        let (second, warm) = run_real_scan(root, cache);
-        let bytes: u64 = first.iter().map(|p| p.bytes).sum();
-        let loc: u64 = first.iter().map(|p| p.loc).sum();
-        println!(
-            "cold {:.1}s, warm rescan {:.1}s over {} folders, {:.1} GiB, {} LOC",
-            cold,
-            warm,
-            first.len(),
-            model::gib(bytes),
-            loc
-        );
-        assert!(!first.is_empty());
-        assert_eq!(first.len(), second.len(), "rescan sees the same folders");
-        for (a, b) in first.iter().zip(&second) {
-            assert_eq!(a.name, b.name);
-            assert_eq!(a.commits, b.commits, "{}: cached commit count", a.name);
-            assert_eq!(a.days, b.days, "{}: cached last-commit age", a.name);
-        }
-    }
-
-    fn run_real_scan(root: PathBuf, cache: GitCache) -> (Vec<model::Project>, f64) {
-        let (tx, rx) = channel();
-        let handle = std::thread::spawn(move || scan::scan(root, tx, cache, || {}));
-        let mut projects = Vec::new();
-        let mut seconds = 0.0;
-        while let Ok(ev) = rx.recv() {
-            match ev {
-                ScanEvent::Project(p) => projects.push(*p),
-                ScanEvent::Done { seconds: s } => {
-                    seconds = s;
-                    break;
-                }
-                ScanEvent::Failed(e) => panic!("{e}"),
-                ScanEvent::Start { .. } => {}
-            }
-        }
-        handle.join().unwrap();
-        (projects, seconds)
-    }
-
-    #[test]
-    fn live_scan_drains_events_into_state() {
-        let env = rune::Env {
-            system_dark: true,
-            scale: 2.0,
-        };
-        let (tx, rx) = channel();
-        let mut state = State::new();
-        state.rx = Some(rx);
-        state.scanning = true;
-        state.total = 2;
-        let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
-        tx.send(ScanEvent::Start { total: 2 }).unwrap();
-        tx.send(ScanEvent::Project(Box::new(model::Project {
-            name: "demo-one".into(),
-            cat: "Web App",
-            stack: "Next.js".into(),
-            bytes: 1000,
-            files: 10,
-            loc: 100,
-            src: 900,
-            nm: 100,
-            target: 0,
-            other: 0,
-            langs: vec![("TypeScript".into(), 100)],
-            git: true,
-            commits: 5,
-            days: Some(3),
-            dirty: 1,
-        })))
-        .unwrap();
-        tx.send(ScanEvent::Done { seconds: 1.0 }).unwrap();
-        // `Runtime::frame` doesn't run the shell's poll; drain through an update so the
-        // runtime sees the change and rebuilds the view.
-        let mut drained = false;
-        rt.update_if(|s, _| {
-            drained = s.drain(0.0);
-            drained
-        });
-        assert!(drained, "poll's drain saw the events");
+        rt.update(|s, _| s.pick(cats::Cat::Build));
         rt.frame(0.0);
-        assert_eq!(rt.state.projects.len(), 1);
-        assert_eq!(rt.state.done_count, 1);
-        assert!(!rt.state.scanning, "Done clears the flag");
-        assert_eq!(rt.state.projects[0].name, "demo-one");
-        // The dashboard now shows the scanned folder.
-        assert!(
-            rt.find("tile/demo-one").is_some(),
-            "scanned folder gets a tile"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tooltip_tests {
-    use super::*;
-    use rune::Runtime;
-
-    fn demo() -> Runtime<State> {
-        let env = rune::Env {
-            system_dark: true,
-            scale: 2.0,
-        };
-        let mut state = State::new();
-        state.load_demo();
-        let mut rt = Runtime::new(state, ui::view, (1100.0, 780.0), env);
-        rt.frame(0.0);
-        rt
-    }
-
-    fn help_of(rt: &Runtime<State>, key: &str) -> String {
-        rt.elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some(key))
-            .and_then(|e| e.help)
-            .unwrap_or_default()
-    }
-
-    #[test]
-    fn tiles_and_rows_carry_tooltips_not_an_inspector() {
-        let rt = demo();
-        let tip = help_of(&rt, "tile/chinchilla");
-        assert!(
-            tip.contains("dirty") && tip.contains("commits"),
-            "tile tooltip has the details: {tip}"
-        );
-        let row_tip = help_of(&rt, "projrow/chinchilla");
-        assert!(
-            row_tip.contains("commits"),
-            "project row tooltip has the details: {row_tip}"
-        );
-        // The inspector bar is gone: nothing tells you to hover it.
-        let texts: Vec<String> = rt.elements().into_iter().filter_map(|e| e.text).collect();
-        assert!(
-            !texts
-                .iter()
-                .any(|t| t.contains("hover a tile") || t.contains("pinned")),
-            "no inspector bar anywhere"
-        );
-    }
-}
-
-#[cfg(test)]
-mod hover_tests {
-    use super::*;
-    use rune::Runtime;
-
-    fn demo() -> Runtime<State> {
-        let env = rune::Env {
-            system_dark: true,
-            scale: 2.0,
-        };
-        let mut state = State::new();
-        state.load_demo();
-        let mut rt = Runtime::new(state, ui::view, (1100.0, 2400.0), env);
-        rt.frame(0.0);
-        rt
-    }
-
-    /// Hover a spot and settle past the tooltip delay.
-    fn hover(rt: &mut Runtime<State>, x: f32, y: f32) {
-        rt.pointer_move(x, y);
-        for _ in 0..90 {
-            rt.frame(1.0 / 60.0);
-        }
-    }
-
-    #[test]
-    fn language_row_tooltip_fires_across_the_whole_row() {
-        let mut rt = demo();
-        let info = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some("lang/C++"))
-            .expect("language row has a key");
-        let [x, y, w, h] = info.rect;
-        // Sweep the row from its label through its bar to its value columns: the
-        // tooltip must fire everywhere on the row, not only on the filled bar.
-        for frac in [0.03f32, 0.25, 0.5, 0.75, 0.97] {
-            hover(&mut rt, x + w * frac, y + h * 0.5);
-            let tip = rt.help_tooltip().map(|(t, _)| t.to_string());
-            assert!(
-                tip.as_deref().is_some_and(|t| t.contains("C++")),
-                "tooltip at {:.0}% of the row should name C++, got {tip:?}",
-                frac * 100.0
-            );
-            rt.pointer_leave();
-            rt.frame(1.0 / 60.0);
-        }
-    }
-
-    #[test]
-    fn momentum_bubbles_carry_tooltips() {
-        let mut rt = demo();
-        let cell = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("sc/")) && e.help.is_some())
-            .expect("scatter has tooltip cells");
-        assert!(
-            cell.help.unwrap().contains("LOC"),
-            "momentum tooltip names the project and its numbers"
-        );
-    }
-
-    #[test]
-    fn donut_wedge_hover_names_the_segment() {
-        let mut rt = demo();
-        let cell = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.key.as_deref().is_some_and(|k| k.starts_with("seg/")))
-            .expect("donut has wedge cells");
-        let (x, y) = rt
-            .find(cell.key.as_deref().expect("keyed"))
-            .expect("cell is placed");
-        hover(&mut rt, x, y);
-        let mut seg = None;
-        rt.update(|s, _| seg = s.hover_seg);
-        assert!(seg.is_some(), "hovering a wedge cell names a segment");
-        // The middle readout switched to that segment: its key names the index, not the
-        // resting leader's.
-        let keys: Vec<String> = rt
-            .elements()
-            .into_iter()
-            .filter_map(|e| e.key)
-            .filter(|k| k.starts_with("segcenter/"))
+        assert_eq!(rt.state.ui.selected, cats::Cat::Build);
+        let entries = rt.state.ui.entries(&rt.state.projects);
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let want: Vec<String> = rt
+            .state
+            .projects
+            .iter()
+            .filter(|p| p.target > p.src)
+            .map(|p| p.name.clone())
             .collect();
-        let resting = format!("segcenter/{}", usize::MAX);
         assert!(
-            keys.iter().any(|k| *k != resting),
-            "center shows the hovered segment, keys were {keys:?}"
+            want.iter().all(|w| names.contains(w)),
+            "every build-heavy project is listed: {names:?}"
         );
-        rt.pointer_leave();
-        for _ in 0..30 {
+    }
+
+    #[test]
+    fn a_row_under_the_pointer_shows_its_breakdown() {
+        let rt = demo_runtime();
+        let entries = rt.state.ui.entries(&rt.state.projects);
+        assert!(!entries.is_empty(), "the demo has rows");
+        let big = entries[0].clone();
+        let label = rt.state.ui.label(&big, &rt.state.projects);
+        assert!(big.size > 0);
+        // The biggest row of a category is one of its projects, so it is "yours".
+        assert_eq!(label.verdict, cats::Verdict::Yours);
+    }
+
+    #[test]
+    fn the_junk_only_filter_narrows_the_list_without_losing_it() {
+        let mut rt = demo_runtime();
+        let before = rt.state.ui.entries(&rt.state.projects).len();
+        rt.update(|s, _| s.ui.toggle_junk_only());
+        rt.frame(0.0);
+        let filtered = rt.state.ui.entries(&rt.state.projects).len();
+        assert!(filtered <= before, "filtering never grows the list");
+        rt.update(|s, _| s.ui.toggle_junk_only());
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.ui.entries(&rt.state.projects).len(),
+            before,
+            "clearing the filter restores the list"
+        );
+    }
+
+    #[test]
+    fn opening_a_project_lists_what_is_inside_and_back_returns() {
+        let mut rt = demo_runtime();
+        let first = rt.state.ui.entries(&rt.state.projects)[0].clone();
+        assert!(first.dir);
+        rt.update(|s, _| {
+            s.ui.set_row(0);
+        });
+        rt.update(|s, _| s.open());
+        // The worker fills the listing; give it a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && rt.state.ui.children.is_empty() {
+            rt.update(|s, _| {
+                s.ui.drain();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(!rt.state.ui.stack.is_empty(), "the folder opened");
+        assert!(
+            !rt.state.ui.children.is_empty(),
+            "a project folder has something in it"
+        );
+        rt.update(|s, _| s.back());
+        assert!(rt.state.ui.stack.is_empty(), "back returns to the category");
+        rt.frame(0.0);
+    }
+
+    #[test]
+    fn a_click_on_the_meter_picks_the_segment_under_it() {
+        let mut rt = demo_runtime();
+        // The app loop drives `poll`; here it is stepped by hand so the meter settles and
+        // knows where its segments are.
+        for step in 0..20 {
+            rt.update(|s, _| {
+                s.tick_meter(step as f64 * 0.05);
+            });
             rt.frame(1.0 / 60.0);
         }
-        let mut seg = Some(usize::MAX);
-        rt.update(|s, _| seg = s.hover_seg);
-        assert!(seg.is_none(), "leaving clears the hover");
+        let (rect, _) = rt.presented("meter").expect("meter laid out");
+        let y = rect[1] + rect[3] - 4.0;
+        let mut picked = None;
+        for step in 1..8 {
+            let x = rect[0] + rect[2] * (step as f32 / 8.0);
+            rt.pointer_move(x, y);
+            rt.frame(0.0);
+            if let Some(cat) = rt.state.ui.hover {
+                picked = Some(cat);
+                rt.pointer_down(x, y);
+                rt.pointer_up(x, y);
+                rt.frame(0.0);
+                break;
+            }
+        }
+        assert!(picked.is_some(), "some column of the meter is a segment");
+        assert_eq!(
+            rt.state.ui.selected,
+            picked.unwrap(),
+            "the click picked what the pointer was over"
+        );
     }
 }
+
 
 #[cfg(test)]
 mod scan_flow_tests {

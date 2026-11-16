@@ -1,559 +1,924 @@
-//! The single-page dashboard: a header with the scan state and Rescan, the headline
-//! readouts, then one card per kind of information — disk footprint treemap, momentum
-//! map, languages, and the projects table. The content column caps its width and centers,
-//! so wide windows don't stretch it and narrow ones just shrink the cards.
+//! The window, ported from the upstream interface's `app.tsx` (MIT).
+//!
+//! Everything is one monospace face at one size, on black, with no borders and no panels:
+//! hierarchy comes from colour and weight alone. The page is a top line (what the app is and
+//! what the scan is doing), the totals, the dot-matrix meter, then two columns — the category
+//! legend with its reclaimable summary, and the detail pane where folders open — and a bottom
+//! line carrying the actions that apply right now.
+//!
+//! The one thing dropped from the port is the terminal: there are no key hints and no key
+//! routing. Every action is a control under the pointer, and the signature "press again"
+//! confirmation is gone with it, since nothing here deletes anything.
 
-use rune::{col, el, row, text, Align, Color, Cx, El, ScrollSpec, TextStyle};
+use rune::color::srgb_decode;
+use rune::{el, row, text, col, Align, Color, Cursor, Cx, El, ScrollSpec, SurfaceFit, TextStyle};
 
-use crate::charts::{scan_time, squarify};
-use crate::cui::{self, Theme};
-use crate::model::{fmt, gb, gib, Project};
-use crate::viz;
+use crate::browse::{Culprit, Item};
+use crate::cats::{self, Cat, Tier, Verdict, CATEGORIES};
+use crate::model::{self, Project};
+use crate::meter::Meter;
+use crate::store;
 use crate::State;
 
-/// The content column's widest size; wider windows center it instead of stretching.
-pub const MAX_W: f32 = 1000.0;
-/// Chart width inside a card: the column (MAX_W) minus the page padding and card padding.
-pub const CHART_W: f32 = MAX_W - 40.0;
-/// How many projects the table lists before it says "and N more".
-const TOP_PROJECTS: usize = 10;
+/// One terminal cell's worth of text: the only size on screen.
+pub const FS: f32 = 12.0;
+/// The meter's dot pitch, in points.
+pub const CELL: f32 = 7.5;
+/// Rows the detail pane's list draws before it stops.
+const DOTS: usize = 16;
 
-// ---- shared helpers ----
-
-struct Totals {
-    bytes: u64,
-    files: u64,
-    loc: u64,
-    src: u64,
-    commits: u64,
-    dirty: u64,
-    repos: usize,
-    no_git: usize,
-    active: usize,
-    dormant: usize,
-    stale: usize,
-    nm: u64,
-    target: u64,
-    other: u64,
+/// The port's palette, decoded once per view.
+struct Ink {
+    fg: Color,
+    muted: Color,
+    faint: Color,
+    red: Color,
+    green: Color,
+    amber: Color,
+    row: Color,
 }
 
-fn totals(ps: &[Project]) -> Totals {
-    let mut t = Totals {
-        bytes: 0,
-        files: 0,
-        loc: 0,
-        src: 0,
-        commits: 0,
-        dirty: 0,
-        repos: 0,
-        no_git: 0,
-        active: 0,
-        dormant: 0,
-        stale: 0,
-        nm: 0,
-        target: 0,
-        other: 0,
-    };
-    for p in ps {
-        t.bytes += p.bytes;
-        t.files += p.files;
-        t.loc += p.loc;
-        t.src += p.src;
-        t.commits += p.commits;
-        t.dirty += p.dirty;
-        t.nm += p.nm;
-        t.target += p.target;
-        t.other += p.other;
-        if p.git {
-            t.repos += 1;
-            match p.days {
-                Some(d) if d <= 30 => t.active += 1,
-                Some(d) if d <= 120 => t.dormant += 1,
-                Some(_) => t.stale += 1,
-                None => {}
-            }
-        } else {
-            t.no_git += 1;
+fn rgb(v: [u8; 3]) -> Color {
+    Color {
+        r: srgb_decode(v[0] as f32 / 255.0),
+        g: srgb_decode(v[1] as f32 / 255.0),
+        b: srgb_decode(v[2] as f32 / 255.0),
+        a: 1.0,
+    }
+}
+
+impl Ink {
+    fn new() -> Self {
+        Self {
+            fg: rgb([230, 230, 230]),
+            muted: rgb([140, 140, 140]),
+            faint: rgb([79, 79, 79]),
+            red: rgb([248, 113, 113]),
+            green: rgb([74, 222, 128]),
+            amber: rgb([251, 191, 36]),
+            row: rgb([181, 181, 181]),
         }
     }
-    t
 }
 
-fn lang_mix(ps: &[Project]) -> Vec<(String, u64)> {
-    let mut map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for p in ps {
-        for (lang, lines) in &p.langs {
-            *map.entry(lang.clone()).or_insert(0) += lines;
-        }
-    }
-    let mut v: Vec<(String, u64)> = map.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
-    v
+fn color_of(rgb8: cats::Rgb) -> Color {
+    rgb(rgb8)
 }
 
-/// Compact axis figure: 720k / 1.2M style, so log-scale ticks stay inside the gutter.
-fn compact(v: f64) -> String {
-    if v >= 1_000_000.0 {
-        format!("{:.1}M", v / 1_000_000.0)
-    } else if v >= 1_000.0 {
-        format!("{:.0}k", v / 1_000.0)
+fn tint(rgb8: cats::Rgb, alpha: f32) -> Color {
+    let mut c = color_of(rgb8);
+    c.a = alpha.clamp(0.0, 1.0);
+    c
+}
+
+fn mono(size: f32, weight: f32) -> TextStyle {
+    TextStyle::new(size, weight).mono()
+}
+
+/// Width of n monospace characters at the one size on screen.
+fn ch(n: f32) -> f32 {
+    FS * 0.6 * n
+}
+
+fn pct(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        "0%".to_string()
     } else {
-        format!("{v:.0}")
+        format!("{}%", (part as f64 / whole as f64 * 100.0).round() as u64)
     }
 }
 
-/// One line per project for tooltips: everything worth knowing, nothing more.
-fn project_tip(p: &Project) -> String {
-    let age = match p.days {
-        Some(d) => format!("last commit {}d ago", d),
-        None => "no git".to_string(),
-    };
-    format!(
-        "{} · {} · {} files · {} LOC · {} commits · {} · {} dirty",
-        p.cat,
-        gb(p.bytes),
-        fmt(p.files),
-        fmt(p.loc),
-        fmt(p.commits),
-        age,
-        fmt(p.dirty)
-    )
+/// A clickable run of text with no chrome, the way a link sits in a terminal.
+fn link(
+    label: impl Into<String>,
+    c: Color,
+    on_press: impl Fn(&mut State) + 'static,
+) -> El {
+    text(label)
+        .font(mono(FS, 400.0))
+        .color(c)
+        .cursor(Cursor::Pointer)
+        .hover(Color::WHITE)
+        .on_press(on_press)
 }
 
-// ---- header ----
+/// A small bordered control: the pointer-first replacement for the port's key hints.
+fn chip(
+    label: impl Into<String>,
+    c: Color,
+    ink: cats::Rgb,
+    on_press: impl Fn(&mut State) + 'static,
+) -> El {
+    row()
+        .px(9.0)
+        .py(4.0)
+        .radius(7.0)
+        .border(1.0, tint(ink, 0.32))
+        .fill(Color::BLACK)
+        .hover(tint(ink, 0.16))
+        .cursor(Cursor::Pointer)
+        .items_center()
+        .on_press(on_press)
+        .child(text(label).font(mono(FS, 400.0)).color(c))
+}
 
-fn header(s: &State, t: &Theme) -> El {
-    let subtitle = if s.scanning {
-        if s.total > 0 {
-            format!("scanning {} / {} · {}", s.done_count, s.total, s.current)
-        } else {
-            "starting scan…".to_string()
-        }
-    } else if let Some(when) = &s.done_at {
-        format!(
-            "{} folders · scanned {} · {}",
-            s.projects.len(),
-            when,
-            scan_time(s.scan_secs)
-        )
-    } else if s.demo {
-        format!("{} folders · demo fixture", s.projects.len())
+/// A run of plain monospace text: the only kind of text on screen.
+fn t(content: impl Into<String>, c: Color) -> El {
+    text(content).font(mono(FS, 400.0)).color(c)
+}
+
+fn tb(content: impl Into<String>, c: Color) -> El {
+    text(content).font(mono(FS, 700.0)).color(c)
+}
+
+fn sep(ink: &Ink) -> El {
+    t("·", ink.faint)
+}
+
+// ---- the dot sparkline ----------------------------------------------------
+
+fn dot_hash(a: usize, b: usize) -> f32 {
+    let mut h = (a as u32)
+        .wrapping_add(374_761_393)
+        .wrapping_mul(668_265_263)
+        ^ (b as u32)
+            .wrapping_add(1_274_126_177)
+            .wrapping_mul(2_246_822_519);
+    h = (h ^ (h >> 13)).wrapping_mul(3_266_489_917);
+    ((h ^ (h >> 16)) as f32) / 4_294_967_296.0
+}
+
+/// A small dot-matrix bar, the same pixel language as the big meter: lit dots in the category
+/// colour with the odd white one, unlit dots for the rest.
+fn dots(fraction: f32, color: cats::Rgb, count: usize, seed: usize, dim: bool) -> El {
+    let dot = (FS * 0.26).max(2.0).round();
+    let gap = (FS * 0.14).max(1.0).round();
+    let lit = if fraction > 0.0 {
+        ((fraction.clamp(0.0, 1.0) * count as f32).round() as usize).max(1)
     } else {
-        format!("{} folders", s.projects.len())
+        0
     };
     row()
-        .key("header")
-        .w_full()
-        .h(44.0)
+        .gap(gap)
         .items_center()
-        .gap(10.0)
-        .px(12.0)
-        // Sticky and frosted: content scrolls underneath and blurs behind the bar.
-        .sticky_top(0.0)
-        .raise()
-        .backdrop_blur(12.0)
-        .fill(t.bg.alpha(0.72))
-        .border(1.0, t.border_subtle)
-        .radius(12.0)
-        .child(
-            text("Projects")
-                .font(TextStyle::new(16.0, 500.0))
-                .color(t.fg),
+        .children((0..count).map(move |i| {
+            let on = i < lit;
+            let k = dot_hash(i + seed * 31, seed);
+            let fill = if !on {
+                rgb([28, 28, 28])
+            } else if k > 0.9 && !dim {
+                Color::WHITE
+            } else {
+                tint(color, if dim { 0.35 } else { 0.55 + k * 0.45 })
+            };
+            el().size(dot, dot).radius(dot / 2.0).fill(fill)
+        }))
+}
+
+// ---- top line -------------------------------------------------------------
+
+fn clip_path(path: &str, max_chars: usize) -> String {
+    // Long absolute paths keep their tail, which is the part that says what is being read.
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(count - max_chars + 1).collect();
+    format!("…{tail}")
+}
+
+fn top_line(s: &State, ink: &Ink) -> El {
+    let status = if s.scanning {
+        let what = if s.total > 0 {
+            format!("measuring {} / {}", s.done_count, s.total)
+        } else {
+            "starting scan".to_string()
+        };
+        row()
+            .items_center()
+            .gap(ch(1.0))
+            .child(t(what, ink.fg))
+            .child(t(clip_path(&s.current, 56), ink.faint).truncate())
+    } else if let Some(error) = &s.error {
+        t(error.clone(), ink.red).truncate()
+    } else {
+        let secs = if s.scan_secs >= 0.05 {
+            format!(" in {:.1}s", s.scan_secs)
+        } else {
+            String::new()
+        };
+        t(
+            format!(
+                "scan complete · {} folders{}",
+                s.projects.len(),
+                secs
+            ),
+            ink.faint,
         )
-        .child(cui::note(subtitle, t.text3))
+        .truncate()
+    };
+
+    row()
+        .key("topline")
+        .w_full()
+        .items_center()
+        .gap(ch(2.0))
+        .child(
+            row()
+                .gap(ch(2.0))
+                .items_center()
+                .child(tb("projects-stats", ink.fg))
+                .child(t(clip_path(&format!("{}", s.ui.root().display()), 40), ink.faint))
+                .children((s.demo).then(|| t("demo disk", ink.amber))),
+        )
         .child(el().grow(1.0))
-        .child(cui::button_primary(
-            t,
-            "Rescan",
-            "rescan",
-            |st: &mut State| State::request_scan(st),
+        .child(status)
+        .child(chip("Rescan", ink.fg, [230, 230, 230], |s: &mut State| {
+            State::request_scan(s)
+        }))
+}
+
+// ---- totals ---------------------------------------------------------------
+
+fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
+    let total: u64 = sizes.iter().sum();
+    let rebuildable = sizes[1] + sizes[2];
+    let known = total > 0;
+    let figure = |label: &str, value: String| -> El {
+        row()
+            .items_center()
+            .child(tb(if known { value } else { "…".into() }, ink.fg))
+            .child(t(format!(" {label}"), ink.muted))
+    };
+    row()
+        .key("totals")
+        .w_full()
+        .items_center()
+        .gap(ch(1.2))
+        .child(figure("under the root", model::gb(total)))
+        .child(sep(ink))
+        .child(sep(ink))
+        .child(tb(model::gb(rebuildable), ink.green))
+        .child(t(" rebuildable", ink.muted))
+        .child(sep(ink))
+        .child(tb(model::gb(sizes[0]), ink.fg))
+        .child(t(" source", ink.muted))
+        .child(el().grow(1.0))
+        .children(
+            (!s.engine_line().is_empty())
+                .then(|| t(s.engine_line(), ink.faint).truncate())
+                .map(|e| e.key("engine")),
+        )
+}
+
+// ---- meter ----------------------------------------------------------------
+
+fn meter(s: &State, _cx: &mut Cx<State>) -> El {
+    el()
+        .key("meter")
+        .w_full()
+        .h(Meter::height(CELL))
+        .native_surface(s.meter.surface(), SurfaceFit::Fill)
+        .surface_anchor(Align::Start, Align::Start)
+        .cursor(Cursor::Pointer)
+        .on_layout(|s: &mut State, r: [f32; 4]| s.meter_resize(r[2], r[3]))
+        .on_pointer_move_local(|s: &mut State, p, _| {
+            let hit = s.meter_hit(p.x, p.y);
+            s.ui.set_hover(hit);
+        })
+        .on_hover_change(|s: &mut State, inside, _| {
+            if !inside {
+                s.ui.set_hover(None);
+            }
+        })
+        .on_press(|s: &mut State| {
+            if let Some(cat) = s.ui.hover {
+                s.pick(cat);
+            }
+        })
+}
+
+// ---- left column: categories ----------------------------------------------
+
+fn category_line(s: &State, ink: &Ink, category: &cats::Category, sizes: &[u64; 4], largest: u64) -> El {
+    let selected = s.ui.selected == category.id;
+    let dimmed = s.ui.hover.is_some() && s.ui.hover != Some(category.id) && !selected;
+    let bytes = sizes[store::cat_index(category.id)];
+    let fraction = if largest > 0 {
+        bytes as f32 / largest as f32
+    } else {
+        0.0
+    };
+    let id = category.id;
+    row()
+        .key(format!("cat/{}", category.id.label()))
+        .w_full()
+        .h(FS * 1.75)
+        .items_center()
+        .gap(ch(0.6))
+        .cursor(Cursor::Pointer)
+        .on_hover_change(move |s: &mut State, inside, _| {
+            if inside {
+                s.ui.set_hover(Some(id));
+            } else if s.ui.hover == Some(id) {
+                s.ui.set_hover(None);
+            }
+        })
+        .on_press(move |s: &mut State| s.pick(id))
+        .child(
+            tb(if selected { "·" } else { "" }, color_of(category.color)).w(ch(1.0)),
+        )
+        .child(t("■", color_of(category.color)).w(ch(1.0)))
+        .child(
+            text(category.name)
+                .font(mono(FS, if selected { 700.0 } else { 400.0 }))
+                .color(if selected {
+                    ink.fg
+                } else if dimmed {
+                    ink.faint
+                } else {
+                    ink.row
+                })
+                .w(ch(11.0)),
+        )
+        .child(
+            text(model::gb(bytes))
+                .font(mono(FS, 400.0))
+                .color(if selected { ink.fg } else { ink.muted })
+                .w(ch(9.0))
+                .align(Align::End),
+        )
+        .child(dots(
+            fraction,
+            category.color,
+            14,
+            category.id.label().len() * 7,
+            dimmed,
         ))
 }
 
-// ---- overview ----
-
-fn overview(s: &State, t: &Theme, tt: &Totals) -> El {
-    let has = !s.projects.is_empty();
-    let fig = |v: String| if has { v } else { "—".to_string() };
-    let rebuildable = tt.nm + tt.target + tt.other;
-
-    let readouts = row()
+/// One line: how much of what is listed looks like junk, and the filter to see only that.
+fn reclaimable_line(s: &State, ink: &Ink) -> El {
+    let (junk, unused) = s.ui.reclaimable(&s.projects);
+    let total = s.ui.scope_size(&s.projects);
+    let share = if total == 0 {
+        0
+    } else {
+        ((junk as f64 / total as f64) * 100.0).round() as u64
+    };
+    row()
         .w_full()
-        .gap(10.0)
-        .child(col().grow(1.0).child(cui::card(
-            t,
-            "",
-            "",
-            cui::readout(
-                t,
-                "ON DISK",
-                &fig(format!("{:.1}", gib(tt.bytes))),
-                Some("GiB"),
-                Some(format!("{} files", fmt(tt.files))),
-                28.0,
-                false,
-            ),
-        )))
-        .child(col().grow(1.0).child(cui::card(
-            t,
-            "",
-            "",
-            cui::readout(
-                t,
-                "LINES OF CODE",
-                &fig(format!("{:.2}M", tt.loc as f64 / 1e6)),
-                None,
-                Some(format!("{:.1} GiB of source", gib(tt.src))),
-                28.0,
-                false,
-            ),
-        )))
-        .child(col().grow(1.0).child(cui::card(
-            t,
-            "",
-            "",
-            cui::readout(
-                t,
-                "COMMITS",
-                &fig(fmt(tt.commits)),
-                None,
-                Some(format!("{} git repos", tt.repos)),
-                28.0,
-                false,
-            ),
-        )))
-        .child(col().grow(1.0).child(cui::card(
-            t,
-            "",
-            "",
-            cui::readout(
-                t,
-                "REBUILDABLE",
-                &fig(format!("{:.1}", gib(rebuildable))),
-                Some("GiB"),
-                Some("build output and deps".to_string()),
-                28.0,
-                true,
-            ),
-        )));
-
-    // Treemap: CUI style — neutral tiles, a soft accent tint under the cursor, tooltips.
-    let items: Vec<(String, u64, String)> = s
-        .projects
-        .iter()
-        .map(|p| (p.name.clone(), p.bytes, p.cat.to_string()))
-        .collect();
-    let tiles = squarify(&items, 0.0, 0.0, CHART_W, 280.0);
-    let treemap_card = cui::card(
-        t,
-        "Disk footprint",
-        "Area = bytes on disk; rest on a tile for the details.",
-        viz::treemap(t, &tiles, CHART_W, 280.0, |tile| {
-            s.projects
-                .iter()
-                .find(|p| p.name == tile.name)
-                .map(project_tip)
-                .unwrap_or_else(|| format!("{} · {}", tile.name, gb(tile.bytes)))
-        }),
-    );
-
-    let scatter_card = cui::card(
-        t,
-        "Momentum map",
-        "Left = recently touched, up = more code, bubble size = disk footprint; the dashed line marks a year stale.",
-        momentum(s, t),
-    );
-
-    // Languages: the ranked lines bar list and the share donut, side by side.
-    let mix = lang_mix(s.projects.as_slice());
-    let lang_total: u64 = mix.iter().map(|l| l.1).sum();
-    let max_lang = mix.first().map(|l| l.1).unwrap_or(1).max(1) as f32;
-    let mut lang_rows = col().w_full().gap(2.0);
-    for (i, (lang, lines)) in mix.iter().take(8).enumerate() {
-        lang_rows = lang_rows.child(
-            cui::bar_list_row(
-                t,
-                &format!("lang/{lang}"),
-                lang,
-                *lines as f32 / max_lang,
-                &fmt(*lines),
-                &format!("{:.0}%", *lines as f64 / lang_total.max(1) as f64 * 100.0),
-                i == 0,
-                110.0,
-            )
-            .help(format!(
-                "{lang}: {} lines of hand-written code",
-                fmt(*lines)
-            )),
-        );
-    }
-    let languages_card = cui::card(
-        t,
-        "Languages",
-        "Hand-written code only; vendored and minified excluded.",
-        lang_rows,
-    );
-
-    let segments: Vec<(String, u64, Color)> = mix
-        .iter()
-        .take(6)
-        .enumerate()
-        .map(|(i, (l, n))| (l.clone(), *n, t.series[i % t.series.len()]))
-        .collect();
-    let share_card = cui::card(
-        t,
-        "Share of code",
-        "The six largest languages; hover a wedge or a row to name it.",
-        viz::donut(t, &segments, 190.0, s.hover_seg),
-    );
-
-    col()
-        .w_full()
-        .gap(12.0)
-        .child(readouts)
-        .child(treemap_card)
-        .child(scatter_card)
-        .child(
-            row()
-                .w_full()
-                .gap(12.0)
-                .child(col().grow(1.35).child(languages_card))
-                .child(col().grow(1.0).child(share_card)),
+        .items_center()
+        .gap(ch(0.4))
+        .child(tb(format!("{share}%"), ink.green))
+        .child(t(" junk", ink.muted))
+        .children(
+            (unused > 1_000_000)
+                .then(|| t(format!(" · {} unused", model::gb(unused)), ink.amber)),
         )
-        .child(projects_card(s, t))
+        .child(el().grow(1.0))
+        .child(
+            text(if s.ui.junk_only {
+                "show everything"
+            } else {
+                "junk only"
+            })
+            .font(mono(FS, 400.0))
+            .color(if s.ui.junk_only { ink.amber } else { ink.muted })
+            .cursor(Cursor::Pointer)
+            .hover(Color::WHITE)
+            .on_press(|s: &mut State| s.ui.toggle_junk_only()),
+        )
 }
 
-/// Momentum scatter in CUI style: status-colored bubbles with surface rings.
-fn momentum(s: &State, t: &Theme) -> El {
-    const W: f32 = CHART_W;
-    const H: f32 = 280.0;
-    const MAX_DAYS: f64 = 660.0;
-    let max_loc = s
-        .projects
-        .iter()
-        .map(|p| p.loc)
-        .max()
-        .unwrap_or(1)
-        .max(2000) as f64;
-    let points: Vec<(String, f64, f64, f64, Color)> = s
-        .projects
-        .iter()
-        .filter(|p| p.days.is_some())
-        .map(|p| {
-            (
-                p.name.clone(),
-                (p.days.unwrap_or(0) as f64).min(MAX_DAYS),
-                p.loc as f64,
-                (p.bytes.max(1) as f64).sqrt(),
-                t.status(p.days),
+/// "31.2 GB rebuildable": the quick wins the port puts under the categories.
+fn quick_wins(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
+    if s.scanning && s.projects.is_empty() {
+        return t("looking for space you can get back…", ink.faint);
+    }
+    let total = sizes[1] + sizes[2];
+    let row_for = |cat: Cat, label: &str, bytes: u64| -> El {
+        let id = cat;
+        row()
+            .key(format!("win/{}", id.label()))
+            .items_center()
+            .gap(ch(0.6))
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| s.pick(id))
+            .child(t("■", color_of(id.color())))
+            .child(
+                text(label.to_string())
+                    .font(mono(FS, 400.0))
+                    .color(ink.muted)
+                    .w(ch(12.0)),
             )
-        })
-        .collect();
-    let max_size = points.iter().map(|p| p.3).fold(1.0f64, f64::max);
-    let points: Vec<(String, f64, f64, f64, Color)> = points
-        .iter()
-        .map(|(n, x, y, sz, c)| (n.clone(), *x, *y, 3.0 + *sz / max_size * 13.0, *c))
-        .collect();
-    // One tooltip line per bubble, same order, with the folder's real footprint.
-    let tips: Vec<String> = s
-        .projects
-        .iter()
-        .filter(|p| p.days.is_some())
-        .map(|p| {
-            format!(
-                "{} — {} LOC · {}d · {} on disk",
-                p.name,
-                fmt(p.loc),
-                p.days.unwrap_or(0),
-                gb(p.bytes)
+            .child(
+                text(model::gb(bytes))
+                    .font(mono(FS, 400.0))
+                    .color(ink.muted)
+                    .w(ch(9.0))
+                    .align(Align::End),
             )
+    };
+    col()
+        .gap(ch(0.35))
+        .child(
+            row()
+                .items_center()
+                .child(tb(model::gb(total), ink.green))
+                .child(t(" rebuildable", ink.muted)),
+        )
+        .child(row_for(Cat::Deps, "dependencies", sizes[1]))
+        .child(row_for(Cat::Build, "build output", sizes[2]))
+}
+
+fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    col()
+        .key("categories")
+        .w(width)
+        .shrink()
+        .gap(ch(0.2))
+        .child(
+            t("categories", ink.faint)
+                .pl(ch(2.0))
+                .pb(ch(0.4)),
+        )
+        .children(
+            CATEGORIES
+                .iter()
+                .map(|c| category_line(s, ink, c, sizes, largest)),
+        )
+        .child(el().grow(1.0))
+        .child(
+            col()
+                .gap(ch(0.5))
+                .pl(ch(1.2))
+                .child(reclaimable_line(s, ink))
+                .child(quick_wins(s, ink, sizes)),
+        )
+}
+
+// ---- right column: what is inside -----------------------------------------
+
+fn breadcrumb(s: &State, ink: &Ink) -> El {
+    let category = s.ui.selected.category();
+    let mut crumb = row().items_center().shrink().child(
+        text(category.name)
+            .font(mono(FS, 400.0))
+            .color(color_of(category.color))
+            .cursor(Cursor::Pointer)
+            .hover(Color::WHITE)
+            .on_press(|s: &mut State| s.jump(0)),
+    );
+    for (i, level) in s.ui.stack.iter().enumerate() {
+        let last = i + 1 == s.ui.stack.len();
+        let level_index = i + 1;
+        let name = format!("{}{}", level.name, if level.dir { "/" } else { "" });
+        crumb = crumb.child(t(" / ", ink.faint));
+        let mut part = text(name)
+            .font(mono(FS, if last { 700.0 } else { 400.0 }))
+            .color(if last { color_of(category.color) } else { ink.muted })
+            .truncate();
+        if !last {
+            part = part
+                .cursor(Cursor::Pointer)
+                .hover(Color::WHITE)
+                .on_press(move |s: &mut State| s.jump(level_index));
+        }
+        crumb = crumb.child(part);
+    }
+    crumb
+}
+
+fn inside_header(s: &State, ink: &Ink, total: u64) -> El {
+    let category = s.ui.selected.category();
+    let scope = s.ui.scope_size(&s.projects);
+    row()
+        .w_full()
+        .items_center()
+        .gap(ch(2.0))
+        .child(el().grow(1.0).child(breadcrumb(s, ink)))
+        .child(
+            row()
+                .items_center()
+                .gap(ch(2.0))
+                .shrink()
+                .child(tb(model::gb(scope), ink.fg))
+                .child(t(format!("{} of disk", pct(scope, total)), ink.muted))
+                .child(t(
+                    cats::tier_note(category.tier),
+                    match category.tier {
+                        Tier::Safe => ink.green,
+                        Tier::Review => ink.amber,
+                        Tier::Keep => ink.muted,
+                    },
+                )),
+        )
+}
+
+fn blurb_line(s: &State, ink: &Ink) -> El {
+    let line = match s.ui.stack.last() {
+        Some(level) => level.path.display().to_string(),
+        None => s.ui.selected.category().blurb.to_string(),
+    };
+    row()
+        .w_full()
+        .items_center()
+        .gap(ch(2.0))
+        .child(t(line, ink.faint).truncate())
+        .child(el().grow(1.0))
+        .children(
+            s.ui.listing
+                .then(|| t("measuring…", ink.muted).shrink()),
+        )
+}
+
+fn project_age(s: &State, item: &Item) -> Option<u64> {
+    let name = if s.ui.stack.is_empty() {
+        item.name.as_str()
+    } else {
+        s.ui.stack[0].name.as_str()
+    };
+    s.projects
+        .iter()
+        .find(|p| p.name == name)
+        .and_then(|p| p.days)
+}
+
+fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
+    let s = ctx.s;
+    let ink = ctx.ink;
+    let selected = s.ui.row == index;
+    let category = s.ui.selected.category();
+    let label = s.ui.label(item, &s.projects);
+    let days = project_age(s, item);
+    let stale = days.is_some_and(|d| d > 180);
+    let scope = s.ui.scope_size(&s.projects).max(1);
+    let under_root = s.ui.stack.is_empty();
+
+    row()
+        .key(format!("row/{index}"))
+        .w_full()
+        .h(FS * 1.75)
+        .items_center()
+        .gap(ch(1.0))
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            s.ui.set_row(index);
         })
-        .collect();
-    // Y ticks evenly spaced in log space from the floor up to the max, labelled compactly.
-    let floor = 2000.0f64;
-    let step = (floor / max_loc).powf(0.25);
-    let y_ticks: Vec<(f64, String)> = (0..=4)
-        .map(|k| {
-            let v = max_loc * step.powi(k);
-            (v, compact(v))
-        })
-        .collect();
-    let x_ticks: Vec<(f64, String)> = [
-        (0.0, "today".into()),
-        (30.0, "30d".into()),
-        (120.0, "120d".into()),
-        (365.0, "365d".into()),
-        (MAX_DAYS, "660+".into()),
-    ]
-    .to_vec();
-    viz::scatter_bubble(
-        t,
-        &points,
-        &x_ticks,
-        &y_ticks,
-        W,
-        H,
-        "days since last commit",
-        Some((365.0, "1 year stale".into())),
-        MAX_DAYS,
-        max_loc,
-        true,
-        true,
-        &tips,
+        .on_double_press(|s: &mut State| s.open())
+        .child(tb(if selected { "·" } else { "" }, color_of(category.color)).w(ch(1.0)))
+        .child(
+            t(
+                if item.dir { "▸" } else { "" },
+                if item.dir {
+                    color_of(category.color)
+                } else {
+                    ink.faint
+                },
+            )
+            .w(ch(1.0)),
+        )
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(format!("{}{}", item.name, if item.dir { "/" } else { "" }))
+                        .font(mono(FS, if selected { 700.0 } else { 400.0 }))
+                        .color(if selected { ink.fg } else { ink.row })
+                        .truncate(),
+                )
+                .children(under_root.then(|| {
+                    t(
+                        format!(" {}", clip_path(&format!("{}", s.ui.root().display()), 24)),
+                        ink.faint,
+                    )
+                })),
+        )
+        .child(
+            t(label.verdict.tag(), color_of(label.verdict.color()))
+                .w(ch(6.0)),
+        )
+        .child(
+            text(model::gb(item.size))
+                .font(mono(FS, 400.0))
+                .color(if selected { ink.fg } else { ink.muted })
+                .w(ch(8.0))
+                .align(Align::End),
+        )
+        .child(dots(
+            item.size as f32 / max.max(1) as f32,
+            if label.verdict == Verdict::Yours {
+                category.color
+            } else {
+                label.verdict.color()
+            },
+            DOTS,
+            index + 3,
+            label.verdict == Verdict::Yours && !selected,
+        ))
+        .child(
+            text(pct(item.size, scope))
+                .font(mono(FS, 400.0))
+                .color(ink.faint)
+                .w(ch(4.0))
+                .align(Align::End),
+        )
+        .child(
+            text(days.map(cats::short_age).unwrap_or_default())
+                .font(mono(FS, 400.0))
+                .color(if stale { ink.amber } else { ink.faint })
+                .w(ch(6.0))
+                .align(Align::End),
+        )
+        .help(format!(
+            "{} · {}{}",
+            model::gb(item.size),
+            if label.reason.is_empty() {
+                item.name.clone()
+            } else {
+                format!("{} · {}", item.name, label.reason)
+            },
+            if days.is_some() {
+                " · last commit known"
+            } else {
+                ""
+            }
+        ))
+}
+
+/// "└ mostly in node_modules/  31.2 GB · 77%", printed under a folder.
+fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit) -> El {
+    let line = row().w_full().h(FS * 1.45).items_center().pl(ch(4.0));
+    let Some(last) = culprit.chain.last() else {
+        if culprit.top.len() <= 1 {
+            return el();
+        }
+        // No single thing dominates: name the three biggest instead.
+        let spread = culprit
+            .top
+            .iter()
+            .map(|t| format!("{} {}", t.name, model::gb(t.size)))
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        return line
+            .child(t("└ spread out:", ink.faint))
+            .child(t(spread, ink.muted).pl(ch(1.0)).truncate());
+    };
+    let verdict = cats::classify(&last.name, last.dir, None);
+    line.child(t("└ mostly in", ink.faint))
+        .child(
+            t(
+                format!("{}{}", last.name, if last.dir { "" } else { "" }),
+                ink.fg,
+            )
+            .pl(ch(1.0))
+            .truncate(),
+        )
+        .child(t(model::gb(last.size), ink.muted).pl(ch(2.0)))
+        .child(
+            t(
+                // Share of the thing being jumped into, which is what the line claims.
+                format!(
+                    "· {}",
+                    pct(last.size, culprit.root_size.max(item.size).max(last.size))
+                ),
+                ink.faint,
+            )
+            .pl(ch(1.0)),
+        )
+        .children(
+            (!verdict.verdict.tag().is_empty()).then(|| {
+                t(
+                    verdict.verdict.tag(),
+                    color_of(verdict.verdict.color()),
+                )
+                .pl(ch(2.0))
+            }),
+        )
+}
+
+/// What the highlighted row is, where its space is, and what you can do with it.
+fn item_details(ctx: &Ctx, item: &Item) -> El {
+    let s = ctx.s;
+    let ink = ctx.ink;
+    let label = s.ui.label(item, &s.projects);
+    let culprit = s.ui.culprit(item, &s.projects);
+    let pending = s.ui.culprit_pending(item);
+    let can_open = item.dir && s.ui.stack.len() < 12;
+    let has_culprit = culprit.as_ref().is_some_and(|c| c.chain.len() > 1);
+
+    let verdict_name = match label.verdict {
+        Verdict::Unused => "probably unused".to_string(),
+        other => other.tag().to_string(),
+    };
+    let mut body = col()
+        .w_full()
+        .pl(ch(4.0))
+        .gap(ch(0.1))
+        .children(
+            (!label.reason.is_empty() || label.verdict != Verdict::Yours).then(|| {
+                row()
+                    .h(FS * 1.45)
+                    .items_center()
+                    .child(tb(verdict_name, color_of(label.verdict.color())))
+                    .children((!label.reason.is_empty()).then(|| {
+                        t(format!("· {}", label.reason), ink.muted)
+                            .pl(ch(1.0))
+                            .truncate()
+                    }))
+            }),
+        );
+
+    if pending {
+        body = body.child(
+            row()
+                .h(FS * 1.45)
+                .items_center()
+                .child(t("└ finding what is taking the space…", ink.faint)),
+        );
+    } else if let Some(culprit) =
+        culprit.as_ref().filter(|c| !c.chain.is_empty() || c.top.len() > 1)
+    {
+        body = body.child(culprit_line(ink, item, culprit));
+    }
+
+    body.child(
+        row()
+            .h(FS * 1.7)
+            .items_center()
+            .gap(ch(1.4))
+            .children(can_open.then(|| link("open →", ink.muted, |s: &mut State| s.open())))
+            .children(
+                has_culprit.then(|| {
+                    link("go to culprit →", ink.amber, |s: &mut State| s.go_to_culprit())
+                }),
+            )
+            .child(link("reveal in explorer", ink.muted, |s: &mut State| {
+                s.reveal()
+            })),
     )
 }
 
-// ---- projects table ----
-
-/// The projects table: a header row so every column says what it means, the biggest
-/// folders ranked by disk, and a note when there are more.
-fn projects_card(s: &State, t: &Theme) -> El {
-    let mut ranked: Vec<&Project> = s.projects.iter().collect();
-    ranked.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-    let max = ranked.first().map(|p| p.bytes).unwrap_or(1).max(1) as f32;
-    let shown = ranked.len().min(TOP_PROJECTS);
-
-    // Column widths, shared by the header and the rows.
-    const NAME_W: f32 = 190.0;
-    const NUM_W: f32 = 78.0;
-    const AGE_W: f32 = 96.0;
-
-    let cell = |label: &str, w: f32| {
-        text(label.to_string())
-            .font(TextStyle::new(9.5, 500.0).mono())
-            .color(t.text3)
-            .w(w)
-            .align(Align::End)
+fn empty(s: &State, ink: &Ink) -> El {
+    let line = if s.ui.listing {
+        "measuring what is inside…"
+    } else if s.ui.junk_only {
+        "nothing here looks like junk"
+    } else if s.scanning && s.ui.stack.is_empty() {
+        "still measuring…"
+    } else if !s.ui.stack.is_empty() {
+        "empty, or could not be read"
+    } else if s.projects.is_empty() {
+        "nothing under this folder yet"
+    } else {
+        "nothing in this category"
     };
-    let head = row()
-        .w_full()
-        .h(24.0)
-        .items_center()
-        .gap(12.0)
-        .px(6.0)
-        .child(
-            text("PROJECT")
-                .font(TextStyle::new(9.5, 500.0).mono())
-                .color(t.text3)
-                .w(NAME_W),
-        )
-        .child(text("").grow(1.0))
-        .child(cell("DISK", NUM_W))
-        .child(cell("LOC", NUM_W))
-        .child(cell("COMMITS", NUM_W))
-        .child(cell("LAST COMMIT", AGE_W));
+    t(line, ink.faint).pt(ch(0.6)).pl(ch(4.0))
+}
 
-    let mut rows = col().w_full().gap(2.0);
-    for p in ranked.iter().take(shown) {
-        let age = match p.days {
-            Some(d) => format!("{d}d"),
-            None => "—".into(),
-        };
-        rows = rows.child(
+fn inside(ctx: &Ctx) -> El {
+    let s = ctx.s;
+    let ink = ctx.ink;
+    let entries = s.ui.entries(&s.projects);
+    let all = s.ui.all_entries(&s.projects);
+    let max = entries.first().map(|e| e.size).unwrap_or(1);
+    let total = s.ui.total(&s.projects);
+    let selected = s.ui.row.min(entries.len().saturating_sub(1));
+
+    let mut rows = col()
+        .key("rows")
+        .w_full()
+        .gap(ch(0.15))
+        .children(entries.iter().enumerate().map(|(index, item)| {
+            let mut block = col().w_full().child(item_line(ctx, item, index, max));
+            if index == selected {
+                block = block.child(item_details(ctx, item));
+            }
+            block
+        }));
+
+    rows = rows.children((all.len() > store::MAX_ROWS).then(|| {
+        t(format!("… and {} smaller", all.len() - store::MAX_ROWS), ink.faint)
+            .pt(ch(0.4))
+            .pl(ch(2.4))
+    }));
+
+    let count = format!(
+        "{} {}{}{}",
+        all.len(),
+        if all.len() == 1 { "item" } else { "items" },
+        if s.ui.junk_only {
+            " labelled junk or unused"
+        } else {
+            ""
+        },
+        if s.ui.listing { " · measuring" } else { "" }
+    );
+
+    let mut list = col()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(ch(0.2))
+        .child(inside_header(s, ink, total))
+        .child(blurb_line(s, ink))
+        .child(
             row()
-                .key(format!("projrow/{}", p.name))
                 .w_full()
-                .h(cui::H_SM)
                 .items_center()
-                .gap(12.0)
-                .px(6.0)
-                .radius(cui::R_CONTROL)
-                .hover(t.hover())
-                .help(project_tip(p))
+                .gap(ch(0.6))
+                .pt(ch(0.7))
+                .pb(ch(0.2))
+                .child(t(count, ink.faint).grow(1.0).pl(ch(2.0)))
                 .child(
-                    row()
-                        .w(NAME_W)
-                        .gap(8.0)
-                        .items_center()
-                        .child(cui::dot(t.status(p.days), 7.0))
-                        .child(
-                            text(p.name.clone())
-                                .font(TextStyle::new(12.5, 400.0))
-                                .color(t.fg),
-                        ),
-                )
-                .child(
-                    el().h(8.0).grow(1.0).radius(4.0).fill(t.track).child(
-                        el().h(8.0)
-                            .w_frac(p.bytes as f32 / max)
-                            .radius(4.0)
-                            .fill(t.text3),
-                    ),
-                )
-                .child(
-                    cui::mono_text(gb(p.bytes), 11.5, t.text2)
-                        .w(NUM_W)
-                        .align(Align::End),
-                )
-                .child(
-                    cui::mono_text(fmt(p.loc), 11.5, t.text3)
-                        .w(NUM_W)
-                        .align(Align::End),
-                )
-                .child(
-                    cui::mono_text(fmt(p.commits), 11.5, t.text3)
-                        .w(NUM_W)
-                        .align(Align::End),
-                )
-                .child(
-                    cui::mono_text(age, 11.5, t.text3)
-                        .w(AGE_W)
+                    text("last commit")
+                        .font(mono(FS, 400.0))
+                        .color(ink.faint)
+                        .w(ch(10.0))
                         .align(Align::End),
                 ),
         );
-    }
-    let more = ranked.len() - shown;
-    let foot = (more > 0).then(|| {
-        cui::note(
-            format!("… and {more} more folders, smallest last — the treemap above has them all"),
-            t.text3,
-        )
-    });
 
-    cui::card(
-        t,
-        "Projects",
-        "The biggest folders by disk; the dot is the project's pulse (green active, blue dormant, red stale, grey no git).",
-        col()
-            .w_full()
-            .gap(4.0)
-            .child(head)
-            .child(rows)
-            .children(foot),
-    )
+    if entries.is_empty() {
+        list = list.child(empty(s, ink));
+    } else {
+        list = list.child(
+            col()
+                .key("scroll")
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec { stick_bottom: false })
+                .child(rows),
+        );
+    }
+    list.key("inside")
 }
 
-// ---- view ----
+// ---- bottom line -----------------------------------------------------------
 
-pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
-    let t = cui::theme();
-    let tt = totals(&s.projects);
+fn bottom_line(s: &State, ink: &Ink) -> El {
+    let mut actions = row().key("actions").items_center().gap(ch(1.4));
+    if !s.ui.stack.is_empty() {
+        actions = actions.child(chip("← back", ink.muted, [140, 140, 140], |s: &mut State| {
+            s.back()
+        }));
+    }
 
+    row()
+        .key("bottom")
+        .w_full()
+        .items_center()
+        .gap(ch(2.0))
+        .child(actions)
+        .child(el().grow(1.0))
+        .children(s.ui.note.clone().map(|note| t(note, ink.muted).truncate()))
+}
+
+// ---- view ------------------------------------------------------------------
+
+/// The left column's width: the marker, the square, the name, the size, then the dot bar.
+pub fn left_width() -> f32 {
+    let dot = (FS * 0.26).max(2.0).round();
+    let gap = (FS * 0.14).max(1.0).round();
+    ch(1.0) + ch(1.0) + ch(11.0) + ch(9.0) + 14.0 * (dot + gap) + ch(4.6)
+}
+
+struct Ctx<'a> {
+    s: &'a State,
+    ink: &'a Ink,
+}
+
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    let ink = Ink::new();
+    let ctx = Ctx { s, ink: &ink };
+    let sizes = s.ui.category_sizes(&s.projects);
     col()
         .key("page")
         .w_full()
         .h_full()
-        .fill(t.bg)
-        .px(24.0)
-        .py(14.0)
-        .items_center()
+        .fill(Color::BLACK)
+        .px(FS * 1.2)
+        .py(FS * 0.8)
+        .gap(ch(0.5))
+        .child(top_line(s, &ink))
+        .child(el().h(ch(0.4)))
+        .child(totals(s, &ink, &sizes))
+        .child(meter(s, cx))
         .child(
-            col()
-                .w_full()
-                .h_full()
-                .max_w(MAX_W)
+            row()
+                .grow(1.0)
                 .min_h(0.0)
-                .gap(12.0)
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_h(0.0)
-                        .scroll(ScrollSpec {
-                            stick_bottom: false,
-                        })
-                        .gap(12.0)
-                        .child(header(s, &t))
-                        .child(overview(s, &t, &tt)),
-                ),
+                .gap(ch(3.0))
+                .pt(ch(0.8))
+                .child(categories(s, &ink, &sizes, left_width()))
+                .child(inside(&ctx)),
         )
+        .child(bottom_line(s, &ink))
+}
+
+/// The projects a row's label needs, for tests that render without a scan.
+pub fn projects<'a>(s: &'a State) -> &'a [Project] {
+    &s.projects
 }
