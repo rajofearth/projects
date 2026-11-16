@@ -326,15 +326,23 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     let elapsed = clock - s.fps_since;
     if elapsed >= 2.0 {
         let fps = (s.fps_frames as f32 / elapsed as f32).round();
-        let ram = process_ram() / 1048576;
+        let frames = s.fps_frames;
+        let scanning = s.scanning;
         s.fps_frames = 0;
         s.fps_since = clock;
-        let fps_shown = s.fps as u32;
-        let ram_shown = s.ram_bytes / 1048576;
-        if fps != fps_shown as f32 || ram != ram_shown {
-            s.fps = fps;
-            s.ram_bytes = ram * 1048576;
-            changed = true;
+        // Divide frames only by seconds the loop was actually free to run. A window a scan
+        // straddled had the loop starved for most of it, and a window the runtime parked
+        // after the page came to rest had it parked; either way the quotient is not a frame
+        // rate, so hold the last good reading rather than print the gap as one.
+        if !scanning && frames >= 2 {
+            let ram = process_ram() / 1048576;
+            let fps_shown = s.fps as u32;
+            let ram_shown = s.ram_bytes / 1048576;
+            if fps != fps_shown as f32 || ram != ram_shown {
+                s.fps = fps;
+                s.ram_bytes = ram * 1048576;
+                changed = true;
+            }
         }
     }
     // At rest, hand pages back to Windows every 30 s: the working set creeps up as the

@@ -183,8 +183,18 @@ impl Meter {
             self.draw(model);
             self.push();
         }
-        // Report movement so the frame loop keeps running until the bar comes to rest.
-        moving || self.edge > 0.004 || self.edge < 0.996 && model.scanning
+        // Report movement so the frame loop keeps running until the bar comes to rest. The
+        // edge has to be *snapped* at rest, or it decays towards zero for ever and the whole
+        // page repaints on every tick.
+        let edge_moving = if model.scanning {
+            self.edge < 0.996
+        } else {
+            self.edge > 0.004
+        };
+        if !edge_moving {
+            self.edge = if model.scanning { 1.0 } else { 0.0 };
+        }
+        moving || edge_moving
     }
 
     fn push(&mut self) {
