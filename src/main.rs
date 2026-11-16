@@ -327,14 +327,12 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     if elapsed >= 2.0 {
         let fps = (s.fps_frames as f32 / elapsed as f32).round();
         let frames = s.fps_frames;
-        let scanning = s.scanning;
         s.fps_frames = 0;
         s.fps_since = clock;
-        // Divide frames only by seconds the loop was actually free to run. A window a scan
-        // straddled had the loop starved for most of it, and a window the runtime parked
-        // after the page came to rest had it parked; either way the quotient is not a frame
-        // rate, so hold the last good reading rather than print the gap as one.
-        if !scanning && frames >= 2 {
+        // Commit whenever the window produced frames. A window that produced none (the
+        // runtime parks a window sitting still) keeps the last reading rather than reporting
+        // 0 fps, and a window a scan straddled still counts so the gauge recovers afterwards.
+        if frames >= 2 {
             let ram = process_ram() / 1048576;
             let fps_shown = s.fps as u32;
             let ram_shown = s.ram_bytes / 1048576;
@@ -489,6 +487,19 @@ mod tests {
     use super::*;
     use rune::Runtime;
 
+    #[test]
+    fn the_footer_shows_a_live_frame_rate_once_frames_have_run() {
+        let mut rt = demo_runtime();
+        for i in 1..=140 {
+            rt.frame(i as f64 / 60.0);
+        }
+        let line = rt.state.engine_line();
+        assert!(line.contains("fps"), "no frame rate: {line:?}");
+        // At 60 fps the window closes several times over 140 frames, so the reading is real
+        // rather than a placeholder that never updated.
+        assert!(rt.state.fps > 0.0, "the gauge never updated: {line:?}");
+    }
+
     fn demo_runtime() -> Runtime<State> {
         let env = rune::Env {
             system_dark: true,
@@ -497,6 +508,7 @@ mod tests {
         let mut state = State::new();
         state.load_demo();
         let mut rt = Runtime::new(state, ui::view, (1180.0, 820.0), env);
+        rt.poll = Some(poll);
         rt.frame(0.0);
         rt
     }

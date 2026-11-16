@@ -299,7 +299,9 @@ fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
             None => row()
                 .key("engine")
                 .children((!s.engine_line().is_empty()).then(|| {
-                    t(s.engine_line(), ink.faint).truncate()
+                    // A bare truncating run shrinks to nothing in a row that is already
+                    // full, so the gauge gets a floor wide enough to show its reading.
+                    t(s.engine_line(), ink.faint).w(ch(26.0)).align(Align::End).truncate()
                 })),
         })
 }
