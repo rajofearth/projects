@@ -83,7 +83,7 @@ pub struct Meter {
 impl Meter {
     pub fn new() -> Self {
         Self {
-            background: [0, 0, 0],
+            background: crate::ui::BG,
             scale: 1.0,
             cell: 7,
             ..Self::default()

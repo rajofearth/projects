@@ -303,3 +303,194 @@ pub fn demo_projects() -> Vec<Project> {
         ),
     ]
 }
+
+/// What `detect::inspect` would say about each demo project, so the demo scene's cards and
+/// details look the way a real folder does.
+pub fn demo_info(name: &str) -> crate::detect::Info {
+    use crate::detect::{Commit, Info};
+    let (desc, stack, langs, pm, scripts, remote, dirty, ahead): (
+        &str,
+        &[&'static str],
+        &[(&'static str, f32)],
+        Option<&'static str>,
+        &[(&str, &str)],
+        &str,
+        u32,
+        u32,
+    ) = match name {
+        "chinchilla" => (
+            "Small-model distillation runs on Modal, with eval sweeps and checkpoints pulled from the Hub.",
+            &["Python", "PyTorch", "Modal"],
+            &[("Python", 0.82), ("TypeScript", 0.14), ("Shell", 0.04)],
+            Some("uv"),
+            &[],
+            "https://github.com/rajofearth/chinchilla",
+            3,
+            0,
+        ),
+        "ply" => (
+            "A GPU-drawn desktop shell for Windows: launcher, window switcher and notes in one process.",
+            &["Rust", "GPUI"],
+            &[("Rust", 0.94), ("Shell", 0.04), ("C", 0.02)],
+            Some("cargo"),
+            &[("build", "cargo build"), ("run", "cargo run"), ("test", "cargo test")],
+            "https://github.com/rajofearth/ply",
+            7,
+            2,
+        ),
+        "yotes" => (
+            "Notes that sync through SQLite in the browser, with tags, backlinks and a quick switcher.",
+            &["Next.js", "React", "TypeScript", "Tailwind"],
+            &[("TypeScript", 0.71), ("CSS", 0.17), ("JavaScript", 0.12)],
+            Some("pnpm"),
+            &[("dev", "next dev --turbo"), ("build", "next build"), ("lint", "next lint"), ("db:push", "drizzle-kit push")],
+            "https://github.com/rajofearth/yotes",
+            0,
+            0,
+        ),
+        "messenger" | "messenger-now" | "messenger-relay-next" => (
+            "Encrypted chat for Android and iOS on Convex, with offline drafts and voice notes.",
+            &["Expo", "React Native", "TypeScript"],
+            &[("TypeScript", 0.88), ("Kotlin", 0.08), ("JavaScript", 0.04)],
+            Some("bun"),
+            &[("start", "expo start"), ("android", "expo run:android"), ("ios", "expo run:ios"), ("test", "jest")],
+            "https://github.com/rajofearth/messenger",
+            if name == "messenger" { 12 } else { 0 },
+            0,
+        ),
+        "camx2" => (
+            "Webcam scene captions computed on the GPU in the browser, with LM Studio as a fallback.",
+            &["Next.js", "React", "TypeScript"],
+            &[("TypeScript", 0.79), ("CSS", 0.11), ("JavaScript", 0.10)],
+            Some("npm"),
+            &[("dev", "next dev"), ("build", "next build")],
+            "https://github.com/rajofearth/camx2",
+            0,
+            0,
+        ),
+        "llama.cpp" => (
+            "LLM inference in C/C++.",
+            &["C++", "C"],
+            &[("C++", 0.58), ("C", 0.31), ("Python", 0.11)],
+            None,
+            &[],
+            "https://github.com/ggml-org/llama.cpp",
+            0,
+            0,
+        ),
+        "clai" => (
+            "A terminal coding assistant with an Ink interface, language-server context and model routing.",
+            &["TypeScript", "Node"],
+            &[("TypeScript", 0.97), ("JavaScript", 0.03)],
+            Some("bun"),
+            &[("dev", "bun run src/cli.tsx"), ("build", "bun build"), ("test", "bun test")],
+            "https://github.com/rajofearth/clai",
+            2,
+            1,
+        ),
+        n if n.contains("ply") || n.contains("winamp") || n.contains("sentinel") || n.contains("raycast") => (
+            "A native Windows tool drawn with GPUI.",
+            &["Rust", "GPUI"],
+            &[("Rust", 1.0)],
+            Some("cargo"),
+            &[("build", "cargo build"), ("run", "cargo run"), ("test", "cargo test")],
+            "",
+            0,
+            0,
+        ),
+        _ => (
+            "A Next.js site with its content in MDX.",
+            &["Next.js", "React", "TypeScript"],
+            &[("TypeScript", 0.74), ("CSS", 0.2), ("JavaScript", 0.06)],
+            Some("npm"),
+            &[("dev", "next dev"), ("build", "next build"), ("start", "next start")],
+            "",
+            0,
+            0,
+        ),
+    };
+    let now = crate::saved::now_unix();
+    let subjects = [
+        "Keep the selection when a rescan reorders rows",
+        "Read the README's first paragraph for the description",
+        "Fix the dev script on Windows paths with spaces",
+        "Bump dependencies",
+        "Drop the unused settings migration",
+    ];
+    Info {
+        stack: stack.to_vec(),
+        scripts: scripts.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+        package_manager: pm,
+        description: Some(desc.to_string()),
+        remote: (!remote.is_empty()).then(|| remote.to_string()),
+        dirty,
+        ahead,
+        behind: 0,
+        commits: subjects
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Commit {
+                hash: format!("{:07x}", 0x3a1f9c2u32.wrapping_mul(i as u32 + 7) & 0xfffffff),
+                subject: s.to_string(),
+                author: "Yashraj".into(),
+                unix: now - (i as i64 * 31 + 3) * 3600,
+            })
+            .collect(),
+        languages: langs.to_vec(),
+    }
+}
+
+/// Thirty-odd days of plausible agent usage ending `today`, for the demo scene.
+pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
+    use crate::usage::Usage;
+    let models: [(&'static str, &str, f64, bool); 4] = [
+        ("claude", "claude-opus-4-1-20250805", 6.1, true),
+        ("claude", "claude-sonnet-4-5-20250929", 0.9, true),
+        ("codex", "gpt-5-codex", 0.42, true),
+        ("opencode", "big-pickle", 0.0, true),
+    ];
+    let projects = ["projects-stats", "ply", "yotes", "messenger", "clai", "rune"];
+    let mut out = Vec::new();
+    for back in 0..44i64 {
+        let day = today - back;
+        let (y, m, d) = crate::usage_ui::civil_from_days(day);
+        let weekday = (day + 4).rem_euclid(7);
+        let quiet = weekday == 0 || weekday == 6;
+        for (mi, (provider, model, rate, priced)) in models.iter().enumerate() {
+            let wave = ((back as f64 * 0.7 + mi as f64).sin() + 1.3) * if quiet { 0.35 } else { 1.0 };
+            let base = [1.6e6, 6.5e6, 3.8e6, 2.2e6][mi];
+            let tokens = (base * wave * (1.0 + (back % 5) as f64 * 0.12)) as u64;
+            if tokens == 0 || (mi == 3 && back > 20) {
+                continue;
+            }
+            let project = projects[(back as usize + mi) % projects.len()];
+            out.push(Usage {
+                provider,
+                model: model.to_string(),
+                day: format!("{y:04}-{m:02}-{d:02}"),
+                project: project.to_string(),
+                input: tokens / 10,
+                output: tokens / 20,
+                cache_read: tokens - tokens / 10 - tokens / 20 - tokens / 40,
+                cache_write: tokens / 40,
+                cost_usd: tokens as f64 / 1e6 * rate,
+                priced: *priced,
+            });
+        }
+        if back % 9 == 2 {
+            out.push(Usage {
+                provider: "opencode",
+                model: "qwen3-coder-local".into(),
+                day: format!("{y:04}-{m:02}-{d:02}"),
+                project: "ply".into(),
+                input: 300_000,
+                output: 80_000,
+                cache_read: 0,
+                cache_write: 0,
+                cost_usd: 0.0,
+                priced: false,
+            });
+        }
+    }
+    out
+}

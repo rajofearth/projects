@@ -2,19 +2,31 @@
 //! `cargo run -p projects-stats` opens the window and starts scanning;
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
+mod actions;
 mod browse;
 mod cats;
+mod detail;
+mod detect;
 mod fixture;
+mod fmt;
 mod home;
+mod icons;
+mod inspect;
 mod launch;
 mod meter;
 mod model;
-mod nav;
+mod newproj;
+mod saved;
 mod scan;
+mod settings_ui;
+mod shell;
+mod storage_ui;
 mod store;
+mod templates;
+mod templates_ui;
 mod ui;
-mod usage_ui;
 mod usage;
+mod usage_ui;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -63,18 +75,33 @@ pub struct State {
     /// key — rescans skip the history walk for repos that haven't moved.
     pub git_cache: GitCache,
     /// Which page the window shows.
-    pub page: nav::Page,
+    pub page: shell::Page,
     pub home: home::Home,
     pub usage: usage_ui::UsageState,
     /// Editors and tools found on this machine, probed once.
     pub apps: Vec<launch::App>,
+    /// Pins, archive, recently opened, layout, folders, editor: what survives a restart.
+    pub saved: saved::Saved,
+    /// `detect` facts per project, read off the UI thread.
+    pub inspect: inspect::Inspector,
+    pub newp: newproj::NewProject,
+    pub tmpl: templates_ui::TemplatesPage,
+    pub settings: settings_ui::SettingsPage,
+    /// Toasts on screen, and the next toast's id.
+    pub notes: Vec<shell::Note>,
+    note_seq: u64,
+    /// The keyboard shortcut sheet.
+    pub shortcuts: bool,
+    /// The window's width, for menus opened from a button.
+    pub window_w: f32,
 }
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
 
 impl State {
     fn new() -> State {
-        let root = std::env::var("RUNE_STATS_ROOT").unwrap_or_else(|_| r"P:\Projects".into());
+        let saved = saved::Saved::load(r"P:\Projects");
+        let root = saved.root.clone();
         let ui = store::Ui::new(PathBuf::from(&root));
         State {
             root,
@@ -101,11 +128,70 @@ impl State {
             fps_since: 0.0,
             last_trim: 0.0,
             git_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            page: nav::Page::Projects,
+            page: shell::Page::Home,
             home: home::Home::new(),
             usage: usage_ui::UsageState::new(),
             apps: Vec::new(),
+            saved,
+            inspect: inspect::Inspector::new(),
+            newp: newproj::NewProject::new(),
+            tmpl: templates_ui::TemplatesPage::new(),
+            settings: settings_ui::SettingsPage::new(),
+            notes: Vec::new(),
+            note_seq: 0,
+            shortcuts: false,
+            window_w: 1200.0,
         }
+    }
+
+    pub fn toast(&mut self, text: String) {
+        self.note_seq += 1;
+        self.notes.push(shell::Note { id: self.note_seq, text, error: false, until: None });
+    }
+
+    pub fn toast_error(&mut self, text: String) {
+        self.note_seq += 1;
+        self.notes.push(shell::Note { id: self.note_seq, text, error: true, until: None });
+    }
+
+    /// Shows a page, closing whatever floats over the one being left.
+    pub fn go(&mut self, page: shell::Page) {
+        self.page = page;
+        self.home.menu = None;
+        self.home.open_select = None;
+        self.shortcuts = false;
+    }
+
+    /// A rescan the user asked for (the button, Ctrl+R).
+    pub fn rescan(&mut self) {
+        if self.demo {
+            self.toast("The demo scene has no folder to scan".into());
+            return;
+        }
+        self.inspect.clear();
+        self.request_scan();
+    }
+
+    /// Shows another projects folder: a new scan, and nothing carried over from the old one.
+    pub fn switch_root(&mut self, root: &str) {
+        if root.eq_ignore_ascii_case(&self.root) {
+            return;
+        }
+        self.saved.set_root(root);
+        self.root = root.to_string();
+        self.ui = store::Ui::new(PathBuf::from(root));
+        self.projects.clear();
+        self.home.selected = None;
+        self.home.detail = false;
+        self.home.branches.clear();
+        self.inspect.clear();
+        self.scanning = false;
+        self.rx = None;
+        self.last_done = None;
+        if !self.demo {
+            self.request_scan();
+        }
+        self.toast(format!("Showing {root}"));
     }
 
     /// The footer's engine line: frame time in µs, resident memory, last scan duration.
@@ -127,11 +213,26 @@ impl State {
 
     fn load_demo(&mut self) {
         self.demo = true;
+        self.inspect.demo = true;
+        self.usage.demo = true;
+        self.saved.opened.clear();
+        self.saved.pinned.clear();
+        self.saved.archived.clear();
         self.scanning = false;
         self.error = None;
         self.projects = fixture::demo_projects();
         self.scan_secs = 0.0;
         self.last_done = Some(0.0);
+        for (i, p) in self.projects.iter().enumerate() {
+            let branch = match i % 5 {
+                0 => "main",
+                1 => "dev",
+                2 => "main",
+                3 => "feat/sync",
+                _ => "master",
+            };
+            self.home.branches.insert(p.name.clone(), if p.git { branch.to_string() } else { String::new() });
+        }
     }
 
     /// Start a scan unless one is already running or demo mode holds the data.
@@ -283,6 +384,19 @@ impl State {
         self.ui.reveal(&self.projects, self.demo);
     }
 
+    /// Shows the biggest folder a command brings back in Explorer: the first thing to clear.
+    pub fn reveal_biggest(&mut self) {
+        let Some((item, _)) = storage_ui::disk_win(self) else { return };
+        if self.demo {
+            self.toast(format!("Revealed {}", item.path.display()));
+            return;
+        }
+        match browse::reveal(&item.path) {
+            Ok(()) => self.toast(format!("Revealed {}", item.name)),
+            Err(e) => self.toast_error(format!("Couldn't reveal {}: {e}", item.name)),
+        }
+    }
+
     // ---- the meter -----------------------------------------------------------
 
     /// The meter's element was laid out at `w` × `h` points.
@@ -344,7 +458,54 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
         s.home.refresh_branches(&root, &s.projects);
         changed = true;
     }
-    if s.page == nav::Page::Usage && !s.usage.loaded && !s.usage.loading {
+    if newproj::drain(s) {
+        changed = true;
+    }
+    if s.inspect.drain() {
+        changed = true;
+    }
+    // Stack labels from the manifests, a few folders a frame, then every project's full
+    // facts on the inspector's thread once the scan has settled.
+    if !s.demo {
+        let root = PathBuf::from(&s.root);
+        let missing: Vec<String> = s
+            .projects
+            .iter()
+            .filter(|p| !s.inspect.has_stack(&p.name))
+            .take(24)
+            .map(|p| p.name.clone())
+            .collect();
+        for name in missing {
+            let st = detect::stack(&root.join(&name));
+            s.inspect.set_stack(&name, st);
+            changed = true;
+        }
+    }
+    if !s.scanning {
+        let waker = s.waker.clone();
+        let root = PathBuf::from(&s.root);
+        let names: Vec<String> = s.projects.iter().map(|p| p.name.clone()).collect();
+        for name in names {
+            if s.inspect.get(&name).is_none() && !s.inspect.pending(&name) {
+                let path = root.join(&name);
+                s.inspect.want(&name, path, false, waker.as_ref());
+                changed |= s.demo;
+            }
+        }
+    }
+    if let (Some(name), true) = (s.home.selected.clone(), s.home.detail) {
+        let path = PathBuf::from(&s.root).join(&name);
+        let waker = s.waker.clone();
+        s.inspect.want(&name, path, true, waker.as_ref());
+    }
+    if let Some(e) = s.saved.error.take() {
+        s.toast_error(e);
+        changed = true;
+    }
+    if shell::tick_toasts(s, clock, tx) {
+        changed = true;
+    }
+    if s.page == shell::Page::Usage && !s.usage.loaded && !s.usage.loading {
         let waker = s.waker.clone();
         s.usage.start(waker);
         changed = true;
@@ -394,7 +555,11 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
         s.last_trim = clock;
     }
 
-    if !s.scanning && !s.demo && s.last_done.is_none_or(|t| clock - t >= RESCAN_EVERY) {
+    let due = match s.last_done {
+        None => true,
+        Some(t) => s.saved.auto_rescan && clock - t >= RESCAN_EVERY,
+    };
+    if !s.scanning && !s.demo && due {
         s.request_scan();
         changed = true;
     }
@@ -500,20 +665,118 @@ fn setup(s: &mut State, waker: Waker) {
     }
 }
 
+fn scene_home(s: &mut State) {
+    s.load_demo();
+    s.saved.toggle_pin("ply");
+    s.saved.toggle_pin("yotes");
+    s.saved.mark_opened("messenger");
+    s.saved.mark_opened("clai");
+    s.saved.mark_opened("camx2");
+    s.home.selected = Some("chinchilla".into());
+}
+
+fn scene_detail(s: &mut State) {
+    scene_home(s);
+    s.home.selected = Some("ply".into());
+    s.home.detail = true;
+}
+
+fn scene_list(s: &mut State) {
+    scene_home(s);
+    s.saved.layout = saved::Layout::List;
+}
+
+fn scene_storage(s: &mut State) {
+    s.load_demo();
+    s.page = shell::Page::Storage;
+}
+
+fn scene_storage_open(s: &mut State) {
+    scene_storage(s);
+    s.ui.set_row(1);
+    s.open();
+    s.ui.set_row(0);
+}
+
+fn scene_usage(s: &mut State) {
+    s.load_demo();
+    s.page = shell::Page::Usage;
+}
+
+fn scene_templates(s: &mut State) {
+    s.load_demo();
+    s.page = shell::Page::Templates;
+    s.tmpl.select(2);
+}
+
+fn scene_settings(s: &mut State) {
+    s.load_demo();
+    s.page = shell::Page::Settings;
+    s.apps = vec![
+        launch::App { id: "vscode", name: "VS Code" },
+        launch::App { id: "cursor", name: "Cursor" },
+        launch::App { id: "zed", name: "Zed" },
+    ];
+    s.saved.roots = vec![s.root.clone(), r"D:\Work".into()];
+    s.saved.archived.insert("llama.cpp".into());
+}
+
+fn scene_new(s: &mut State) {
+    scene_home(s);
+    let root = s.root.clone();
+    s.newp.open(&root);
+    s.newp.name.replace_text("pocket-ledger");
+    s.newp.template = 1;
+}
+
+fn scene_running(s: &mut State) {
+    scene_new(s);
+    s.newp.phase = newproj::Phase::Running;
+    s.newp.running = s.tmpl.list.get(2).cloned();
+    s.newp.step = Some(1);
+    s.newp.log = vec![
+        "$ npm create vite@latest pocket-ledger -- --template react-ts".into(),
+        r"Scaffolding project in P:\Projects\pocket-ledger...".into(),
+        "Done. Now run:".into(),
+        "  cd pocket-ledger".into(),
+        "  npm install".into(),
+        "$ npm install".into(),
+        "added 214 packages, and audited 215 packages in 9s".into(),
+        "48 packages are looking for funding".into(),
+    ];
+}
+
+fn scene_empty(s: &mut State) {
+    s.load_demo();
+    s.home.search.replace_text("zzz");
+}
+
 fn main() {
     rune::run(AppSpec::<State> {
-        scenes: &[("demo", State::load_demo)],
+        scenes: &[
+            ("demo", scene_home),
+            ("demo-detail", scene_detail),
+            ("demo-list", scene_list),
+            ("demo-storage", scene_storage),
+            ("demo-storage-open", scene_storage_open),
+            ("demo-usage", scene_usage),
+            ("demo-templates", scene_templates),
+            ("demo-settings", scene_settings),
+            ("demo-new", scene_new),
+            ("demo-running", scene_running),
+            ("demo-empty", scene_empty),
+        ],
         setup: Some(setup),
         poll: Some(poll),
         // Everything on screen sets in the mono slot: the platform's monospaced UI font,
         // Cascadia Mono on Windows. Figures line up without any tabular trick.
         families: ("Inter", "ui-monospace"),
-        on_key: Some(nav::on_key),
+        on_key: Some(shell::on_key),
         ..AppSpec::new(
-            "projects",
-            (1180.0, 820.0),
+            "Projects",
+            (1200.0, 850.0),
             State::new,
-            ui::view,
+            shell::view,
         )
     });
 }
@@ -543,8 +806,8 @@ mod tests {
         };
         let mut state = State::new();
         state.load_demo();
-        state.page = nav::Page::Storage;
-        let mut rt = Runtime::new(state, ui::view, (1180.0, 820.0), env);
+        state.page = shell::Page::Storage;
+        let mut rt = Runtime::new(state, shell::view, (1180.0, 820.0), env);
         rt.poll = Some(poll);
         rt.frame(0.0);
         rt
@@ -555,13 +818,16 @@ mod tests {
         let mut state = State::new();
         state.load_demo();
         let env = rune::Env { system_dark: true, scale: 2.0 };
-        let mut rt = Runtime::new(state, ui::view, (1180.0, 820.0), env);
+        let mut rt = Runtime::new(state, shell::view, (1180.0, 820.0), env);
         rt.frame(0.0);
         assert!(rt.find("home").is_some());
         assert!(rt.find("search").is_some());
-        assert!(rt.find("tab/usage").is_some());
-        assert!(rt.find("proj/15").is_some(), "all 16 demo projects listed");
-        rt.update(|s, _| s.page = nav::Page::Usage);
+        assert!(rt.find("nav/usage").is_some());
+        let names: Vec<String> = rt.state.projects.iter().map(|p| p.name.clone()).collect();
+        for name in &names {
+            assert!(rt.find(&format!("card/{name}")).is_some(), "{name} has a card");
+        }
+        rt.update(|s, _| s.go(shell::Page::Usage));
         rt.frame(0.1);
         assert!(rt.find("usage").is_some());
     }
@@ -820,10 +1086,10 @@ mod tests {
                 .find(|e| e.text.as_deref().is_some_and(|t| t.starts_with(want)))
                 .map(|e| e.rect)
         };
-        for header in ["folder", "size", "last commit"] {
+        for header in ["Folder", "Size", "Last commit"] {
             assert!(at(header).is_some(), "header {header} is laid out");
         }
-        let h = at("size").unwrap();
+        let h = at("Size").unwrap();
         let sizecells: Vec<f32> = rt
             .elements()
             .into_iter()
