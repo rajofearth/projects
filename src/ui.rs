@@ -36,6 +36,9 @@ struct Ink {
     green: Color,
     amber: Color,
     row: Color,
+    /// A row under the pointer, and the row that is picked: the two mouse-only cues.
+    hover: Color,
+    picked: Color,
 }
 
 fn rgb(v: [u8; 3]) -> Color {
@@ -57,6 +60,8 @@ impl Ink {
             green: rgb([74, 222, 128]),
             amber: rgb([251, 191, 36]),
             row: rgb([181, 181, 181]),
+            hover: rgb([22, 22, 24]),
+            picked: rgb([30, 30, 33]),
         }
     }
 }
@@ -264,11 +269,27 @@ fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
         .child(tb(model::gb(sizes[0]), ink.fg))
         .child(t(" source", ink.muted))
         .child(el().grow(1.0))
-        .children(
-            (!s.engine_line().is_empty())
-                .then(|| t(s.engine_line(), ink.faint).truncate())
-                .map(|e| e.key("engine")),
-        )
+        .child(match s.ui.hover {
+            // Hovering the meter names the band under the pointer, which is what a mouse
+            // user needs to know before clicking a segment.
+            Some(cat) => {
+                let size = s.ui.category_sizes(&s.projects)[store::cat_index(cat)];
+                row()
+                    .key("meter-readout")
+                    .items_center()
+                    .gap(ch(0.6))
+                    .child(t("■", color_of(cat.color())))
+                    .child(tb(cat.name(), ink.fg))
+                    .child(t(model::gb(size), ink.muted))
+                    .child(t(pct(size, total), ink.faint))
+                    .child(t("· click to open", ink.faint))
+            }
+            None => row()
+                .key("engine")
+                .children((!s.engine_line().is_empty()).then(|| {
+                    t(s.engine_line(), ink.faint).truncate()
+                })),
+        })
 }
 
 // ---- meter ----------------------------------------------------------------
@@ -313,10 +334,14 @@ fn category_line(s: &State, ink: &Ink, category: &cats::Category, sizes: &[u64; 
     row()
         .key(format!("cat/{}", category.id.label()))
         .w_full()
-        .h(FS * 1.75)
+        .h(FS * 2.0)
+        .px(ch(0.5))
+        .radius(4.0)
         .items_center()
         .gap(ch(0.6))
         .cursor(Cursor::Pointer)
+        .fill(if selected { ink.picked } else { Color::TRANSPARENT })
+        .hover(ink.hover)
         .on_hover_change(move |s: &mut State, inside, _| {
             if inside {
                 s.ui.set_hover(Some(id));
@@ -461,34 +486,66 @@ fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
 
 // ---- right column: what is inside -----------------------------------------
 
+/// One crumb in the path: every level but the last is a target that jumps straight to it.
+fn crumb(
+    label: String,
+    color: Color,
+    ink: &Ink,
+    active: bool,
+    level: usize,
+) -> El {
+    let hint = label.clone();
+    // The handler sits on a box around the text, not on the text: a run of text is a
+    // selection target first, and a press on one is easier to lose than one on a box.
+    let mut cell = row()
+        .key(format!("crumb/{level}"))
+        .items_center()
+        // Shrink to the label: a crumb that stretched would swallow its neighbours' clicks.
+        .shrink()
+        .h(FS * 1.7)
+        .px(ch(0.45))
+        .radius(4.0)
+        .child(
+            text(label)
+                .font(mono(FS, if active { 700.0 } else { 400.0 }))
+                .color(color),
+        );
+    if active {
+        // Where you are: a surface, not an arrow. Not a target.
+        cell = cell.fill(ink.picked);
+    } else {
+        cell = cell
+            .cursor(Cursor::Pointer)
+            .hover(ink.hover)
+            .on_press(move |s: &mut State| s.jump(level))
+            .help(format!("Go up to {hint}"));
+    }
+    cell
+}
+
 fn breadcrumb(s: &State, ink: &Ink) -> El {
     let category = s.ui.selected.category();
-    let mut crumb = row().items_center().shrink().child(
-        text(category.name)
-            .font(mono(FS, 400.0))
-            .color(color_of(category.color))
-            .cursor(Cursor::Pointer)
-            .hover(Color::WHITE)
-            .on_press(|s: &mut State| s.jump(0)),
-    );
+    let depth = s.ui.stack.len();
+    let mut bar = row().items_center().shrink().gap(ch(0.15));
+    bar = bar.child(crumb(
+        category.name.to_string(),
+        color_of(category.color),
+        ink,
+        depth == 0,
+        0,
+    ));
     for (i, level) in s.ui.stack.iter().enumerate() {
-        let last = i + 1 == s.ui.stack.len();
-        let level_index = i + 1;
-        let name = format!("{}{}", level.name, if level.dir { "/" } else { "" });
-        crumb = crumb.child(t(" / ", ink.faint));
-        let mut part = text(name)
-            .font(mono(FS, if last { 700.0 } else { 400.0 }))
-            .color(if last { color_of(category.color) } else { ink.muted })
-            .truncate();
-        if !last {
-            part = part
-                .cursor(Cursor::Pointer)
-                .hover(Color::WHITE)
-                .on_press(move |s: &mut State| s.jump(level_index));
-        }
-        crumb = crumb.child(part);
+        let last = i + 1 == depth;
+        bar = bar.child(t("/", ink.faint).px(ch(0.3)));
+        bar = bar.child(crumb(
+            format!("{}{}", level.name, if level.dir { "/" } else { "" }),
+            if last { color_of(category.color) } else { ink.muted },
+            ink,
+            last,
+            i + 1,
+        ));
     }
-    crumb
+    bar
 }
 
 fn inside_header(s: &State, ink: &Ink, total: u64) -> El {
@@ -498,7 +555,9 @@ fn inside_header(s: &State, ink: &Ink, total: u64) -> El {
         .w_full()
         .items_center()
         .gap(ch(2.0))
-        .child(el().grow(1.0).child(breadcrumb(s, ink)))
+        // The trail comes first and keeps its own width; the summary gives way to it.
+        .child(breadcrumb(s, ink))
+        .child(el().grow(1.0))
         .child(
             row()
                 .items_center()
@@ -560,16 +619,23 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
     row()
         .key(format!("row/{index}"))
         .w_full()
-        .h(FS * 1.75)
+        .h(FS * 2.0)
+        .px(ch(0.5))
+        .radius(4.0)
         .items_center()
         .gap(ch(1.0))
         .cursor(Cursor::Pointer)
+        // A picked row keeps a surface, so the selection is visible without a keystroke.
+        .fill(if selected { ink.picked } else { Color::TRANSPARENT })
+        .hover(ink.hover)
         .on_press(move |s: &mut State| {
             s.ui.set_row(index);
         })
         .on_double_press(|s: &mut State| s.open())
         .child(tb(if selected { "·" } else { "" }, color_of(category.color)).w(ch(1.0)))
         .child(
+            // The disclosure arrow is its own target: one click opens the folder, the way a
+            // tree in a file manager does.
             t(
                 if item.dir { "▸" } else { "" },
                 if item.dir {
@@ -578,7 +644,18 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
                     ink.faint
                 },
             )
-            .w(ch(1.0)),
+            .w(ch(1.0))
+            .px(ch(0.3))
+            .cursor(if item.dir {
+                Cursor::Pointer
+            } else {
+                Cursor::Default
+            })
+            .hover(color_of(category.color))
+            .on_press(move |s: &mut State| {
+                s.ui.set_row(index);
+                s.open();
+            }),
         )
         .child(
             row()
@@ -750,16 +827,44 @@ fn item_details(ctx: &Ctx, item: &Item) -> El {
             .h(FS * 1.7)
             .items_center()
             .gap(ch(1.4))
-            .children(can_open.then(|| link("open →", ink.muted, |s: &mut State| s.open())))
-            .children(
-                has_culprit.then(|| {
-                    link("go to culprit →", ink.amber, |s: &mut State| s.go_to_culprit())
-                }),
-            )
-            .child(link("reveal in explorer", ink.muted, |s: &mut State| {
+            .children(can_open.then(|| {
+                chip("Open folder", ink.fg, [120, 140, 200], |s: &mut State| s.open())
+            }))
+            .children(has_culprit.then(|| {
+                chip("Go to the culprit", ink.fg, [251, 191, 36], |s: &mut State| {
+                    s.go_to_culprit()
+                })
+            }))
+            .child(chip("Reveal in Explorer", ink.muted, [140, 140, 140], |s: &mut State| {
                 s.reveal()
             })),
     )
+}
+
+/// A column header: clicking it orders the list by that column, clicking it again flips it.
+fn header_cell(s: &State, ink: &Ink, sort: store::Sort, label: &str, width: f32) -> El {
+    let active = s.ui.sort == sort;
+    let arrow = if !active {
+        ""
+    } else if s.ui.sort_down {
+        " ↓"
+    } else {
+        " ↑"
+    };
+    text(format!("{label}{arrow}"))
+        .font(mono(FS, if active { 700.0 } else { 400.0 }))
+        .color(if active { ink.row } else { ink.faint })
+        .w(width)
+        .align(Align::End)
+        .pr(ch(0.4))
+        .cursor(Cursor::Pointer)
+        .hover(Color::WHITE)
+        .on_press(move |s: &mut State| s.ui.set_sort(sort))
+        .help(if active {
+            "Click to flip the order"
+        } else {
+            "Click to order by this column"
+        })
 }
 
 fn empty(s: &State, ink: &Ink) -> El {
@@ -830,15 +935,11 @@ fn inside(ctx: &Ctx) -> El {
                 .items_center()
                 .gap(ch(0.6))
                 .pt(ch(0.7))
-                .pb(ch(0.2))
+                .pb(ch(0.1))
                 .child(t(count, ink.faint).grow(1.0).pl(ch(2.0)))
-                .child(
-                    text("last commit")
-                        .font(mono(FS, 400.0))
-                        .color(ink.faint)
-                        .w(ch(10.0))
-                        .align(Align::End),
-                ),
+                .child(header_cell(s, ink, store::Sort::Name, "name", ch(11.0)))
+                .child(header_cell(s, ink, store::Sort::Size, "size", ch(8.0)))
+                .child(header_cell(s, ink, store::Sort::Age, "last commit", ch(11.0))),
         );
 
     if entries.is_empty() {
@@ -850,6 +951,7 @@ fn inside(ctx: &Ctx) -> El {
                 .grow(1.0)
                 .min_h(0.0)
                 .scroll(ScrollSpec { stick_bottom: false })
+                .scroll_edge_fade(26.0)
                 .child(rows),
         );
     }
@@ -859,12 +961,8 @@ fn inside(ctx: &Ctx) -> El {
 // ---- bottom line -----------------------------------------------------------
 
 fn bottom_line(s: &State, ink: &Ink) -> El {
+    // No back button: the breadcrumb above the list is the way up, and it names where it goes.
     let mut actions = row().key("actions").items_center().gap(ch(1.4));
-    if !s.ui.stack.is_empty() {
-        actions = actions.child(chip("← back", ink.muted, [140, 140, 140], |s: &mut State| {
-            s.back()
-        }));
-    }
 
     row()
         .key("bottom")

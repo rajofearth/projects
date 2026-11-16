@@ -160,11 +160,15 @@ impl State {
                 }
                 Ok(ScanEvent::Project(p)) => {
                     self.current = p.name.clone();
-                    self.done_count += 1;
                     self.refreshing.insert(p.name.clone());
                     match self.projects.iter_mut().find(|old| old.name == p.name) {
+                        // A row arriving again is the same folder with its git history
+                        // patched in: the row updates, no new folder is counted.
                         Some(old) => *old = *p,
-                        None => self.projects.push(*p),
+                        None => {
+                            self.projects.push(*p);
+                            self.done_count += 1;
+                        }
                     }
                     changed = true;
                 }
@@ -634,6 +638,88 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_breadcrumb_walks_back_up_the_path() {
+        let mut rt = demo_runtime();
+        // Open the first project folder, then a folder inside it.
+        // Some demo projects hold only files, so walk the list until one opens onto a folder.
+        let rows = rt.state.ui.entries(&rt.state.projects);
+        for row in (0..rows.len()).filter(|&i| rows[i].dir) {
+            rt.update(move |s, _| {
+                s.ui.set_row(row);
+                s.open();
+            });
+            rt.frame(0.0);
+            let inner = rt.state.ui.entries(&rt.state.projects);
+            if let Some(inner_row) = inner.iter().position(|i| i.dir) {
+                rt.update(move |s, _| {
+                    s.ui.set_row(inner_row);
+                    s.open();
+                });
+                rt.frame(0.0);
+                break;
+            }
+            rt.update(|s, _| s.back());
+            rt.frame(0.0);
+        }
+        assert_eq!(rt.state.ui.stack.len(), 2, "two folders deep");
+
+        // The crumb for the first folder is a real target under the pointer.
+        let (crumb, _) = rt
+            .presented("crumb/1")
+            .expect("the first crumb is laid out");
+        let (x, y) = (crumb[0] + crumb[2] / 2.0, crumb[1] + crumb[3] / 2.0);
+
+        // Which laid-out elements cover the point, and do any of them take input?
+        // Press the first crumb: it must land on that crumb, not on its neighbour.
+        // Let the trail's entry animation finish before clicking on it.
+        for _ in 0..12 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (r, _) = rt.presented("crumb/1").expect("the first crumb is laid out");
+        let (x, y) = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.ui.stack.len(),
+            1,
+            "clicking the first crumb goes back to it"
+        );
+
+        // And the category crumb walks all the way out.
+        let (root, _) = rt.presented("crumb/0").expect("the category crumb is laid out");
+        let (x, y) = (root[0] + root[2] / 2.0, root[1] + root[3] / 2.0);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.0);
+        assert!(
+            rt.state.ui.stack.is_empty(),
+            "the category crumb returns to the category"
+        );
+    }
+
+    #[test]
+    fn there_is_no_back_button_competing_with_the_crumbs() {
+        let mut rt = demo_runtime();
+        let row = rt
+            .state
+            .ui
+            .entries(&rt.state.projects)
+            .iter()
+            .position(|i| i.dir)
+            .unwrap();
+        rt.update(move |s, _| {
+            s.ui.set_row(row);
+            s.open();
+        });
+        rt.frame(0.0);
+        assert!(rt.find("crumb/1").is_some(), "the trail is there");
+        assert!(rt.find("back").is_none(), "and there is no back button");
+    }
+
+    #[test]
     fn a_click_on_the_meter_picks_the_segment_under_it() {
         let mut rt = demo_runtime();
         // The app loop drives `poll`; here it is stepped by hand so the meter settles and
@@ -707,6 +793,39 @@ mod scan_flow_tests {
             s.projects.len(),
             before + 1,
             "old rows stay, fresh row joins"
+        );
+    }
+
+    #[test]
+    fn rows_arrive_while_the_scan_runs() {
+        // The window fills as folders are measured, not in one burst at the end.
+        let mut s = State::new();
+        let root = PathBuf::from("P:/Projects");
+        if !root.is_dir() {
+            return;
+        }
+        s.request_scan();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut seen: Vec<usize> = Vec::new();
+        let mut last = 0;
+        let mut ticks = 0;
+        while std::time::Instant::now() < deadline {
+            s.drain(0.0);
+            if s.projects.len() != last {
+                last = s.projects.len();
+                seen.push(last);
+                ticks += 1;
+            }
+            if !s.scanning {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(seen.len() > 2, "rows land in several waves: {:?}", seen);
+        assert!(
+            *seen.first().unwrap() < *seen.last().unwrap(),
+            "the list grows as the scan runs: {:?}",
+            seen
         );
     }
 

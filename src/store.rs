@@ -14,6 +14,24 @@ use crate::model::Project;
 
 /// Longest list the detail pane draws.
 pub const MAX_ROWS: usize = 150;
+
+/// How the detail pane orders its rows. Clicking a column header sets one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sort {
+    Size,
+    Name,
+    Age,
+}
+
+impl Sort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Size => "size",
+            Sort::Name => "name",
+            Sort::Age => "last commit",
+        }
+    }
+}
 /// How deep the drill-down goes before it stops opening folders.
 const MAX_DEPTH: usize = 12;
 
@@ -36,6 +54,10 @@ pub struct Ui {
     pub note: Option<String>,
     /// Show only the rows labelled junk or unused.
     pub junk_only: bool,
+    /// The detail pane's order, and whether it runs largest/newest first.
+    pub sort: Sort,
+    /// True when the sort runs the other way: smallest, Z to A, oldest first.
+    pub sort_down: bool,
     root: PathBuf,
     /// The listing in flight, if any.
     rx: Option<Receiver<BrowseEvent>>,
@@ -57,6 +79,8 @@ impl Ui {
             culprits: HashMap::new(),
             note: None,
             junk_only: false,
+            sort: Sort::Size,
+            sort_down: true,
             root,
             rx: None,
             cancel: None,
@@ -115,7 +139,55 @@ impl Ui {
                 )
             });
         }
+        let down = self.sort_down;
+        match self.sort {
+            Sort::Size => {
+                list.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)))
+            }
+            Sort::Name => {
+                list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+            // Rows without a commit date sort last, whichever way the column runs.
+            Sort::Age => list.sort_by(|a, b| {
+                let key = |item: &Item| self.age_of(item, projects);
+                match (key(a), key(b)) {
+                    (Some(x), Some(y)) => x.cmp(&y).then_with(|| b.size.cmp(&a.size)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => b.size.cmp(&a.size),
+                }
+            }),
+        }
+        if !down {
+            list.reverse();
+            // "No date" still belongs at the bottom, not the top.
+            if self.sort == Sort::Age {
+                list.sort_by_key(|item| self.age_of(item, projects).is_none());
+            }
+        }
         list
+    }
+
+    /// Days since the row's project last saw a commit, when git knows.
+    pub fn age_of(&self, item: &Item, projects: &[Project]) -> Option<u64> {
+        let name = if self.stack.is_empty() {
+            item.name.as_str()
+        } else {
+            self.stack[0].name.as_str()
+        };
+        projects.iter().find(|p| p.name == name).and_then(|p| p.days)
+    }
+
+    /// A column header was clicked: sort by it, or flip it when it is already the order.
+    pub fn set_sort(&mut self, sort: Sort) {
+        if self.sort == sort {
+            self.sort_down = !self.sort_down;
+        } else {
+            self.sort = sort;
+            // Size and date read best biggest-first; names read best A to Z.
+            self.sort_down = sort != Sort::Name;
+        }
+        self.row = 0;
     }
 
     /// The rows drawn, capped so a folder with a thousand files stays responsive.
@@ -304,7 +376,8 @@ impl Ui {
 
     /// Jumps back to a level in the breadcrumb: 0 is the category itself.
     pub fn jump(&mut self, level: usize, _projects: &[Project], demo: bool) {
-        if level + 1 >= self.stack.len() {
+        // 0 is the category root, which is always reachable; the level already showing is not.
+        if level >= self.stack.len() {
             return;
         }
         self.cancel_work();
@@ -707,6 +780,43 @@ mod tests {
             !culprit.chain.is_empty() || !culprit.top.is_empty(),
             "the demo names where the space went"
         );
+    }
+
+    /// A drill-down four folders deep, the way a click path goes.
+    fn deep_ui(projects: &[Project]) -> Ui {
+        let mut ui = Ui::new(PathBuf::from("root"));
+        ui.selected = Cat::Source;
+        for _ in 0..4 {
+            match ui.entries(projects).iter().position(|i| i.dir) {
+                Some(k) => {
+                    ui.set_row(k);
+                    ui.open(projects, true);
+                }
+                None => break,
+            }
+        }
+        ui
+    }
+
+    #[test]
+    fn every_breadcrumb_level_above_the_leaf_jumps_to_it() {
+        let projects = fixture();
+        let deep = deep_ui(&projects).stack.len();
+        assert!(deep >= 2, "the walk went down: {deep}");
+        // Each crumb above the leaf is reachable, including the category root at 0.
+        for level in 0..deep {
+            let mut ui = deep_ui(&projects);
+            ui.jump(level, &projects, true);
+            assert_eq!(
+                ui.stack.len(),
+                level,
+                "jumping to crumb {level} lands at that level"
+            );
+        }
+        // The level already showing is not a target and changes nothing.
+        let mut ui = deep_ui(&projects);
+        ui.jump(deep, &projects, true);
+        assert_eq!(ui.stack.len(), deep, "the leaf crumb does nothing");
     }
 
     #[test]
