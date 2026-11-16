@@ -387,6 +387,7 @@ fn shortcut_sheet(ink: &Ink, k: &Kit, layer: &mut Vec<El>) {
 // ---- the window ----------------------------------------------------------------
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    s.art.set_scale(cx.env().scale);
     let ink = Ink::new();
     let k = ink.kit();
     let mut layer: Vec<El> = Vec::new();

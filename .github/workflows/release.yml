@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.2.0 (created at the selected branch if it does not exist)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish (Windows)
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release exe
+        run: cargo build --release
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $stage = "dist/projects-$env:TAG-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/projects-stats.exe $stage/
+          Copy-Item README.md $stage/
+          if (Test-Path LICENSE) { Copy-Item LICENSE $stage/ }
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          echo "ZIP=$stage.zip" >> $env:GITHUB_ENV
+
+      - name: Create GitHub release
+        shell: pwsh
+        run: |
+          gh release create $env:TAG $env:ZIP `
+            --title "Projects $env:TAG" `
+            --generate-notes

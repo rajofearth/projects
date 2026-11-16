@@ -183,6 +183,14 @@ fn tokens(u: &Usage) -> u64 {
 #[derive(Default, Clone, Copy)]
 struct Sum {
     tokens: u64,
+    /// Uncached input.
+    input: u64,
+    /// Cached input (cache reads).
+    cache_read: u64,
+    /// Cache writes (5-minute and 1-hour combined).
+    cache_write: u64,
+    /// Output, including reasoning tokens.
+    output: u64,
     cost: f64,
     /// Some tokens had no price.
     unpriced: bool,
@@ -191,6 +199,10 @@ struct Sum {
 impl Sum {
     fn add(&mut self, u: &Usage) {
         self.tokens += tokens(u);
+        self.input += u.input;
+        self.cache_read += u.cache_read;
+        self.cache_write += u.cache_write;
+        self.output += u.output;
         self.cost += u.cost_usd;
         self.unpriced |= !u.priced;
     }
@@ -198,6 +210,24 @@ impl Sum {
         match m {
             Metric::Cost => self.cost,
             Metric::Tokens => self.tokens as f64,
+        }
+    }
+    /// The input / cached / cache write / output split, for totals and breakdowns.
+    fn mix(&self) -> String {
+        format!(
+            "in {} · cached {} · cache write {} · out {}",
+            count(self.input),
+            count(self.cache_read),
+            count(self.cache_write),
+            count(self.output),
+        )
+    }
+    /// Cost, or "unpriced" when the total is zero only because a model has no price.
+    fn cost_label(&self) -> String {
+        if self.cost == 0.0 && self.unpriced {
+            "unpriced".into()
+        } else {
+            usd(self.cost)
         }
     }
 }
@@ -343,7 +373,7 @@ fn stat(ink: &Ink, key: &str, title: &str, s: Sum, delta: Option<(f64, &str)>) -
         .key(format!("stat/{key}"))
         .grow(1.0)
         .min_w(0.0)
-        .h(96.0)
+        .h(116.0)
         .padding(S4)
         .gap(S1)
         .child(label(title, 12.0, 400.0, ink.faint))
@@ -352,7 +382,7 @@ fn stat(ink: &Ink, key: &str, title: &str, s: Sum, delta: Option<(f64, &str)>) -
                 .w_full()
                 .items_end()
                 .gap(S2)
-                .child(data(usd(s.cost), 24.0, ink.fg).shrink())
+                .child(data(s.cost_label(), 24.0, ink.fg).shrink())
                 .child(el().grow(1.0))
                 .children(delta.map(|(pct, vs)| {
                     let up = pct >= 0.0;
@@ -372,6 +402,11 @@ fn stat(ink: &Ink, key: &str, title: &str, s: Sum, delta: Option<(f64, &str)>) -
                 .children(s.unpriced.then(|| {
                     data("+ unpriced", 11.0, ink.faint).help("Some tokens ran on models with no known price, so the cost undercounts them")
                 })),
+        )
+        .child(
+            data(s.mix(), 10.5, ink.faint)
+                .truncate()
+                .help("Uncached input / cached input / cache writes (5m + 1h) / output. Reasoning is inside output and is not billed twice."),
         )
 }
 
@@ -409,11 +444,12 @@ fn chart(s: &State, ink: &Ink, k: &Kit, now: i64) -> El {
             .hover(Color::WHITE.alpha(0.03))
             .radius(3.0)
             .help(format!(
-                "{} · {} · {} tokens{}",
+                "{} · {} · {} tokens{} · {}",
                 if day == now { "Today".into() } else { short_date(day) },
-                usd(v.cost),
+                v.cost_label(),
                 count(v.tokens),
-                if v.unpriced { " · some unpriced" } else { "" }
+                if v.unpriced { " · some unpriced" } else { "" },
+                v.mix()
             ))
             .children((0..SEGMENTS).rev().map(move |seg| {
                 el().w_full().grow(1.0).min_h(2.0).radius(1.5).fill(if seg < lit { color } else { unlit })
@@ -504,7 +540,7 @@ fn breakdown(ink: &Ink, key: &str, title: &str, groups: &[(String, Sum)], limit:
                         .child(data(count(s.tokens), 11.0, ink.faint))
                         .child(
                             data(
-                                if s.cost == 0.0 && s.unpriced { "unpriced".into() } else { usd(s.cost) },
+                                s.cost_label(),
                                 11.0,
                                 if s.cost == 0.0 && s.unpriced { ink.faint } else { ink.fg },
                             )
@@ -512,6 +548,7 @@ fn breakdown(ink: &Ink, key: &str, title: &str, groups: &[(String, Sum)], limit:
                             .align(Align::End),
                         ),
                 )
+                .child(data(s.mix(), 10.5, ink.faint).truncate())
                 .child(bar(f as f32, if i == 0 { ink.fg.alpha(0.8) } else { ink.fg.alpha(0.4) }, ink))
         }))
         .children((groups.len() > limit).then(|| data(format!("+{} more", groups.len() - limit), 11.0, ink.faint)))
@@ -653,9 +690,9 @@ pub fn view(s: &State, ink: &Ink, k: &Kit) -> El {
         .key("usage-totals")
         .w_full()
         .gap(S4)
-        .child(stat(ink, "today", "Today", today_s, change(today_s.cost, yesterday.cost).filter(|_| wide).map(|p| (p, "yesterday"))))
-        .child(stat(ink, "week", "Last 7 days", week, change(week.cost, prev_week.cost).filter(|_| wide).map(|p| (p, "prior 7"))))
-        .child(stat(ink, "month", "Last 30 days", month, change(month.cost, prev_month.cost).filter(|_| wide).map(|p| (p, "prior 30"))))
+        .child(stat(ink, "today", "Today", today_s, change(today_s.cost, yesterday.cost).filter(|_| wide && !today_s.unpriced).map(|p| (p, "yesterday"))))
+        .child(stat(ink, "week", "Last 7 days", week, change(week.cost, prev_week.cost).filter(|_| wide && !week.unpriced).map(|p| (p, "prior 7"))))
+        .child(stat(ink, "month", "Last 30 days", month, change(month.cost, prev_month.cost).filter(|_| wide && !month.unpriced).map(|p| (p, "prior 30"))))
         .child(stat(ink, "all", "All time", all, None));
     let middle = row()
         .w_full()
@@ -699,7 +736,15 @@ mod tests {
     }
 
     fn sum_of(tokens: u64, cost: f64, priced: bool) -> Sum {
-        Sum { tokens, cost, unpriced: !priced }
+        Sum {
+            tokens,
+            input: tokens / 2,
+            cache_read: tokens / 4,
+            cache_write: 0,
+            output: tokens - tokens / 2 - tokens / 4,
+            cost,
+            unpriced: !priced,
+        }
     }
 
     #[test]

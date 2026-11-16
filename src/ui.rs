@@ -15,9 +15,7 @@ use rune::{el, row, text, col, Color, El, TextStyle};
 
 use crate::cats::{self};
 
-/// One terminal cell's worth of text: the only size on screen.
-pub const FS: f32 = 12.0;
-/// The meter's dot pitch, in points.
+/// Kept for the meter's resize signature; the bar is drawn from elements now.
 pub const CELL: f32 = 7.5;
 /// Rows the detail pane's list draws before it stops.
 
@@ -75,7 +73,6 @@ pub(crate) fn rgba(v: [u8; 3], a: f32) -> Color {
 pub(crate) const BG: [u8; 3] = [17, 17, 19];
 /// The accent as bytes, for dot bars.
 pub(crate) const ACCENT: [u8; 3] = [240, 180, 76];
-pub(crate) const WHITE: [u8; 3] = [236, 236, 238];
 
 impl Ink {
     pub(crate) fn new() -> Self {
@@ -183,7 +180,7 @@ pub(crate) fn keycap(key: impl Into<String>, ink: &Ink) -> El {
         .child(data(key, 10.5, ink.muted))
 }
 
-/// A thin proportional bar on a track: the kind of bar everything outside the storage page uses.
+/// A thin proportional bar on a track: the one bar every page uses.
 pub(crate) fn bar(fraction: f32, color: Color, ink: &Ink) -> El {
     let f = fraction.clamp(0.0, 1.0);
     row()
@@ -208,50 +205,6 @@ pub(crate) fn mono(size: f32, weight: f32) -> TextStyle {
     TextStyle::new(size, weight).mono()
 }
 
-/// Width of n monospace characters at the one size on screen.
-pub(crate) fn ch(n: f32) -> f32 {
-    FS * 0.6 * n
-}
-
-// ---- the dot sparkline ----------------------------------------------------
-
-fn dot_hash(a: usize, b: usize) -> f32 {
-    let mut h = (a as u32)
-        .wrapping_add(374_761_393)
-        .wrapping_mul(668_265_263)
-        ^ (b as u32)
-            .wrapping_add(1_274_126_177)
-            .wrapping_mul(2_246_822_519);
-    h = (h ^ (h >> 13)).wrapping_mul(3_266_489_917);
-    ((h ^ (h >> 16)) as f32) / 4_294_967_296.0
-}
-
-/// A small dot-matrix bar, the same pixel language as the big meter: lit dots in the category
-/// colour with the odd white one, unlit dots for the rest.
-pub(crate) fn dots(fraction: f32, color: cats::Rgb, count: usize, seed: usize, dim: bool) -> El {
-    let dot = (FS * 0.26).max(2.0).round();
-    let gap = (FS * 0.14).max(1.0).round();
-    let lit = if fraction > 0.0 {
-        ((fraction.clamp(0.0, 1.0) * count as f32).round() as usize).max(1)
-    } else {
-        0
-    };
-    row()
-        .gap(gap)
-        .items_center()
-        .children((0..count).map(move |i| {
-            let on = i < lit;
-            let k = dot_hash(i + seed * 31, seed);
-            let fill = if !on {
-                rgb([28, 28, 28])
-            } else if k > 0.9 && !dim {
-                Color::WHITE
-            } else {
-                tint(color, if dim { 0.35 } else { 0.55 + k * 0.45 })
-            };
-            el().size(dot, dot).radius(dot / 2.0).fill(fill)
-        }))
-}
 
 // ---- top line -------------------------------------------------------------
 

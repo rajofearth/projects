@@ -3,6 +3,7 @@
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
 mod actions;
+mod art;
 mod browse;
 mod cats;
 mod detail;
@@ -80,6 +81,8 @@ pub struct State {
     pub usage: usage_ui::UsageState,
     /// Editors and tools found on this machine, probed once.
     pub apps: Vec<launch::App>,
+    /// Editor icons and project logos, decoded off the UI thread.
+    pub art: art::Art,
     /// Pins, archive, recently opened, layout, folders, editor: what survives a restart.
     pub saved: saved::Saved,
     /// `detect` facts per project, read off the UI thread.
@@ -132,6 +135,7 @@ impl State {
             home: home::Home::new(),
             usage: usage_ui::UsageState::new(),
             apps: Vec::new(),
+            art: art::Art::default(),
             saved,
             inspect: inspect::Inspector::new(),
             newp: newproj::NewProject::new(),
@@ -658,6 +662,7 @@ fn wallclock() -> String {
 }
 
 fn setup(s: &mut State, waker: Waker) {
+    s.art.start(waker.clone());
     s.waker = Some(waker);
     s.apps = launch::installed();
     if !s.demo {
@@ -713,9 +718,9 @@ fn scene_settings(s: &mut State) {
     s.load_demo();
     s.page = shell::Page::Settings;
     s.apps = vec![
-        launch::App { id: "vscode", name: "VS Code" },
-        launch::App { id: "cursor", name: "Cursor" },
-        launch::App { id: "zed", name: "Zed" },
+        launch::App { id: "vscode", name: "VS Code", exe: None },
+        launch::App { id: "cursor", name: "Cursor", exe: None },
+        launch::App { id: "zed", name: "Zed", exe: None },
     ];
     s.saved.roots = vec![s.root.clone(), r"D:\Work".into()];
     s.saved.archived.insert("llama.cpp".into());
@@ -752,6 +757,8 @@ fn scene_empty(s: &mut State) {
 }
 
 fn main() {
+    // The window and taskbar icon (Windows); a no-op elsewhere. The exe's own icon comes from build.rs.
+    let _ = rune::set_app_icon(include_bytes!("../assets/icon-256.png").to_vec());
     rune::run(AppSpec::<State> {
         scenes: &[
             ("demo", scene_home),
@@ -839,7 +846,7 @@ mod tests {
     #[test]
     fn the_page_shows_the_meter_the_categories_and_the_inside_pane() {
         let rt = demo_runtime();
-        assert!(rt.find("meter").is_some(), "the dot meter is laid out");
+        assert!(rt.find("meter").is_some(), "the meter is laid out");
         assert!(rt.find("categories").is_some(), "the legend is laid out");
         assert!(rt.find("inside").is_some(), "the detail pane is laid out");
         assert!(rt.find("topline").is_some());

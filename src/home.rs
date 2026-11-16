@@ -5,15 +5,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use rune::{col, el, icon, row, Align, Color, Cursor, El, Key, KeyEvent, PointerPress, ScrollSpec, TextEdit, Tx};
+use rune::{col, el, icon, row, Align, Color, Cursor, El, Key, KeyEvent, PointerPress, ScrollSpec, SurfaceFit, TextEdit, Tx};
 use rune_kit::{
     context_menu, Button, ButtonVariant, ControlSize, Kit, MenuEntry, MenuItem,
     SegmentedControl, Select, Spinner, TextInput,
 };
 
 use crate::actions;
+use crate::art;
 use crate::fmt;
 use crate::icons;
+use crate::launch::App;
 use crate::model::{self, Project};
 use crate::saved::{now_unix, Layout, Order};
 use crate::shell;
@@ -322,6 +324,35 @@ fn menu_item(text_: impl Into<String>, glyph: &'static rune::Icon, f: impl Fn(&m
     })
 }
 
+/// A menu row for an editor: its own icon once decoded, else the generic glyph.
+fn app_item(s: &State, app: &App, text_: String, f: impl Fn(&mut State) + 'static) -> MenuItem {
+    match art::ready(s.art.app(app)) {
+        Some(img) => MenuItem::new(text_).lead(el().size(14.0, 14.0).pixels(img.pixels())).on_select(move |s: &mut State| {
+            f(s);
+            close_menu(s);
+        }),
+        None => menu_item(text_, &icons::CODE, f),
+    }
+}
+
+/// A project's logo at `pt` points, or its first letter on a tile until the logo decodes
+/// (or when there is none).
+pub fn logo_mark(s: &State, ink: &Ink, p: &Project, pt: f32) -> El {
+    match art::ready(s.art.logo(&actions::path_of(s, &p.name))) {
+        Some(img) => el().size(pt, pt).radius(4.0).pixels_fit(img.pixels(), SurfaceFit::Fit),
+        None => {
+            let initial = p.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+            row()
+                .size(pt, pt)
+                .radius(4.0)
+                .fill(ink.raised)
+                .items_center()
+                .justify_center()
+                .child(label(initial, (pt * 0.5).round(), 600.0, ink.muted))
+        }
+    }
+}
+
 fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let Some((name, at)) = s.home.menu.clone() else {
         return el().key("ctx-anchor");
@@ -334,7 +365,7 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .iter()
         .map(|a| {
             let (n, id) = (n.clone(), a.id);
-            MenuEntry::item(menu_item(a.name, &icons::CODE, move |s| actions::open_in(s, &n, id)))
+            MenuEntry::item(app_item(s, a, a.name.to_string(), move |s| actions::open_in(s, &n, id)))
         })
         .collect();
     let scripts: Vec<MenuEntry> = match s.inspect.get(&name) {
@@ -360,7 +391,7 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(app) = actions::default_app(s) {
         let id = app.id;
         m = m.item(
-            menu_item(format!("Open in {}", app.name), &icons::CODE, move |s| actions::open_in(s, &g, id)).shortcut("Enter"),
+            app_item(s, app, format!("Open in {}", app.name), move |s| actions::open_in(s, &g, id)).shortcut("Enter"),
         );
     }
     m = m
@@ -508,6 +539,7 @@ fn card(s: &State, ink: &Ink, p: &Project, w: f32) -> El {
                 .w_full()
                 .items_center()
                 .gap(S2)
+                .child(logo_mark(s, ink, p, 20.0))
                 .child(label(p.name.clone(), 14.0, 500.0, ink.fg).grow(1.0).min_w(0.0).truncate())
                 .child(star(s, ink, &p.name, hovered || selected)),
         )

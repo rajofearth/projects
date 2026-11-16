@@ -1,10 +1,11 @@
 //! The details panel beside the grid: what a project is, where git stands, what you can run,
 //! and where its space goes. Facts come from `detect::inspect`, read on the inspector's thread.
 
-use rune::{col, el, icon, row, Align, Color, Cursor, El, ScrollSpec, Tx};
+use rune::{col, el, icon, row, text, Align, Color, Cursor, El, ScrollSpec, Tx};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 
 use crate::actions;
+use crate::art;
 use crate::cats::{self, Cat};
 use crate::fmt;
 use crate::icons;
@@ -237,6 +238,7 @@ pub fn panel(s: &State, ink: &Ink, k: &Kit, p: &Project, _layer: &mut Vec<El>) -
     let info = s.inspect.get(&p.name);
     let path = actions::path_of(s, &p.name).display().to_string();
     let editor = actions::default_app(s).map(|a| (a.id, a.name));
+    let editor_icon = actions::default_app(s).and_then(|a| art::ready(s.art.app(a)));
     let (n1, n2, n3, n4) = (p.name.clone(), p.name.clone(), p.name.clone(), p.name.clone());
     let _pinned = s.saved.pinned.contains(&p.name);
     let stacks = crate::home::stacks(s, p);
@@ -276,12 +278,24 @@ pub fn panel(s: &State, ink: &Ink, k: &Kit, p: &Project, _layer: &mut Vec<El>) -
     body = body.child(storage_block(ink, k, p));
 
     let open = match editor {
-        Some((id, name)) => Button::new(format!("Open in {name}"))
-            .variant(ButtonVariant::Submit)
-            .icon(&icons::CODE)
-            .control_size(ControlSize::Large)
-            .on_press(move |s: &mut State| actions::open_in(s, &n1, id))
-            .build(k),
+        Some((id, name)) => {
+            let button = Button::new(format!("Open in {name}"))
+                .variant(ButtonVariant::Submit)
+                .control_size(ControlSize::Large)
+                .on_press(move |s: &mut State| actions::open_in(s, &n1, id));
+            match editor_icon {
+                Some(img) => button
+                    .label_with(move |font, ink| {
+                        row()
+                            .gap(S2)
+                            .items_center()
+                            .child(el().size(16.0, 16.0).pixels(img.pixels()))
+                            .child(text(format!("Open in {name}")).font(font).color(ink))
+                    })
+                    .build(k),
+                None => button.icon(&icons::CODE).build(k),
+            }
+        }
         None => Button::new("Reveal")
             .variant(ButtonVariant::Submit)
             .icon(&icons::FOLDER)
@@ -319,6 +333,7 @@ pub fn panel(s: &State, ink: &Ink, k: &Kit, p: &Project, _layer: &mut Vec<El>) -
                         .h(32.0)
                         .items_center()
                         .gap(S2)
+                        .child(crate::home::logo_mark(s, ink, p, 28.0))
                         .child(label(p.name.clone(), 16.0, 500.0, ink.fg).grow(1.0).min_w(0.0).truncate())
                         .child(crate::home::star(s, ink, &n4, true))
                         .child(

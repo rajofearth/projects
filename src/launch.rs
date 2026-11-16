@@ -12,6 +12,9 @@ use std::sync::OnceLock;
 pub struct App {
     pub id: &'static str,
     pub name: &'static str,
+    /// The GUI executable whose icon stands for the app. A `.cmd` shim has no icon of its
+    /// own, so this is the `.exe` beside it. `None` when no such file was found.
+    pub exe: Option<PathBuf>,
 }
 
 /// An app that was detected, with the executable (or `.cmd` shim) that launches it.
@@ -21,12 +24,14 @@ struct Found {
 }
 
 /// Where to look for an app: CLI names on PATH first, then known install paths
-/// relative to `%LOCALAPPDATA%`.
+/// relative to `%LOCALAPPDATA%`. `icons` are GUI executables, relative to the same folder,
+/// whose icons show the app.
 struct Spec {
     id: &'static str,
     name: &'static str,
     clis: &'static [&'static str],
     files: &'static [&'static str],
+    icons: &'static [&'static str],
 }
 
 const SPECS: &[Spec] = &[
@@ -35,56 +40,69 @@ const SPECS: &[Spec] = &[
         name: "VS Code",
         clis: &["code"],
         files: &[r"Programs\Microsoft VS Code\bin\code.cmd"],
+        icons: &[r"Programs\Microsoft VS Code\Code.exe"],
     },
     Spec {
         id: "cursor",
         name: "Cursor",
         clis: &["cursor"],
         files: &[r"Programs\cursor\resources\app\bin\cursor.cmd"],
+        icons: &[r"Programs\cursor\Cursor.exe"],
     },
     Spec {
         id: "zed",
         name: "Zed",
         clis: &["zed"],
         files: &[r"Programs\Zed\bin\zed.exe", r"Programs\Zed\Zed.exe"],
+        icons: &[r"Programs\Zed\Zed.exe"],
     },
     Spec {
         id: "windsurf",
         name: "Windsurf",
         clis: &["windsurf"],
         files: &[r"Programs\Windsurf\bin\windsurf.cmd"],
+        icons: &[r"Programs\Windsurf\Windsurf.exe"],
     },
     Spec {
         id: "t3code",
         name: "T3 Code",
         clis: &["t3code"],
+        // The desktop app installs as "T3 Code (Beta).exe" in Programs\t3code (its Start
+        // Menu shortcut is "T3 Code (Beta).lnk"). The `t3` CLI shim on PATH needs that app
+        // too, so it is not used to launch.
         files: &[
+            r"Programs\t3code\T3 Code (Beta).exe",
             r"Programs\t3code\T3 Code.exe",
             r"Programs\T3 Code\T3 Code.exe",
             r"Programs\t3code\t3code.exe",
         ],
+        icons: &[r"Programs\t3code\T3 Code (Beta).exe", r"Programs\T3 Code\T3 Code.exe"],
     },
     Spec {
         id: "synara",
         name: "Synara",
         clis: &["synara"],
         files: &[
+            r"Programs\synara-desktop\Synara.exe",
             r"Programs\synara\Synara.exe",
             r"Programs\Synara\Synara.exe",
             r"Programs\synara\synara.exe",
         ],
+        icons: &[r"Programs\synara-desktop\Synara.exe", r"Programs\synara\Synara.exe"],
     },
     Spec {
         id: "idea",
         name: "IntelliJ IDEA",
         clis: &["idea"],
         files: &[r"JetBrains\Toolbox\scripts\idea.cmd"],
+        icons: &[],
     },
     Spec {
         id: "webstorm",
         name: "WebStorm",
         clis: &["webstorm"],
         files: &[r"JetBrains\Toolbox\scripts\webstorm.cmd"],
+        icons: &[],
     },
 ];
 
@@ -235,10 +253,16 @@ fn detect() -> Vec<Found> {
                         .map(|f| base.join(f))
                         .find(|p| p.is_file())
                 })?;
+            let exe = if is_exe(&launcher) {
+                Some(launcher.clone())
+            } else {
+                find_icon_exe(&launcher, spec.icons, local.as_deref())
+            };
             Some(Found {
                 app: App {
                     id: spec.id,
                     name: spec.name,
+                    exe,
                 },
                 launcher,
             })
@@ -269,6 +293,30 @@ fn find_on_path(cli: &str) -> Option<PathBuf> {
 
 fn is_runnable(p: &Path) -> bool {
     matches!(ext_lower(p).as_deref(), Some("exe" | "cmd" | "bat")) && p.is_file()
+}
+
+/// The icon executable for a `.cmd` shim. Its install folder is a few levels above the shim
+/// (`...\VS Code\bin\code.cmd`), so the folders above it are searched for the file name
+/// first, then `icons` is tried under `%LOCALAPPDATA%`.
+fn find_icon_exe(launcher: &Path, icons: &[&str], local: Option<&Path>) -> Option<PathBuf> {
+    let names: Vec<&str> = icons
+        .iter()
+        .filter_map(|f| Path::new(f).file_name()?.to_str())
+        .collect();
+    let near = launcher
+        .ancestors()
+        .skip(1)
+        .take(5)
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
+        .find(|p| p.is_file());
+    near.or_else(|| {
+        let base = local?;
+        icons.iter().map(|f| base.join(f)).find(|p| p.is_file())
+    })
+}
+
+fn is_exe(p: &Path) -> bool {
+    ext_lower(p).as_deref() == Some("exe") && p.is_file()
 }
 
 fn is_shim(p: &Path) -> bool {
@@ -430,5 +478,29 @@ mod tests {
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 
         fs::remove_dir_all(&parent).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    #[test]
+    fn a_shim_finds_the_exe_in_its_install_folder() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!("icon-test-{}-{nanos}", std::process::id()));
+        let install = base.join("Microsoft VS Code");
+        fs::create_dir_all(install.join("bin")).unwrap();
+        fs::write(install.join("bin").join("code.cmd"), b"").unwrap();
+        fs::write(install.join("Code.exe"), b"").unwrap();
+        let shim = install.join("bin").join("code.cmd");
+
+        let found = find_icon_exe(&shim, &[r"Programs\Microsoft VS Code\Code.exe"], None);
+        assert_eq!(found, Some(install.join("Code.exe")));
+        assert_eq!(find_icon_exe(&base.join("nope.cmd"), &["Code.exe"], None), None);
+        fs::remove_dir_all(&base).unwrap();
     }
 }

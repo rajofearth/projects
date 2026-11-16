@@ -1,20 +1,19 @@
-//! Storage: where the projects folder's bytes are. Totals up top, the dot-matrix meter (the
-//! app's one picture), then the folder table beside what the picked row is, the categories it
-//! can be narrowed to, and what can be cleared. Nothing here deletes anything: Reveal shows a
+//! Storage: where the projects folder's bytes are. Totals up top, one segmented bar of every
+//! byte by category, then the folder list beside what the picked row is, the categories it can
+//! be narrowed to, and what can be cleared. Nothing here deletes anything: Reveal shows a
 //! folder in Explorer and the reader decides.
 
-use rune::{col, el, icon, row, Align, Color, Cursor, Cx, El, ScrollSpec, SurfaceFit};
+use rune::{col, el, icon, row, Align, Color, Cursor, Cx, El, ScrollSpec};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit, Spinner};
 
 use crate::browse::{Culprit, Item};
 use crate::cats::{self, Cat, Tier, Verdict, CATEGORIES};
 use crate::fmt;
 use crate::icons;
-use crate::meter::Meter;
 use crate::model;
 use crate::shell;
 use crate::store;
-use crate::ui::{card, color_of, data, dots, label, Ink, CELL, R_CARD, R_CTRL, S1, S2, S3, S4, S5, S6};
+use crate::ui::{bar, card, color_of, data, label, tint, Ink, R_CARD, R_CTRL, S1, S2, S3, S4, S5, S6};
 use crate::State;
 
 /// The left column: the picked row, the categories, what can be cleared.
@@ -31,19 +30,19 @@ fn verdict_w(s: &State) -> f32 {
     if compact(s) { 8.0 } else { VERDICT_W }
 }
 
-fn dot_count(s: &State) -> usize {
-    if compact(s) { 8 } else { DOTS }
+fn bar_w(s: &State) -> f32 {
+    if compact(s) { 48.0 } else { BAR_W }
 }
 // The table's column widths. The header and every row read these same numbers, so a heading
 // can never drift off the column it names.
 const ARROW_W: f32 = 16.0;
-const VERDICT_W: f32 = 92.0;
+const VERDICT_W: f32 = 104.0;
 const SIZE_W: f32 = 76.0;
-const DOTS: usize = 14;
+const BAR_W: f32 = 96.0;
 const PCT_W: f32 = 36.0;
 const AGE_W: f32 = 64.0;
 const GAP: f32 = 12.0;
-const ROW_H: f32 = 32.0;
+const ROW_H: f32 = 36.0;
 
 fn pct(part: u64, whole: u64) -> String {
     if whole == 0 {
@@ -53,14 +52,26 @@ fn pct(part: u64, whole: u64) -> String {
     }
 }
 
-fn dots_width(n: usize) -> f32 {
-    let dot = (12.0f32 * 0.26).max(2.0).round();
-    let gap = (12.0f32 * 0.14).max(1.0).round();
-    n as f32 * dot + (n as f32 - 1.0).max(0.0) * gap
+fn small_dot(c: Color) -> El {
+    el().size(8.0, 8.0).radius(2.5).fill(c)
 }
 
-fn small_dot(c: Color) -> El {
-    el().size(8.0, 8.0).radius(2.0).fill(c)
+/// A soft pill in a colour: a verdict, a tier. Proportional type on a faint wash of the colour.
+fn chip(text_: impl Into<String>, rgb8: cats::Rgb) -> El {
+    row()
+        .h(20.0)
+        .px(S2)
+        .radius(10.0)
+        .items_center()
+        .shrink()
+        .min_w(0.0)
+        .fill(tint(rgb8, 0.13))
+        .child(label(text_, 11.0, 500.0, color_of(rgb8)).truncate())
+}
+
+/// A thin bar held to a fixed width, for a column.
+fn bar_at(width: f32, fraction: f32, color: Color, ink: &Ink) -> El {
+    row().w(width).items_center().child(bar(fraction, color, ink))
 }
 
 // ---- totals -------------------------------------------------------------------
@@ -111,7 +122,7 @@ fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
                     .child(label(item.name.clone(), 18.0, 500.0, ink.fg).min_w(0.0).shrink().truncate())
                     .child(data(model::gb(item.size), 13.0, ink.green).pb(2.0)),
             )
-            .child(label(label_.reason.clone(), 11.0, 400.0, ink.muted).truncate()),
+            .child(label(label_.reason.clone(), 12.0, 400.0, ink.muted).truncate()),
         None => card(ink)
             .key("total/win")
             .grow(1.3)
@@ -132,7 +143,7 @@ fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
             "On disk",
             v(total),
             ink.fg,
-            data(format!("{} folders", s.projects.len()), 11.0, ink.muted),
+            label(format!("{} folders", s.projects.len()), 12.0, 400.0, ink.muted),
         ))
         .child(stat(
             ink,
@@ -140,9 +151,10 @@ fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
             "Rebuildable",
             v(rebuildable),
             ink.green,
-            data(
+            label(
                 if compact(s) { "deps and builds".to_string() } else { format!("{} deps + {} builds", model::gb(sizes[1]), model::gb(sizes[2])) },
-                11.0,
+                12.0,
+                400.0,
                 ink.muted,
             )
             .truncate(),
@@ -153,15 +165,18 @@ fn totals(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
             "Your source",
             v(sizes[0]),
             ink.fg,
-            data(format!("{} of the disk", pct(sizes[0], total)), 11.0, ink.muted),
+            label(format!("{} of the disk", pct(sizes[0], total)), 12.0, 400.0, ink.muted),
         ))
         .child(win_card)
 }
 
 // ---- the meter ----------------------------------------------------------------
 
+/// Every byte under the root as one segmented bar, a segment per category, with a legend of
+/// the same categories under it. Pointing at either names the category; a click narrows to it.
 fn meter_card(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
     let total: u64 = sizes.iter().sum();
+    let lit = s.ui.hover.or(if s.ui.stack.is_empty() { s.ui.filter.cat() } else { None });
     let readout: El = match s.ui.hover {
         Some(cat) => {
             let size = sizes[store::cat_index(cat)];
@@ -169,61 +184,87 @@ fn meter_card(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
                 .key("meter-readout")
                 .items_center()
                 .gap(S2)
-                .child(small_dot(color_of(cat.color())))
                 .child(label(cat.name(), 12.0, 500.0, ink.fg))
-                .child(data(format!("{} · {}", model::gb(size), pct(size, total)), 11.0, ink.muted))
-                .child(label("click to filter", 11.0, 400.0, ink.faint))
+                .child(data(format!("{} · {}", model::gb(size), pct(size, total)), 12.0, ink.muted))
+                .child(label("Click to filter", 12.0, 400.0, ink.faint))
         }
         None => row()
-            .key("meter-legend")
-            .gap(S4)
+            .key("meter-readout")
             .items_center()
-            .children(CATEGORIES.iter().map(|c| {
-                row()
-                    .gap(6.0)
-                    .items_center()
-                    .child(small_dot(color_of(c.color)))
-                    .child(label(c.name, 11.0, 400.0, ink.muted))
-                    .child(data(pct(sizes[store::cat_index(c.id)], total), 11.0, ink.faint))
-            })),
+            .gap(S2)
+            .child(data(if total > 0 || !s.scanning { model::gb(total) } else { "…".into() }, 12.0, ink.muted))
+            .children(s.scanning.then(|| label("measuring", 12.0, 400.0, ink.faint))),
     };
+    let segments = CATEGORIES.iter().filter(|c| sizes[store::cat_index(c.id)] > 0).map(|c| {
+        let id = c.id;
+        let bytes = sizes[store::cat_index(id)];
+        let on = lit.is_none_or(|l| l == id);
+        el().key(format!("seg/{}", id.label()))
+            .h_full()
+            .grow(bytes as f32 / total.max(1) as f32)
+            .min_w(4.0)
+            .radius(4.0)
+            .fill(if on { color_of(c.color) } else { tint(c.color, 0.28) })
+            .cursor(Cursor::Pointer)
+            .on_hover_change(move |s: &mut State, inside, _| {
+                if inside {
+                    s.ui.set_hover(Some(id));
+                } else if s.ui.hover == Some(id) {
+                    s.ui.set_hover(None);
+                }
+            })
+            .on_press(move |s: &mut State| s.pick(id))
+            .help(c.blurb)
+    });
+    let bar_row = row()
+        .key("meter")
+        .w_full()
+        .h(14.0)
+        .gap(crate::meter::GAP)
+        .children(segments)
+        .children((total == 0).then(|| el().h_full().grow(1.0).radius(4.0).fill(ink.raised)));
+    let legend = row().key("meter-legend").w_full().gap(S2).flex_wrap().children(CATEGORIES.iter().map(|c| {
+        let id = c.id;
+        let bytes = sizes[store::cat_index(id)];
+        let on = s.ui.filter.cat() == Some(id);
+        row()
+            .key(format!("legend/{}", id.label()))
+            .h(28.0)
+            .px(S3)
+            .gap(S2)
+            .radius(14.0)
+            .items_center()
+            .cursor(Cursor::Pointer)
+            .fill(if on { ink.raised } else { Color::TRANSPARENT })
+            .border(1.0, if on { ink.line_strong } else { ink.line })
+            .hover(ink.hover)
+            .on_hover_change(move |s: &mut State, inside, _| {
+                if inside {
+                    s.ui.set_hover(Some(id));
+                } else if s.ui.hover == Some(id) {
+                    s.ui.set_hover(None);
+                }
+            })
+            .on_press(move |s: &mut State| s.pick(id))
+            .child(small_dot(color_of(c.color)))
+            .child(label(c.name, 12.0, if on { 500.0 } else { 400.0 }, if on { ink.fg } else { ink.row }))
+            .child(data(model::gb(bytes), 11.0, ink.muted))
+            .child(data(pct(bytes, total), 11.0, ink.faint))
+    }));
     card(ink)
         .key("meter-card")
         .w_full()
-        .padding(S4)
-        .pt(S3)
-        .gap(0.0)
+        .padding(S5)
+        .gap(S3)
         .child(
             row()
                 .w_full()
-                .h(20.0)
                 .items_center()
                 .child(label("Every byte, by what made it", 13.0, 500.0, ink.fg).grow(1.0))
                 .child(readout),
         )
-        .child(
-            el().key("meter")
-                .w_full()
-                .h(Meter::height(CELL))
-                .native_surface(s.meter.surface(), SurfaceFit::Fill)
-                .surface_anchor(Align::Start, Align::Start)
-                .cursor(Cursor::Pointer)
-                .on_layout(|s: &mut State, r: [f32; 4]| s.meter_resize(r[2], r[3]))
-                .on_pointer_move_local(|s: &mut State, p, _| {
-                    let hit = s.meter_hit(p.x, p.y);
-                    s.ui.set_hover(hit);
-                })
-                .on_hover_change(|s: &mut State, inside, _| {
-                    if !inside {
-                        s.ui.set_hover(None);
-                    }
-                })
-                .on_press(|s: &mut State| {
-                    if let Some(cat) = s.ui.hover {
-                        s.pick(cat);
-                    }
-                }),
-        )
+        .child(bar_row)
+        .child(legend)
 }
 
 // ---- left column ----------------------------------------------------------------
@@ -246,8 +287,8 @@ fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit, color: cats::Rgb) -> 
         return col()
             .w_full()
             .gap(S1)
-            .child(label("Spread across", 11.0, 400.0, ink.faint))
-            .child(data(spread, 11.0, ink.muted).truncate());
+            .child(label("Spread across", 12.0, 400.0, ink.faint))
+            .child(label(spread, 12.0, 400.0, ink.muted).truncate());
     };
     let whole = culprit.root_size.max(item.size).max(last.size);
     let fraction = if whole > 0 { last.size as f32 / whole as f32 } else { 0.0 };
@@ -255,7 +296,7 @@ fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit, color: cats::Rgb) -> 
     col()
         .w_full()
         .gap(6.0)
-        .child(label("Most of it is in", 11.0, 400.0, ink.faint))
+        .child(label("Most of it is in", 12.0, 400.0, ink.faint))
         .child(
             row()
                 .w_full()
@@ -265,7 +306,7 @@ fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit, color: cats::Rgb) -> 
                 .child(data(model::gb(last.size), 11.0, ink.muted).shrink())
                 .child(data(pct(last.size, whole), 11.0, ink.faint).w(32.0).align(Align::End)),
         )
-        .child(dots(fraction, color, 18, last.name.len() * 7, false))
+        .child(bar(fraction, color_of(color), ink))
 }
 
 /// What the highlighted row is, where its space is, and what you can do with it.
@@ -324,11 +365,11 @@ fn details(s: &State, ink: &Ink, k: &Kit) -> El {
                 .gap(6.0)
                 .items_center()
                 .child(small_dot(color_of(category.color)))
-                .child(data(format!("{} {}", model::gb(share), category.name.to_lowercase()), 11.0, ink.muted)),
+                .child(label(format!("{} {}", model::gb(share), category.name.to_lowercase()), 12.0, 400.0, ink.muted)),
         );
     }
     if let Some(d) = days {
-        facts = facts.child(data(format!("last commit {}", fmt::days_ago(Some(d))), 11.0, ink.faint));
+        facts = facts.child(label(format!("Last commit {}", fmt::days_ago(Some(d))), 12.0, 400.0, ink.faint));
     }
     body = body
         .child(facts)
@@ -387,12 +428,11 @@ fn filter_line(
     rgb8: cats::Rgb,
     selected: bool,
     dimmed: bool,
-    seed: usize,
 ) -> El {
     row()
         .key(key)
         .w_full()
-        .h(30.0)
+        .h(34.0)
         .px(S2)
         .gap(S2)
         .radius(R_CTRL)
@@ -408,7 +448,7 @@ fn filter_line(
                 .truncate(),
         )
         .child(data(model::gb(bytes), 11.0, if selected { ink.fg } else { ink.muted }).w(64.0).align(Align::End))
-        .child(dots(fraction, rgb8, 12, seed, dimmed || !selected))
+        .child(bar_at(56.0, fraction, if dimmed { tint(rgb8, 0.3) } else { color_of(rgb8) }, ink))
 }
 
 fn categories_card(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
@@ -424,7 +464,7 @@ fn categories_card(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
         .gap(2.0)
         .child(heading("Show", ink).px(S2).pb(S1))
         .child(
-            filter_line(ink, "filter/all".into(), "All projects", ink.fg, total, 1.0, [236, 236, 238], all_on, false, 0)
+            filter_line(ink, "filter/all".into(), "All projects", ink.fg, total, 1.0, [236, 236, 238], all_on, false)
                 .on_hover_change(|s: &mut State, inside, _| {
                     if inside {
                         s.ui.set_hover(None);
@@ -447,7 +487,6 @@ fn categories_card(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
                 c.color,
                 selected,
                 dimmed,
-                c.id.label().len() * 7,
             )
             .on_hover_change(move |s: &mut State, inside, _| {
                 if inside {
@@ -559,9 +598,16 @@ fn project_age(s: &State, item: &Item) -> Option<u64> {
 
 fn header_cell(s: &State, ink: &Ink, sort: store::Sort, text_: &str, width: Option<f32>, end: bool) -> El {
     let active = sort != store::Sort::None && s.ui.sort == sort;
-    let arrow = if !active { "" } else if s.ui.sort_down { " ↓" } else { " ↑" };
-    let mut cell = label(format!("{text_}{arrow}"), 11.0, if active { 500.0 } else { 400.0 }, if active { ink.row } else { ink.faint })
-        .align(if end { Align::End } else { Align::Start });
+    let tone = if active { ink.fg } else { ink.muted };
+    let mut cell = if end { row().justify_end() } else { row() };
+    cell = cell
+        .h_full()
+        .gap(S1)
+        .items_center()
+        // The arrow sits on the column's open side, so the word stays flush with the figures.
+        .children((active && end).then(|| icon(if s.ui.sort_down { &icons::DOWN } else { &icons::UP }, 12.0).color(ink.muted)))
+        .child(label(text_, 12.0, 500.0, tone))
+        .children((active && !end).then(|| icon(if s.ui.sort_down { &icons::DOWN } else { &icons::UP }, 12.0).color(ink.muted)));
     cell = match width {
         Some(w) => cell.w(w),
         None => cell.grow(1.0).min_w(0.0),
@@ -584,7 +630,7 @@ fn table_row(s: &State, ink: &Ink, item: &Item, index: usize) -> El {
     let share = s.ui.share(item, &s.projects);
     let disk = s.ui.disk_size(&s.projects).max(1);
     let disk_share = item.size as f32 / disk as f32;
-    let tint = if label_.verdict == Verdict::Yours { category.color } else { label_.verdict.color() };
+    let tint_rgb = if label_.verdict == Verdict::Yours { category.color } else { label_.verdict.color() };
     row()
         .key(format!("row/{index}"))
         .w_full()
@@ -612,6 +658,11 @@ fn table_row(s: &State, ink: &Ink, item: &Item, index: usize) -> El {
                 .children(item.dir.then(|| icon(&icons::CHEVRON_RIGHT, 12.0).color(if selected { ink.fg } else { ink.faint }))),
         )
         .child(
+            row()
+                .w(14.0)
+                .children(item.dir.then(|| icon(&icons::FOLDER, 14.0).color(if selected { ink.muted } else { ink.faint }))),
+        )
+        .child(
             label(item.name.clone(), 13.0, if selected { 500.0 } else { 400.0 }, if selected { ink.fg } else { ink.row })
                 .grow(1.0)
                 .min_w(0.0)
@@ -620,13 +671,13 @@ fn table_row(s: &State, ink: &Ink, item: &Item, index: usize) -> El {
         .child(
             row()
                 .w(verdict_w(s))
-                .gap(6.0)
                 .items_center()
-                .children((!label_.verdict.tag().is_empty()).then(|| small_dot(color_of(label_.verdict.color()))))
-                .children((!compact(s)).then(|| label(label_.verdict.tag(), 12.0, 400.0, color_of(label_.verdict.color())))),
+                .children((!label_.verdict.tag().is_empty()).then(|| {
+                    if compact(s) { small_dot(color_of(label_.verdict.color())) } else { chip(label_.verdict.tag(), label_.verdict.color()) }
+                })),
         )
         .child(data(model::gb(item.size), 12.0, if selected { ink.fg } else { ink.muted }).w(SIZE_W).align(Align::End))
-        .child(dots(disk_share, tint, dot_count(s), index + 3, !selected))
+        .child(bar_at(bar_w(s), disk_share, if selected { color_of(tint_rgb) } else { tint(tint_rgb, 0.7) }, ink))
         .children((!compact(s)).then(|| data(pct(share, scope), 11.0, ink.faint).w(PCT_W).align(Align::End)))
         .child(
             data(days.map(cats::short_age).unwrap_or_default(), 11.0, if stale { ink.amber } else { ink.faint })
@@ -690,7 +741,7 @@ fn table(s: &State, ink: &Ink, k: &Kit) -> El {
                 .child(breadcrumb(s, ink))
                 .child(el().grow(1.0))
                 .child(data(model::gb(scope), 13.0, ink.fg))
-                .child(data(format!("{} of disk", pct(scope, total)), 11.0, ink.muted))
+                .child(label(format!("{} of disk", pct(scope, total)), 12.0, 400.0, ink.muted))
                 .children((category.tier != Tier::Keep && s.ui.filter.cat().is_some()).then(|| {
                     label(
                         cats::tier_note(category.tier),
@@ -708,7 +759,7 @@ fn table(s: &State, ink: &Ink, k: &Kit) -> El {
                 .w_full()
                 .pl(S2)
                 .items_center()
-                .child(data(blurb, 11.0, ink.faint).grow(1.0).min_w(0.0).truncate())
+                .child(if s.ui.stack.is_empty() { label(blurb, 12.0, 400.0, ink.faint) } else { data(blurb, 11.0, ink.faint) }.grow(1.0).min_w(0.0).truncate())
                 .children(s.ui.listing.then(|| label("measuring…", 11.0, 400.0, ink.muted))),
         );
     // Laid out with the row's own widths, gaps and inset, so every heading sits over its column.
@@ -720,11 +771,11 @@ fn table(s: &State, ink: &Ink, k: &Kit) -> El {
         .gap(GAP)
         .items_center()
         .border_sides([0.0, 0.0, 1.0, 0.0], ink.line)
-        .child(el().size(ARROW_W, 0.0))
+        .child(el().size(ARROW_W + 14.0 + GAP, 0.0))
         .child(header_cell(s, ink, store::Sort::Name, "Folder", None, false))
         .child(header_cell(s, ink, store::Sort::None, "", Some(verdict_w(s)), false))
         .child(header_cell(s, ink, store::Sort::Size, "Size", Some(SIZE_W), true))
-        .child(el().size(dots_width(dot_count(s)), 0.0))
+        .child(el().size(bar_w(s), 0.0))
         .children((!compact(s)).then(|| el().size(PCT_W, 0.0)))
         .child(header_cell(s, ink, store::Sort::Age, "Last commit", Some(AGE_W), true));
     let body: El = if entries.is_empty() {
@@ -746,7 +797,7 @@ fn table(s: &State, ink: &Ink, k: &Kit) -> El {
                     .gap(2.0)
                     .children(entries.iter().enumerate().map(|(i, item)| table_row(s, ink, item, i)))
                     .children((listing > store::MAX_ROWS).then(|| {
-                        data(format!("and {} smaller", listing - store::MAX_ROWS), 11.0, ink.faint).pt(S2).pl(S2 + ARROW_W + GAP)
+                        label(format!("and {} smaller", listing - store::MAX_ROWS), 12.0, 400.0, ink.faint).pt(S2).pl(S2 + ARROW_W + 14.0 + 2.0 * GAP)
                     })),
             )
     };
@@ -758,7 +809,7 @@ fn table(s: &State, ink: &Ink, k: &Kit) -> El {
         .gap(S3)
         .items_center()
         .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
-        .child(data(fmt::plural(listing, "item", "items"), 11.0, ink.faint))
+        .child(label(fmt::plural(listing, "item", "items"), 12.0, 400.0, ink.faint))
         .child(el().grow(1.0))
         .children(s.ui.note.clone().map(|note| label(note, 12.0, 400.0, ink.muted).truncate()))
         .children(s.ui.note.is_none().then(|| label("Double-click a folder to open it", 11.0, 400.0, ink.faint)));
