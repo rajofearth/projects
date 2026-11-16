@@ -2399,6 +2399,7 @@ name = "projects-stats"
 version = "0.1.0"
 dependencies = [
  "rune",
+ "serde_json",
  "windows-sys 0.59.0",
 ]
 

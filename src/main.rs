@@ -1,15 +1,20 @@
-//! Projects — live stats for a folder of code, built with Rune.
+//! Projects — a manager for a folder of code (projects, storage, usage), built with Rune.
 //! `cargo run -p projects-stats` opens the window and starts scanning;
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
 mod browse;
 mod cats;
 mod fixture;
+mod home;
+mod launch;
 mod meter;
 mod model;
+mod nav;
 mod scan;
 mod store;
 mod ui;
+mod usage_ui;
+mod usage;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,6 +62,12 @@ pub struct State {
     /// Git facts carried between scans, keyed by project path with a refs-mtime validity
     /// key — rescans skip the history walk for repos that haven't moved.
     pub git_cache: GitCache,
+    /// Which page the window shows.
+    pub page: nav::Page,
+    pub home: home::Home,
+    pub usage: usage_ui::UsageState,
+    /// Editors and tools found on this machine, probed once.
+    pub apps: Vec<launch::App>,
 }
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
@@ -90,6 +101,10 @@ impl State {
             fps_since: 0.0,
             last_trim: 0.0,
             git_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            page: nav::Page::Projects,
+            home: home::Home::new(),
+            usage: usage_ui::UsageState::new(),
+            apps: Vec::new(),
         }
     }
 
@@ -127,6 +142,7 @@ impl State {
         self.scanning = true;
         self.error = None;
         self.ui.reset();
+        self.home.branches.clear();
         // The last scan's data stays on screen until each folder's new numbers land,
         // so a rescan never blanks the dashboard.
         self.refreshing.clear();
@@ -323,6 +339,19 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
         changed = true;
     }
     s.ui.want_culprit(s.demo);
+    if s.home.branches.len() < s.projects.len() && !s.scanning && !s.demo {
+        let root = PathBuf::from(&s.root);
+        s.home.refresh_branches(&root, &s.projects);
+        changed = true;
+    }
+    if s.page == nav::Page::Usage && !s.usage.loaded && !s.usage.loading {
+        let waker = s.waker.clone();
+        s.usage.start(waker);
+        changed = true;
+    }
+    if s.usage.drain() {
+        changed = true;
+    }
     // The meter keeps drawing while shares ease, the scan runs, or the pointer moves over it.
     if s.tick_meter(clock) {
         changed = true;
@@ -465,6 +494,7 @@ fn wallclock() -> String {
 
 fn setup(s: &mut State, waker: Waker) {
     s.waker = Some(waker);
+    s.apps = launch::installed();
     if !s.demo {
         s.request_scan();
     }
@@ -478,8 +508,9 @@ fn main() {
         // Everything on screen sets in the mono slot: the platform's monospaced UI font,
         // Cascadia Mono on Windows. Figures line up without any tabular trick.
         families: ("Inter", "ui-monospace"),
+        on_key: Some(nav::on_key),
         ..AppSpec::new(
-            "Project stats",
+            "projects",
             (1180.0, 820.0),
             State::new,
             ui::view,
@@ -512,10 +543,27 @@ mod tests {
         };
         let mut state = State::new();
         state.load_demo();
+        state.page = nav::Page::Storage;
         let mut rt = Runtime::new(state, ui::view, (1180.0, 820.0), env);
         rt.poll = Some(poll);
         rt.frame(0.0);
         rt
+    }
+
+    #[test]
+    fn the_projects_page_is_home_and_lists_every_project() {
+        let mut state = State::new();
+        state.load_demo();
+        let env = rune::Env { system_dark: true, scale: 2.0 };
+        let mut rt = Runtime::new(state, ui::view, (1180.0, 820.0), env);
+        rt.frame(0.0);
+        assert!(rt.find("home").is_some());
+        assert!(rt.find("search").is_some());
+        assert!(rt.find("tab/usage").is_some());
+        assert!(rt.find("proj/15").is_some(), "all 16 demo projects listed");
+        rt.update(|s, _| s.page = nav::Page::Usage);
+        rt.frame(0.1);
+        assert!(rt.find("usage").is_some());
     }
 
     fn texts(rt: &Runtime<State>) -> Vec<String> {

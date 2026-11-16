@@ -40,20 +40,20 @@ const GAP: f32 = FS * 0.9;
 /// The preview strip under the list: tall enough for verdict, blame and actions.
 
 /// The port's palette, decoded once per view.
-struct Ink {
-    fg: Color,
-    muted: Color,
-    faint: Color,
-    red: Color,
-    green: Color,
-    amber: Color,
-    row: Color,
+pub(crate) struct Ink {
+    pub(crate) fg: Color,
+    pub(crate) muted: Color,
+    pub(crate) faint: Color,
+    pub(crate) red: Color,
+    pub(crate) green: Color,
+    pub(crate) amber: Color,
+    pub(crate) row: Color,
     /// A row under the pointer, and the row that is picked: the two mouse-only cues.
-    hover: Color,
-    picked: Color,
+    pub(crate) hover: Color,
+    pub(crate) picked: Color,
 }
 
-fn rgb(v: [u8; 3]) -> Color {
+pub(crate) fn rgb(v: [u8; 3]) -> Color {
     Color {
         r: srgb_decode(v[0] as f32 / 255.0),
         g: srgb_decode(v[1] as f32 / 255.0),
@@ -63,7 +63,7 @@ fn rgb(v: [u8; 3]) -> Color {
 }
 
 impl Ink {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             fg: rgb([230, 230, 230]),
             muted: rgb([140, 140, 140]),
@@ -78,22 +78,22 @@ impl Ink {
     }
 }
 
-fn color_of(rgb8: cats::Rgb) -> Color {
+pub(crate) fn color_of(rgb8: cats::Rgb) -> Color {
     rgb(rgb8)
 }
 
-fn tint(rgb8: cats::Rgb, alpha: f32) -> Color {
+pub(crate) fn tint(rgb8: cats::Rgb, alpha: f32) -> Color {
     let mut c = color_of(rgb8);
     c.a = alpha.clamp(0.0, 1.0);
     c
 }
 
-fn mono(size: f32, weight: f32) -> TextStyle {
+pub(crate) fn mono(size: f32, weight: f32) -> TextStyle {
     TextStyle::new(size, weight).mono()
 }
 
 /// Width of n monospace characters at the one size on screen.
-fn ch(n: f32) -> f32 {
+pub(crate) fn ch(n: f32) -> f32 {
     FS * 0.6 * n
 }
 
@@ -106,7 +106,7 @@ fn pct(part: u64, whole: u64) -> String {
 }
 
 /// A small bordered control: the pointer-first replacement for the port's key hints.
-fn chip(
+pub(crate) fn chip(
     label: impl Into<String>,
     c: Color,
     ink: cats::Rgb,
@@ -126,21 +126,21 @@ fn chip(
 }
 
 /// A run of plain monospace text: the only kind of text on screen.
-fn t(content: impl Into<String>, c: Color) -> El {
+pub(crate) fn t(content: impl Into<String>, c: Color) -> El {
     text(content).font(mono(FS, 400.0)).color(c)
 }
 
-fn tb(content: impl Into<String>, c: Color) -> El {
+pub(crate) fn tb(content: impl Into<String>, c: Color) -> El {
     text(content).font(mono(FS, 700.0)).color(c)
 }
 
-fn sep(ink: &Ink) -> El {
+pub(crate) fn sep(ink: &Ink) -> El {
     t("·", ink.faint)
 }
 
 /// The "you are here" dot in front of a filter row. It keeps its width when unlit, so every
 /// row's marker and name start at the same place whether or not the row is the current one.
-fn marker(lit: bool, color: Color) -> El {
+pub(crate) fn marker(lit: bool, color: Color) -> El {
     row()
         .w(ch(1.0))
         .shrink()
@@ -162,7 +162,7 @@ fn dot_hash(a: usize, b: usize) -> f32 {
 
 /// A small dot-matrix bar, the same pixel language as the big meter: lit dots in the category
 /// colour with the odd white one, unlit dots for the rest.
-fn dots(fraction: f32, color: cats::Rgb, count: usize, seed: usize, dim: bool) -> El {
+pub(crate) fn dots(fraction: f32, color: cats::Rgb, count: usize, seed: usize, dim: bool) -> El {
     let dot = (FS * 0.26).max(2.0).round();
     let gap = (FS * 0.14).max(1.0).round();
     let lit = if fraction > 0.0 {
@@ -189,7 +189,7 @@ fn dots(fraction: f32, color: cats::Rgb, count: usize, seed: usize, dim: bool) -
 
 // ---- top line -------------------------------------------------------------
 
-fn clip_path(path: &str, max_chars: usize) -> String {
+pub(crate) fn clip_path(path: &str, max_chars: usize) -> String {
     // Long absolute paths keep their tail, which is the part that says what is being read.
     let count = path.chars().count();
     if count <= max_chars {
@@ -239,7 +239,8 @@ fn top_line(s: &State, ink: &Ink) -> El {
             row()
                 .gap(ch(2.0))
                 .items_center()
-                .child(tb("projects-stats", ink.fg))
+                .child(tb("projects", ink.fg))
+                .child(crate::nav::tabs(s, ink))
                 .child(t(clip_path(&format!("{}", s.ui.root().display()), 40), ink.faint))
                 .children((s.demo).then(|| t("demo disk", ink.amber))),
         )
@@ -792,7 +793,7 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize) -> El {
 }
 
 /// A faint lowercase heading, the same voice as "categories" in the sidebar.
-fn section_label(text_: &str, ink: &Ink) -> El {
+pub(crate) fn section_label(text_: &str, ink: &Ink) -> El {
     t(text_, ink.faint).pb(ch(0.2))
 }
 
@@ -1138,8 +1139,11 @@ struct Ctx<'a> {
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let ink = Ink::new();
-    let ctx = Ctx { s, ink: &ink };
-    let sizes = s.ui.category_sizes(&s.projects);
+    let body = match s.page {
+        crate::nav::Page::Projects => crate::home::view(s, &ink),
+        crate::nav::Page::Storage => storage(s, &ink, cx),
+        crate::nav::Page::Usage => crate::usage_ui::view(s, &ink),
+    };
     col()
         .key("page")
         .w_full()
@@ -1150,7 +1154,18 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .gap(ch(0.5))
         .child(top_line(s, &ink))
         .child(el().h(ch(0.4)))
-        .child(totals(s, &ink, &sizes))
+        .child(body.grow(1.0).min_h(0.0))
+}
+
+/// The disk-usage page: totals, the meter, the categories and the folder list.
+fn storage(s: &State, ink: &Ink, cx: &mut Cx<State>) -> El {
+    let ctx = Ctx { s, ink };
+    let sizes = s.ui.category_sizes(&s.projects);
+    col()
+        .key("storage")
+        .w_full()
+        .gap(ch(0.5))
+        .child(totals(s, ink, &sizes))
         .child(meter(s, cx))
         .child(
             row()
@@ -1158,8 +1173,15 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .gap(ch(3.0))
                 .pt(ch(0.8))
-                .child(categories(s, &ink, &sizes, left_width()))
+                .child(categories(s, ink, &sizes, left_width()))
                 .child(inside(&ctx)),
         )
-        .child(bottom_line(s, &ink))
+        .child(bottom_line(s, ink))
+}
+
+/// Width of an `n`-dot bar, so a header can reserve exactly its space.
+pub(crate) fn dots_w(n: usize) -> f32 {
+    let dot = (FS * 0.26).max(2.0).round();
+    let gap = (FS * 0.14).max(1.0).round();
+    n as f32 * dot + (n as f32 - 1.0).max(0.0) * gap
 }
