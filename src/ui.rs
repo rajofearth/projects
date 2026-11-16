@@ -941,13 +941,13 @@ fn verdict_block(label: &Label, coloured: Color, ink: &Ink) -> Option<El> {
         col()
             .w_full()
             .gap(ch(0.2))
-            .child(
+            .children((!label.tag_line().is_empty()).then(|| {
                 row()
                     .items_center()
                     .gap(ch(0.6))
                     .child(t("■", coloured))
-                    .child(t(label.tag_line(), coloured)),
-            )
+                    .child(t(label.tag_line(), coloured))
+            }))
             .children(
                 (!label.reason.is_empty())
                     .then(|| t(label.reason.clone(), ink.muted).pl(ch(1.6)).truncate()),
@@ -983,9 +983,11 @@ fn header_cell(
     if sort == store::Sort::None {
         return cell;
     }
+    // Hover uses the rows' dark surface: a white fill under faint text
+    // left the label unreadable.
     cell.px(0.0)
         .cursor(Cursor::Pointer)
-        .hover(Color::WHITE)
+        .hover(ink.hover)
         .on_press(move |s: &mut State| s.ui.set_sort(sort))
         .help(if active {
             "Reverse the order"

@@ -110,7 +110,7 @@ pub fn tier_note(tier: Tier) -> &'static str {
     match tier {
         Tier::Safe => "safe to clear",
         Tier::Review => "review first",
-        Tier::Keep => "keep",
+        Tier::Keep => "",
     }
 }
 
@@ -137,7 +137,7 @@ impl Verdict {
         match self {
             Verdict::Regenerates => "regenerates",
             Verdict::Stale => "stale",
-            Verdict::Yours => "keep",
+            Verdict::Yours => "",
             Verdict::GitHistory => "git history",
         }
     }
@@ -167,7 +167,7 @@ impl Label {
         match self.verdict {
             Verdict::Regenerates => "rebuildable",
             Verdict::Stale => "not touched in a while",
-            Verdict::Yours => "keep",
+            Verdict::Yours => "",
             Verdict::GitHistory => "git history",
         }
     }

@@ -260,9 +260,8 @@ pub fn find_culprit(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
     });
 }
 
-/// Shows the item in Explorer (Finder, or the desktop's file manager elsewhere), opening
-/// its parent folder with the item highlighted. "Open folder" is the action that opens a
-/// folder itself.
+/// Shows the item in Explorer (Finder, or the desktop's file manager elsewhere): a folder
+/// opens in Explorer, a file opens its folder with the file highlighted.
 ///
 /// The argument goes to Explorer raw: `Command::arg` escapes embedded quotes as `\"`,
 /// which Explorer can't parse, so it falls back to opening Documents. The quotes are still
@@ -271,8 +270,13 @@ pub fn reveal(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("explorer")
-            .raw_arg(format!("/select,\"{}\"", path.display()))
+        // A folder opens as itself; a file opens its folder with the file highlighted.
+        let arg = if path.is_dir() {
+            format!("\"{}\"", path.display())
+        } else {
+            format!("/select,\"{}\"", path.display())
+        };
+        std::process::Command::new("explorer").raw_arg(arg)
             .spawn()
             .map(|_| ())
     }
