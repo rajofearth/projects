@@ -1,12 +1,10 @@
 //! The fix-storage vocabulary applied to a folder of projects: what is on disk splits into
 //! four categories (source, dependencies, build output, everything else), and every item gets
-//! a verdict — junk, unused, system or yours — with a one-line reason.
+//! a verdict — regenerates, stale, git history or yours — with a one-line reason.
 //!
 //! Ported from the upstream interface's `categories.ts` and `classify.ts` (MIT), with this
 //! app's data in place of a Mac's: no Photos library or Trash here, but the same rules and the
 //! same words.
-
-use std::path::Path;
 
 use crate::model::Project;
 
@@ -46,7 +44,7 @@ pub const CATEGORIES: [Category; 4] = [
         name: "Source",
         color: [34, 211, 238],
         tier: Tier::Keep,
-        blurb: "Hand-written code and the files beside it.",
+        blurb: "Hand-written code and the files beside it",
     },
     Category {
         id: Cat::Deps,
@@ -67,7 +65,7 @@ pub const CATEGORIES: [Category; 4] = [
         name: "Other",
         color: [139, 92, 246],
         tier: Tier::Review,
-        blurb: ".git history, media and everything else a project keeps.",
+        blurb: ".git history, media and everything else a project keeps",
     },
 ];
 
@@ -108,12 +106,6 @@ impl Cat {
     }
 }
 
-pub const TIER_LABEL: [(&str, &str); 3] = [
-    ("safe", "safe to clear"),
-    ("review", "review first"),
-    ("keep", "keep"),
-];
-
 pub fn tier_note(tier: Tier) -> &'static str {
     match tier {
         Tier::Safe => "safe to clear",
@@ -124,54 +116,75 @@ pub fn tier_note(tier: Tier) -> &'static str {
 
 // ---- labels -----------------------------------------------------------------
 
-/// junk:   regenerates by itself or is a leftover; removing it loses nothing.
-/// unused: probably not needed any more; your call.
-/// yours:  your data, in use; shown for context only.
-/// system: a tool manages it; leave it to them.
+/// regenerates: a command brings it back; removing it loses nothing.
+/// stale:       nothing has touched it in a long time; your call.
+/// yours:       your data, in use; shown for context only.
+/// git history: git owns it; removing it loses your commits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    Junk,
-    Unused,
+    Regenerates,
+    Stale,
     Yours,
-    System,
+    GitHistory,
 }
 
 impl Verdict {
+    /// What the row says about the folder, in the reader's terms. Each tag is the state
+    /// the bytes are in, not a judgement about them: a regenerate folder is one whose
+    /// contents come back from a command, stale is one nobody has touched, and git history
+    /// is one only git reads.
     pub fn tag(self) -> &'static str {
         match self {
-            Verdict::Junk => "junk",
-            Verdict::Unused => "unused",
-            Verdict::Yours => "",
-            Verdict::System => "system",
+            Verdict::Regenerates => "regenerates",
+            Verdict::Stale => "stale",
+            Verdict::Yours => "keep",
+            Verdict::GitHistory => "git history",
         }
     }
 
     pub fn color(self) -> Rgb {
         match self {
-            Verdict::Junk => [74, 222, 128],
-            Verdict::Unused => [251, 191, 36],
+            Verdict::Regenerates => [74, 222, 128],
+            Verdict::Stale => [251, 191, 36],
             Verdict::Yours => [120, 120, 120],
-            Verdict::System => [124, 138, 160],
+            Verdict::GitHistory => [124, 138, 160],
         }
     }
 }
 
+#[derive(Debug)]
 pub struct Label {
     pub verdict: Verdict,
-    /// Short, lowercase reason, e.g. "rebuilds with npm install".
+    /// Short, lowercase reason, e.g. "npm install brings it back".
     pub reason: String,
 }
 
-fn junk(reason: impl Into<String>) -> Label {
+impl Label {
+    /// The verdict as a sentence opener, so a reason can follow it: "rebuildable · npm
+    /// install brings it back". Yours has nothing to add, so it returns an empty string and
+    /// callers skip the whole clause.
+    pub fn tag_line(&self) -> &'static str {
+        match self.verdict {
+            Verdict::Regenerates => "rebuildable",
+            Verdict::Stale => "not touched in a while",
+            Verdict::Yours => "keep",
+            Verdict::GitHistory => "git history",
+        }
+    }
+}
+
+/// The bytes come back from a command: installing or building restores this folder.
+fn regen(reason: impl Into<String>) -> Label {
     Label {
-        verdict: Verdict::Junk,
+        verdict: Verdict::Regenerates,
         reason: reason.into(),
     }
 }
 
-fn unused(reason: impl Into<String>) -> Label {
+/// Nobody has touched this in a long time, and nothing here needs it to be current.
+fn stale(reason: impl Into<String>) -> Label {
     Label {
-        verdict: Verdict::Unused,
+        verdict: Verdict::Stale,
         reason: reason.into(),
     }
 }
@@ -257,29 +270,29 @@ pub fn classify(name: &str, dir: bool, days: Option<u64>) -> Label {
         _ => String::new(),
     };
     if lower == "node_modules" {
-        return junk(format!("rebuilds with npm install{touched}"));
+        return regen(format!("npm install brings it back{touched}"));
     }
     if lower == ".git" {
         return Label {
-            verdict: Verdict::System,
+            verdict: Verdict::GitHistory,
             reason: "git manages this · removing it loses your commits".to_string(),
         };
     }
     if BUILD_CACHES.contains(&lower.as_str()) && dir {
-        return unused(format!("build output · rebuilds from source{touched}"));
+        return stale(format!("rebuilds from source{touched}"));
     }
     if lower == ".venv" || lower == "venv" || lower == "env" {
-        return unused(format!("python environment · recreate with pip install{touched}"));
+        return stale(format!("pip install recreates it{touched}"));
     }
     if lower == "vendor" || lower == "pods" {
-        return junk(format!("vendored dependencies · install brings them back{touched}"));
+        return regen(format!("install brings it back{touched}"));
     }
     if let Some(d) = days {
         if d > 365 {
-            return unused(format!("not touched in {}", age(d)));
+            return stale(format!("not touched in {}", age(d)));
         }
         if d > 180 {
-            return unused(format!("not touched in {}", age(d)));
+            return stale(format!("not touched in {}", age(d)));
         }
         return yours(format!("changed {}", if d < 1 { "today".to_string() } else { format!("{} ago", age(d)) }));
     }
@@ -289,14 +302,14 @@ pub fn classify(name: &str, dir: bool, days: Option<u64>) -> Label {
 /// What a whole project probably is, from how it is built and when it was last committed to.
 pub fn classify_project(p: &Project, cat: Cat) -> Label {
     match cat {
-        Cat::Deps => junk("node_modules · npm install brings it back"),
-        Cat::Build => unused("build output · rebuilds from source"),
+        Cat::Deps => regen("npm install brings it back"),
+        Cat::Build => stale("rebuilds from source"),
         Cat::Source => match p.days {
-            Some(d) if d > 365 => unused(format!("no commit in {}", age(d))),
+            Some(d) if d > 365 => stale(format!("no commit in {}", age(d))),
             _ => yours(""),
         },
         Cat::Other => Label {
-            verdict: Verdict::System,
+            verdict: Verdict::GitHistory,
             reason: "git history and media".to_string(),
         },
     }
@@ -306,22 +319,13 @@ pub fn classify_project(p: &Project, cat: Cat) -> Label {
 /// listed under: the "All" view ranks whole projects.
 pub fn classify_row(p: &Project) -> Label {
     let rebuildable = p.nm + p.target + p.other.min(p.nm + p.target);
-    if let Some(d) = p.days {
-        if d > 365 {
-            return unused(format!("no commit in {}", age(d)));
-        }
+    if let Some(d) = p.days.filter(|d| *d > 365) {
+        return stale(format!("no commit in {}", age(d)));
     }
     if p.bytes > 0 && rebuildable * 3 >= p.bytes * 2 {
-        return junk("mostly rebuildable · install and build bring it back");
+        return regen("install and build bring it back");
     }
     yours("")
-}
-
-/// Folds a path's first interesting component into a readable name, for the breadcrumb.
-pub fn leaf(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
 #[cfg(test)]
@@ -349,24 +353,24 @@ mod tests {
     }
 
     #[test]
-    fn node_modules_is_junk_and_build_output_is_unused() {
-        assert_eq!(classify("node_modules", true, None).verdict, Verdict::Junk);
-        assert_eq!(classify("target", true, None).verdict, Verdict::Unused);
-        assert_eq!(classify("dist", true, None).verdict, Verdict::Unused);
+    fn node_modules_regenerates_and_build_output_is_stale() {
+        assert_eq!(classify("node_modules", true, None).verdict, Verdict::Regenerates);
+        assert_eq!(classify("target", true, None).verdict, Verdict::Stale);
+        assert_eq!(classify("dist", true, None).verdict, Verdict::Stale);
         assert_eq!(classify("src", true, None).verdict, Verdict::Yours);
     }
 
     #[test]
-    fn git_is_system_and_says_why() {
+    fn git_history_says_what_it_costs() {
         let label = classify(".git", true, None);
-        assert_eq!(label.verdict, Verdict::System);
+        assert_eq!(label.verdict, Verdict::GitHistory);
         assert!(label.reason.contains("commits"), "{}", label.reason);
     }
 
     #[test]
-    fn a_year_of_silence_makes_a_folder_unused() {
+    fn a_year_of_silence_makes_a_folder_stale() {
         let label = classify("notes", true, Some(400));
-        assert_eq!(label.verdict, Verdict::Unused);
+        assert_eq!(label.verdict, Verdict::Stale);
         assert!(label.reason.contains("1 year"), "{}", label.reason);
     }
 
@@ -379,13 +383,13 @@ mod tests {
     }
 
     #[test]
-    fn a_project_mostly_of_dependencies_is_junk() {
+    fn a_project_mostly_of_dependencies_regenerates() {
         let p = project(900, 100, 0, 10, Some(12));
-        assert_eq!(classify_row(&p).verdict, Verdict::Junk);
+        assert_eq!(classify_row(&p).verdict, Verdict::Regenerates);
         let own = project(10, 10, 10, 900, Some(12));
         assert_eq!(classify_row(&own).verdict, Verdict::Yours);
         let stale = project(0, 0, 0, 900, Some(500));
-        assert_eq!(classify_row(&stale).verdict, Verdict::Unused);
+        assert_eq!(classify_row(&stale).verdict, Verdict::Stale);
     }
 
     #[test]

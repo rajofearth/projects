@@ -311,7 +311,12 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
         "core.untrackedCache=false",
     ])
     .args(args)
-    .current_dir(dir);
+    .current_dir(dir)
+    // No credential prompt, no pager, no interactive anything: a repo with a helper
+    // configured fails the call instead of blocking a scan worker on stdin.
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "")
+    .env("GIT_PAGER", "cat");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -677,7 +682,9 @@ fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -
         tasks: Mutex<(Vec<Task>, usize)>,
         cv: Condvar,
         pending: AtomicUsize,
-        /// Directories still outstanding per project: 0 means that project is fully measured.
+        /// Directories still outstanding per project: 0 means that project is fully
+        /// measured. `push` adds one and `finished_one` takes one, so the seed task and
+        /// every subdirectory it finds are all counted exactly once.
         per_proj: Mutex<Vec<usize>>,
     }
 
@@ -709,7 +716,7 @@ fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -
         fn finished_one(&self, proj: usize) -> bool {
             let left = {
                 let mut counts = self.per_proj.lock().unwrap();
-                counts[proj] -= 1;
+                counts[proj] = counts[proj].saturating_sub(1);
                 counts[proj]
             };
             self.pending.fetch_sub(1, Ordering::Release);
@@ -738,6 +745,10 @@ fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -
         tasks: Mutex::new((Vec::new(), 0)),
         cv: Condvar::new(),
         pending: AtomicUsize::new(0),
+        // Zero to begin with: `push` counts each task as it is queued, including the seed
+        // task for each project root pushed below, and `finished_one` takes one back when
+        // that task's directory is measured. A project with no subfolders therefore goes
+        // seed (1) then done (0) and reports its row.
         per_proj: Mutex::new(vec![0; dirs.len()]),
     });
     // `\\?\` lets paths run past the 260-char limit (node_modules gets deep), but only
@@ -834,15 +845,17 @@ fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -
                     }
                     // This project's tree is fully enumerated: hand its numbers over now,
                     // so the window fills row by row instead of after the whole walk.
+                    // The snapshot is taken under `aggs`; `on_project` runs after the
+                    // guard is gone, because it takes the git and waiting locks itself.
+                    // Lock order everywhere: aggs, then git_results, then waiting.
                     if queue.finished_one(task.proj) {
                         let mut mine = local.remove(&task.proj).unwrap_or_default();
-                        {
+                        let snapshot = {
                             let mut all = aggs.lock().unwrap();
                             all[task.proj].merge(&mut mine);
-                            let snapshot = all[task.proj].clone();
-                            drop(all);
-                            on_project(task.proj, snapshot);
-                        }
+                            all[task.proj].clone()
+                        };
+                        on_project(task.proj, snapshot);
                     }
                 }
                 let mut all = aggs.lock().unwrap();

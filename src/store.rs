@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use crate::browse::{self, BrowseEvent, Culprit, Item};
-use crate::cats::{self, Cat};
+use crate::cats::{self, Cat, Label};
 use crate::model::Project;
 
 /// Longest list the detail pane draws.
@@ -88,8 +88,6 @@ pub struct Ui {
     pub culprits: HashMap<PathBuf, Option<Culprit>>,
     /// One line about the last action.
     pub note: Option<String>,
-    /// Show only the rows labelled junk or unused.
-    pub junk_only: bool,
     /// The detail pane's order, and whether it runs largest/newest first.
     pub sort: Sort,
     /// True when the sort runs the other way: smallest, Z to A, oldest first.
@@ -98,10 +96,23 @@ pub struct Ui {
     /// The listing in flight, if any.
     rx: Option<Receiver<BrowseEvent>>,
     cancel: Option<browse::Cancel>,
-    /// Culprit searches in flight, one channel each.
-    culprit_rx: Vec<Receiver<BrowseEvent>>,
-    culprit_cancels: Vec<browse::Cancel>,
+    /// Culprit searches in flight. Each one's receiver and cancel flag travel together, so
+    /// they can never drift apart the way two index-matched vectors would.
+    culprits_in_flight: Vec<CulpritSearch>,
 }
+
+/// One culprit search, its cancel flag beside the channel it reports on.
+struct CulpritSearch {
+    rx: Receiver<BrowseEvent>,
+    cancel: browse::Cancel,
+    /// The folder being measured, so a later request for it can reuse the search.
+    path: PathBuf,
+}
+
+/// How many culprit searches may run at once. The row in view changes on every poll, so
+/// without a cap a user sweeping the pointer down the list would start a full folder walk
+/// per row; one at a time is all the preview strip can show.
+const MAX_CULPRIT_SEARCHES: usize = 2;
 
 impl Ui {
     pub fn new(root: PathBuf) -> Self {
@@ -114,14 +125,12 @@ impl Ui {
             listing: false,
             culprits: HashMap::new(),
             note: None,
-            junk_only: false,
             sort: Sort::Size,
             sort_down: true,
             root,
             rx: None,
             cancel: None,
-            culprit_rx: Vec::new(),
-            culprit_cancels: Vec::new(),
+            culprits_in_flight: Vec::new(),
         }
     }
 
@@ -180,14 +189,6 @@ impl Ui {
         } else {
             self.children.clone()
         };
-        if self.junk_only {
-            list.retain(|item| {
-                matches!(
-                    self.label(item, projects).verdict,
-                    cats::Verdict::Junk | cats::Verdict::Unused
-                )
-            });
-        }
         let down = self.sort_down;
         match self.sort {
             Sort::Size => {
@@ -302,13 +303,73 @@ impl Ui {
     }
 
     /// How much of what is listed is labelled junk, and how much is probably unused.
+    /// How many rows the list holds before it is capped, for the "… and N smaller" line.
+    /// Counting is all the caller needs, so this does not build or sort the list.
+    pub fn listing_count(&self, projects: &[Project]) -> usize {
+        if !self.stack.is_empty() {
+            return self.children.len();
+        }
+        projects
+            .iter()
+            .filter(|p| self.category_bytes(p) > 0)
+            .count()
+    }
+
+    /// Bytes of one project the current filter keeps, without building a row for it.
+    fn category_bytes(&self, p: &Project) -> u64 {
+        match self.filter.cat() {
+            Some(cat) => cat.bytes(p),
+            None => p.bytes,
+        }
+    }
+
+    /// The row worth acting on: the largest folder whose bytes a command brings back. This
+    /// is what the sidebar offers as the next move, so it returns the row itself rather
+    /// than a count, and the label so the caller can say why.
+    pub fn biggest_reclaimable(&self, projects: &[Project]) -> Option<(Item, Label)> {
+        let entries = self.entries(projects);
+        entries
+            .into_iter()
+            .map(|item| {
+                let label = self.label(&item, projects);
+                (item, label)
+            })
+            .find(|(_, label)| label.verdict == cats::Verdict::Regenerates)
+    }
+
+    /// How many folders are reclaimable in this view, and how many bytes they hold.
+    pub fn reclaim_summary(&self, projects: &[Project]) -> (usize, u64) {
+        let mut count = 0;
+        let mut bytes = 0;
+        for item in self.entries(projects) {
+            if self.label(&item, projects).verdict == cats::Verdict::Regenerates {
+                count += 1;
+                bytes += item.size;
+            }
+        }
+        (count, bytes)
+    }
+
+    /// How much of what is listed is labelled junk, and how much is probably unused.
+    /// Both totals come from the scan's own buckets, which is what the verdict rules read,
+    /// so this needs no per-row label pass over a freshly sorted list.
+    #[allow(dead_code)]
     pub fn reclaimable(&self, projects: &[Project]) -> (u64, u64) {
-        let mut junk = 0;
-        let mut unused = 0;
-        for item in self.all_entries(projects) {
-            match self.label(&item, projects).verdict {
-                cats::Verdict::Junk => junk += item.size,
-                cats::Verdict::Unused => unused += item.size,
+        let (mut junk, mut unused) = (0u64, 0u64);
+        if self.stack.is_empty() {
+            for item in self.all_entries(projects) {
+                match self.label(&item, projects).verdict {
+                    cats::Verdict::Regenerates => junk += item.size,
+                    cats::Verdict::Stale => unused += item.size,
+                    _ => {}
+                }
+            }
+            return (junk, unused);
+        }
+        for item in &self.children {
+            match self.label(item, projects).verdict {
+                cats::Verdict::Regenerates => junk += item.size,
+                cats::Verdict::Stale => unused += item.size,
                 _ => {}
             }
         }
@@ -335,11 +396,6 @@ impl Ui {
 
     pub fn set_row(&mut self, row: usize) {
         self.row = row;
-    }
-
-    pub fn toggle_junk_only(&mut self) {
-        self.junk_only = !self.junk_only;
-        self.row = 0;
     }
 
     /// Opens the row's folder and measures what is inside.
@@ -395,11 +451,28 @@ impl Ui {
         if self.culprits.contains_key(&path) {
             return;
         }
+        if self
+            .culprits_in_flight
+            .iter()
+            .any(|search| search.path == path)
+        {
+            return;
+        }
+        // The oldest search gives way when the cap is reached: it is measuring a folder
+        // nobody is pointing at any more, and its result would be thrown away anyway.
+        while self.culprits_in_flight.len() >= MAX_CULPRIT_SEARCHES {
+            let dropped = self.culprits_in_flight.remove(0);
+            dropped.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.culprits.remove(&dropped.path);
+        }
         self.culprits.insert(path.clone(), None);
         let (tx, rx) = channel();
         let cancel = browse::cancel_flag();
-        self.culprit_rx.push(rx);
-        self.culprit_cancels.push(cancel.clone());
+        self.culprits_in_flight.push(CulpritSearch {
+            rx,
+            cancel: cancel.clone(),
+            path: path.clone(),
+        });
         browse::find_culprit(path, tx, cancel);
     }
 
@@ -532,8 +605,8 @@ impl Ui {
             }
         }
         let mut i = 0;
-        while i < self.culprit_rx.len() {
-            let finished = match self.culprit_rx[i].try_recv() {
+        while i < self.culprits_in_flight.len() {
+            let finished = match self.culprits_in_flight[i].rx.try_recv() {
                 Ok(BrowseEvent::Culprit { path, culprit }) => {
                     self.culprits.insert(path, Some(culprit));
                     changed = true;
@@ -541,13 +614,20 @@ impl Ui {
                 }
                 Ok(_) => false,
                 Err(std::sync::mpsc::TryRecvError::Empty) => false,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => true,
+                // The sender is gone: the thread finished, cancelled or not.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // A cancelled search never reports, so its row would say "looking"
+                    // for ever. Drop the placeholder and let a later poll retry it.
+                    let path = self.culprits_in_flight[i].path.clone();
+                    if self.culprits.get(&path).is_some_and(|c| c.is_none()) {
+                        self.culprits.remove(&path);
+                        changed = true;
+                    }
+                    true
+                }
             };
             if finished {
-                self.culprit_rx.remove(i);
-                if i < self.culprit_cancels.len() {
-                    self.culprit_cancels.remove(i);
-                }
+                self.culprits_in_flight.remove(i);
             } else {
                 i += 1;
             }
@@ -556,14 +636,24 @@ impl Ui {
     }
 
     /// Asks for the culprit of the highlighted row, when it is on screen and not measured yet.
-    pub fn want_culprit(&mut self, projects: &[Project], demo: bool) {
+    pub fn want_culprit(&mut self, demo: bool) {
         if self.stack.is_empty() || self.listing {
             return;
         }
-        let Some(item) = self.entries(projects).into_iter().nth(self.row) else {
+        // Runs on every poll, so it must not sort and clone the whole list to find a row it
+        // is about to skip. The cheap checks come first: the listing already in hand, then
+        // the single row wanted.
+        let Some(item) = self.children_row() else {
             return;
         };
         if !item.dir || self.culprits.contains_key(&item.path) {
+            return;
+        }
+        if self
+            .culprits_in_flight
+            .iter()
+            .any(|search| search.path == item.path)
+        {
             return;
         }
         if demo {
@@ -572,6 +662,11 @@ impl Ui {
             return;
         }
         self.want_culprit_at(item.path);
+    }
+
+    /// The row under the highlight, found without sorting the list it lives in.
+    fn children_row(&self) -> Option<Item> {
+        self.children.get(self.row).cloned()
     }
 
     pub fn reveal(&mut self, projects: &[Project], demo: bool) {
@@ -603,11 +698,10 @@ impl Ui {
         if let Some(cancel) = self.cancel.take() {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        for cancel in self.culprit_cancels.drain(..) {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        for search in self.culprits_in_flight.drain(..) {
+            search.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.rx = None;
-        self.culprit_rx.clear();
     }
 }
 
@@ -780,7 +874,7 @@ mod tests {
     #[test]
     fn all_projects_is_the_default_and_lists_every_folder_at_its_whole_size() {
         let projects = fixture();
-        let mut ui = Ui::new(PathBuf::from(r"P:\Projects"));
+        let ui = Ui::new(PathBuf::from(r"P:\Projects"));
         assert_eq!(ui.filter, Filter::All, "the window opens showing everything");
         let rows = ui.entries(&projects);
         assert_eq!(rows.len(), projects.len(), "every project is listed");
@@ -873,7 +967,7 @@ mod tests {
             .position(|i| i.dir)
             .expect("a folder to look into");
         ui.set_row(dir_row);
-        ui.want_culprit(&projects, true);
+        ui.want_culprit(true);
         let item = ui.entries(&projects)[dir_row].clone();
         let culprit = ui.culprit(&item, &projects).expect("demo culprit");
         assert!(
@@ -933,15 +1027,18 @@ mod tests {
     }
 
     #[test]
-    fn junk_only_keeps_the_rows_worth_looking_at() {
+    fn the_reclaim_summary_counts_only_what_a_command_brings_back() {
         let projects = fixture();
-        let mut ui = Ui::new(PathBuf::from("root"));
-        ui.filter = Filter::Only(Cat::Source);
-        let all = ui.entries(&projects).len();
-        ui.toggle_junk_only();
-        let only = ui.entries(&projects);
-        assert!(only.len() < all, "the filter drops rows that are fine");
-        assert!(only.iter().any(|r| r.name == "old"), "the stale one stays");
+        let ui = Ui::new(PathBuf::from("root"));
+        let (count, bytes) = ui.reclaim_summary(&projects);
+        // heavy-deps is 900 MiB of dependencies and old is 970 MiB of source that no
+        // command brings back; native is 900 MiB of build output. Two rows regenerate, and
+        // the whole folder is what a press offers, since that is what the row stands for.
+        assert_eq!(count, 2, "only the regenerating folders count");
+        assert_eq!(bytes, 2000, "and the bytes are those two folders");
+        let (item, label) = ui.biggest_reclaimable(&projects).expect("one worth clearing");
+        assert_eq!(label.verdict, cats::Verdict::Regenerates);
+        assert_eq!(item.size, 1000, "the largest project comes first");
     }
 
     #[test]

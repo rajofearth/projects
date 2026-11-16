@@ -175,7 +175,21 @@ impl State {
                 Ok(ScanEvent::Done { seconds }) => {
                     eprintln!("scan done in {seconds:.1}s");
                     self.scanning = false;
-                    self.refreshing.clear();
+                    // Folders removed or renamed since the last scan never sent a row, so
+                    // they would sit on screen for ever. The walk saw every folder that is
+                    // still there; anything it did not report is gone.
+                    let seen = std::mem::take(&mut self.refreshing);
+                    let stale: Vec<String> = self
+                        .projects
+                        .iter()
+                        .filter(|p| !seen.contains(&p.name))
+                        .map(|p| p.name.clone())
+                        .collect();
+                    if !stale.is_empty() {
+                        self.projects.retain(|p| seen.contains(&p.name));
+                        self.done_count = self.projects.len();
+                        self.ui.row = self.ui.row.min(self.projects.len().saturating_sub(1));
+                    }
                     self.scan_secs = seconds;
                     self.last_done = Some(clock);
                     self.done_at = Some(wallclock());
@@ -308,7 +322,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     if s.ui.drain() {
         changed = true;
     }
-    s.ui.want_culprit(&s.projects, s.demo);
+    s.ui.want_culprit(s.demo);
     // The meter keeps drawing while shares ease, the scan runs, or the pointer moves over it.
     if s.tick_meter(clock) {
         changed = true;
@@ -465,23 +479,14 @@ fn main() {
         // Cascadia Mono on Windows. Figures line up without any tabular trick.
         families: ("Inter", "ui-monospace"),
         ..AppSpec::new(
-            "Projects — Live Stats",
+            "Project stats",
             (1180.0, 820.0),
             State::new,
-            view,
+            ui::view,
         )
     });
 }
 
-/// The view: remembers the window's pixel scale so the meter can draw one pixel per pixel.
-fn view(s: &State, cx: &mut rune::Cx<State>) -> rune::El {
-    // The meter budgets its buffer in device pixels, so it needs the window's scale; it
-    // picks it up on layout, which is where `meter_resize` learns the size anyway.
-    let _ = cx.env().scale;
-    ui::view(s, cx)
-}
-
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,20 +625,77 @@ mod tests {
     }
 
     #[test]
-    fn the_junk_only_filter_narrows_the_list_without_losing_it() {
+    fn the_detail_card_fits_the_sidebar_column() {
+        // The card was moved into the sidebar without being redesigned for its width, and its
+        // row ran wider than the column, so the excess drew over the table beside it. A long
+        // name is the case that exposes it, so the card is measured with one.
         let mut rt = demo_runtime();
-        let before = rt.state.ui.entries(&rt.state.projects).len();
-        rt.update(|s, _| s.ui.toggle_junk_only());
+        let parent = rt.state.ui.entries(&rt.state.projects)[0].clone();
+        let long = "a-folder-name-long-enough-to-need-the-whole-sidebar-and-more";
+        let child = browse::Item::folder(parent.path.join(long), long.to_string(), 9_000);
+        rt.update(|s, _| {
+            s.ui.stack.push(parent);
+            s.ui.children = vec![child.clone()];
+            s.ui.listing = false;
+            s.ui.row = 0;
+            s.ui.culprits.insert(
+                child.path.clone(),
+                Some(browse::Culprit {
+                    chain: vec![
+                        child.clone(),
+                        browse::Item::folder(child.path.clone(), long.to_string(), 9_000),
+                    ],
+                    top: Vec::new(),
+                    root_size: child.size,
+                }),
+            );
+        });
         rt.frame(0.0);
-        let filtered = rt.state.ui.entries(&rt.state.projects).len();
-        assert!(filtered <= before, "filtering never grows the list");
-        rt.update(|s, _| s.ui.toggle_junk_only());
-        rt.frame(0.0);
-        assert_eq!(
-            rt.state.ui.entries(&rt.state.projects).len(),
-            before,
-            "clearing the filter restores the list"
+        let (card, _) = rt.presented("detail").expect("the card is laid out");
+        let (column, _) = rt.presented("categories").expect("the column is laid out");
+        assert!(
+            card[0] + card[2] <= column[0] + column[2] + 0.5,
+            "the card ends at {} in a column that ends at {}, so it draws over the table",
+            card[0] + card[2],
+            column[0] + column[2]
         );
+        // The row it describes is still named, so the fit is not achieved by showing nothing.
+        assert!(
+            rt.elements()
+                .into_iter()
+                .filter_map(|e| e.text)
+                .any(|t| t.contains("a-folder-name-long")),
+            "the card still names the row it describes"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_names_the_biggest_folder_worth_clearing() {
+        // The reclaim line replaced a filter that hid rows. It has to name a real row from
+        // the list and a size, so the offer is something the reader can act on.
+        let rt = demo_runtime();
+        let (item, label) = rt
+            .state
+            .ui
+            .biggest_reclaimable(&rt.state.projects)
+            .expect("the demo has a folder worth clearing");
+        assert!(
+            label.verdict == cats::Verdict::Regenerates,
+            "it is a folder a command brings back: {label:?}"
+        );
+        assert!(item.size > 0, "and it has bytes to reclaim");
+        assert!(
+            !label.reason.is_empty(),
+            "and the line can say why it is safe"
+        );
+        // It is also in the list the table shows, so pressing it lands on a real row.
+        let listed = rt
+            .state
+            .ui
+            .entries(&rt.state.projects)
+            .iter()
+            .any(|e| e.path == item.path);
+        assert!(listed, "the named folder is one of the rows on screen");
     }
 
     #[test]
@@ -691,12 +753,12 @@ mod tests {
                 "picking row {row} moved the rows it was picked from"
             );
         }
-        // The detail lives in its own strip, below the list.
-        let (strip, _) = rt.presented("preview").expect("the preview strip is laid out");
-        let last = before.last().unwrap();
+        // The detail lives in the sidebar, so it never sits between the rows.
+        let (detail, _) = rt.presented("details").expect("the details block is laid out");
+        let (rows, _) = rt.presented("rows").expect("the rows are laid out");
         assert!(
-            strip[1] >= last[1],
-            "the strip sits under the rows: {strip:?} vs {last:?}"
+            detail[0] + detail[2] <= rows[0] + 0.5,
+            "the details stay in the left column: {detail:?} vs {rows:?}"
         );
     }
 
@@ -704,7 +766,7 @@ mod tests {
     fn every_header_sits_over_the_column_it_names() {
         let rt = demo_runtime();
         // Find the header by its label and the row cell by the text it shows.
-        let mut at = |want: &str| -> Option<[f32; 4]> {
+        let at = |want: &str| -> Option<[f32; 4]> {
             rt.elements()
                 .into_iter()
                 .find(|e| e.text.as_deref().is_some_and(|t| t.starts_with(want)))
@@ -759,11 +821,6 @@ mod tests {
         assert_eq!(rt.state.ui.stack.len(), 2, "two folders deep");
 
         // The crumb for the first folder is a real target under the pointer.
-        let (crumb, _) = rt
-            .presented("crumb/1")
-            .expect("the first crumb is laid out");
-        let (x, y) = (crumb[0] + crumb[2] / 2.0, crumb[1] + crumb[3] / 2.0);
-
         // Which laid-out elements cover the point, and do any of them take input?
         // Press the first crumb: it must land on that crumb, not on its neighbour.
         // Let the trail's entry animation finish before clicking on it.
@@ -861,55 +918,74 @@ mod scan_flow_tests {
         let before = s.projects.len();
         s.scanning = true;
         // A fresh folder's numbers land as one row the moment they arrive, replacing
-        // any row of the same name; the old list is never cleared mid-scan.
-        let root = std::env::temp_dir().join("ps-rescan-keep");
+        // any row of the same name; the old list is never cleared mid-scan. The scratch
+        // root is unique to this test so a parallel test cannot share its tree.
+        let root = std::env::temp_dir().join(format!("ps-rescan-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("fresh/.git")).unwrap();
         std::fs::write(root.join("fresh/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let (tx, rx) = channel();
+        let walked = root.clone();
         std::thread::spawn(move || {
-            scan::scan(root, tx, GitCache::default(), || {});
+            scan::scan(walked, tx, GitCache::default(), || {});
         });
         s.rx = Some(rx);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // Long enough that a loaded machine still finishes: the walk is one tiny folder, but
+        // the suite runs these in parallel on a cold cache, and a timeout here used to look
+        // like a stale-row bug instead of a test that gave up early.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut landed = 0;
+        let mut seen_row = false;
         while std::time::Instant::now() < deadline {
             if s.drain(0.0) {
                 landed += 1;
-            } else if s.projects.iter().any(|p| p.name == "fresh") {
-                break;
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            if s.projects.iter().any(|p| p.name == "fresh") {
+                seen_row = true;
+            }
+            // Done has to arrive before the list is judged: the demo's rows go at that
+            // point, and only `fresh` is reported by this small root. Count events until
+            // then, so the drain-proof is the scan finishing rather than one lucky poll.
+            if !s.scanning {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        assert!(!s.scanning, "the scan finished within the deadline");
         assert!(landed > 0, "events drain");
-        assert!(s.projects.iter().any(|p| p.name == "fresh"));
+        assert!(seen_row, "the fresh folder's row was delivered mid-scan");
+        // The scan is of a throwaway root holding one folder, so the demo rows it never
+        // reported are gone by the time it finishes: the list is exactly the walked tree.
         assert_eq!(
             s.projects.len(),
-            before + 1,
-            "old rows stay, fresh row joins"
+            1,
+            "only the walked folder remains: {:?}",
+            s.projects.iter().map(|p| p.name.clone()).collect::<Vec<_>>()
         );
+        assert_eq!(s.projects[0].name, "fresh");
+        assert!(before > 1, "the demo list had rows before the scan");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn rows_arrive_while_the_scan_runs() {
-        // The window fills as folders are measured, not in one burst at the end.
-        let mut s = State::new();
+        // The window fills as folders are measured, not in one burst at the end. This is the
+        // only test that walks the real root, on a state of its own, so no other test's
+        // list can receive its rows.
         let root = PathBuf::from("P:/Projects");
         if !root.is_dir() {
             return;
         }
+        let mut s = State::new();
         s.request_scan();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         let mut seen: Vec<usize> = Vec::new();
         let mut last = 0;
-        let mut ticks = 0;
         while std::time::Instant::now() < deadline {
             s.drain(0.0);
             if s.projects.len() != last {
                 last = s.projects.len();
                 seen.push(last);
-                ticks += 1;
             }
             if !s.scanning {
                 break;
@@ -937,6 +1013,26 @@ mod scan_flow_tests {
         assert!(s.rx.is_none(), "the dead channel is dropped");
         // And it stays ended: draining again is quiet.
         assert!(!s.drain(0.0));
+    }
+
+    #[test]
+    fn a_folder_that_vanished_is_dropped_when_the_scan_finishes() {
+        let mut s = State::new();
+        s.load_demo();
+        let kept = s.projects[0].name.clone();
+        let gone = s.projects[1].name.clone();
+        s.scanning = true;
+        let (tx, rx) = channel();
+        s.rx = Some(rx);
+        // Only one of the two folders is still on disk this scan.
+        let survivor = s.projects[0].clone();
+        tx.send(ScanEvent::Project(Box::new(survivor))).unwrap();
+        tx.send(ScanEvent::Done { seconds: 1.0 }).unwrap();
+        assert!(s.drain(0.0));
+        let names: Vec<&str> = s.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, [kept.as_str()], "the vanished folder is gone: {names:?}");
+        assert!(!names.contains(&gone.as_str()));
+        assert_eq!(s.done_count, 1, "the progress count matches the list");
     }
 
     #[test]

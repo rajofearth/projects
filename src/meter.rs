@@ -144,7 +144,6 @@ impl Meter {
 
         let ease = (dt * 9.0).min(1.0);
         let fade = (dt * 12.0).min(1.0);
-        let mut cursor = 0.0f32;
 
         for segment in &model.segments {
             let from = *self.shown.get(&segment.id).unwrap_or(&0.0);
@@ -169,7 +168,6 @@ impl Meter {
                 moving = true;
             }
             self.level.insert(segment.id, next);
-            cursor += to;
         }
 
         let edge_wanted = if model.scanning { 1.0 } else { 0.0 };

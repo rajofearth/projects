@@ -14,8 +14,8 @@ use rune::color::srgb_decode;
 use rune::{el, row, text, col, Align, Color, Cursor, Cx, El, ScrollSpec, SurfaceFit, TextStyle};
 
 use crate::browse::{Culprit, Item};
-use crate::cats::{self, Cat, Tier, Verdict, CATEGORIES};
-use crate::model::{self, Project};
+use crate::cats::{self, Cat, Label, Tier, Verdict, CATEGORIES};
+use crate::model;
 use crate::meter::Meter;
 use crate::store;
 use crate::State;
@@ -30,6 +30,7 @@ const DOTS: usize = 16;
 // The table's column widths, in points. The header and every row read these same numbers,
 // so a heading can never drift off the column it names.
 const MARK_W: f32 = FS * 1.2;
+
 const ARROW_W: f32 = FS * 1.2;
 const VERDICT_W: f32 = FS * 7.0;
 const SIZE_W: f32 = FS * 8.0;
@@ -37,7 +38,6 @@ const PCT_W: f32 = FS * 4.5;
 const AGE_W: f32 = FS * 6.0;
 const GAP: f32 = FS * 0.9;
 /// The preview strip under the list: tall enough for verdict, blame and actions.
-const PREVIEW_H: f32 = FS * 6.2;
 
 /// The port's palette, decoded once per view.
 struct Ink {
@@ -105,20 +105,6 @@ fn pct(part: u64, whole: u64) -> String {
     }
 }
 
-/// A clickable run of text with no chrome, the way a link sits in a terminal.
-fn link(
-    label: impl Into<String>,
-    c: Color,
-    on_press: impl Fn(&mut State) + 'static,
-) -> El {
-    text(label)
-        .font(mono(FS, 400.0))
-        .color(c)
-        .cursor(Cursor::Pointer)
-        .hover(Color::WHITE)
-        .on_press(on_press)
-}
-
 /// A small bordered control: the pointer-first replacement for the port's key hints.
 fn chip(
     label: impl Into<String>,
@@ -150,6 +136,15 @@ fn tb(content: impl Into<String>, c: Color) -> El {
 
 fn sep(ink: &Ink) -> El {
     t("·", ink.faint)
+}
+
+/// The "you are here" dot in front of a filter row. It keeps its width when unlit, so every
+/// row's marker and name start at the same place whether or not the row is the current one.
+fn marker(lit: bool, color: Color) -> El {
+    row()
+        .w(ch(1.0))
+        .shrink()
+        .child(tb(if lit { "·" } else { "" }, color))
 }
 
 // ---- the dot sparkline ----------------------------------------------------
@@ -364,9 +359,7 @@ fn category_line(s: &State, ink: &Ink, category: &cats::Category, sizes: &[u64; 
             }
         })
         .on_press(move |s: &mut State| s.pick(id))
-        .child(
-            tb(if selected { "·" } else { "" }, color_of(category.color)).w(ch(1.0)),
-        )
+        .child(marker(selected, color_of(category.color)))
         .child(t("■", color_of(category.color)).w(ch(1.0)))
         .child(
             text(category.name)
@@ -396,82 +389,94 @@ fn category_line(s: &State, ink: &Ink, category: &cats::Category, sizes: &[u64; 
         ))
 }
 
-/// One line: how much of what is listed looks like junk, and the filter to see only that.
-fn reclaimable_line(s: &State, ink: &Ink) -> El {
-    let (junk, unused) = s.ui.reclaimable(&s.projects);
-    let total = s.ui.scope_size(&s.projects);
-    let share = if total == 0 {
-        0
-    } else {
-        ((junk as f64 / total as f64) * 100.0).round() as u64
+/// The one thing to do next in this view: how much space a reinstall or rebuild gives back,
+/// and the single folder worth clearing first. A press on that folder shows it in the file
+/// manager; the app never deletes anything itself.
+fn reclaim_line(s: &State, ink: &Ink) -> El {
+    let Some((item, label)) = s.ui.biggest_reclaimable(&s.projects) else {
+        return col()
+            .key("reclaim")
+            .w_full()
+            .gap(ch(0.2))
+            .child(section_label("space you can free", ink))
+            .child(t("nothing rebuildable in this view", ink.faint));
     };
-    row()
+    let (count, bytes) = s.ui.reclaim_summary(&s.projects);
+    col()
+        .key("reclaim")
         .w_full()
-        .items_center()
-        .gap(ch(0.4))
-        .child(tb(format!("{share}%"), ink.green))
-        .child(t(" junk", ink.muted))
-        .children(
-            (unused > 1_000_000)
-                .then(|| t(format!(" · {} unused", model::gb(unused)), ink.amber)),
-        )
-        .child(el().grow(1.0))
+        .gap(ch(0.3))
+        .child(section_label("space you can free", ink))
         .child(
-            text(if s.ui.junk_only {
-                "show everything"
-            } else {
-                "junk only"
-            })
-            .font(mono(FS, 400.0))
-            .color(if s.ui.junk_only { ink.amber } else { ink.muted })
-            .cursor(Cursor::Pointer)
-            .hover(Color::WHITE)
-            .on_press(|s: &mut State| s.ui.toggle_junk_only()),
+            row()
+                .items_center()
+                .child(tb(model::gb(bytes), ink.green))
+                .child(t(" reclaimable", ink.muted)),
+        )
+        .child(
+            t(
+                format!(
+                    "{} {} here can be deleted and rebuilt",
+                    count,
+                    if count == 1 { "folder" } else { "folders" }
+                ),
+                ink.faint,
+            )
+            .truncate(),
+        )
+        .child(section_label("biggest win", ink).pt(ch(0.5)))
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(ch(0.6))
+                .cursor(Cursor::Pointer)
+                .hover(ink.hover)
+                .radius(4.0)
+                .on_press(|s: &mut State| s.reveal())
+                .child(t(format!("→ {}", item.name), ink.amber).grow(1.0).min_w(0.0).truncate())
+                .child(t(model::gb(item.size), ink.muted).shrink()),
+        )
+        .children(
+            // Why clearing it is safe: "npm install brings it back".
+            (!label.reason.is_empty()).then(|| t(label.reason.clone(), ink.faint).pl(ch(2.0)).truncate()),
         )
 }
 
-/// "31.2 GB rebuildable": the quick wins the port puts under the categories.
+/// The whole disk's rebuildable bytes, split by what brings them back. A press filters the
+/// list to that category.
 fn quick_wins(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
     if s.scanning && s.projects.is_empty() {
         return t("looking for space you can get back…", ink.faint);
     }
-    let total = sizes[1] + sizes[2];
-    let row_for = |cat: Cat, label: &str, bytes: u64| -> El {
+    let row_for = |cat: Cat, label: &str, how: &str, bytes: u64| -> El {
         let id = cat;
         row()
             .key(format!("win/{}", id.label()))
+            .w_full()
             .items_center()
             .gap(ch(0.6))
             .cursor(Cursor::Pointer)
+            .hover(ink.hover)
+            .radius(4.0)
             .on_press(move |s: &mut State| s.pick(id))
             .child(t("■", color_of(id.color())))
-            .child(
-                text(label.to_string())
-                    .font(mono(FS, 400.0))
-                    .color(ink.muted)
-                    .w(ch(12.0)),
-            )
-            .child(
-                text(model::gb(bytes))
-                    .font(mono(FS, 400.0))
-                    .color(ink.muted)
-                    .w(ch(9.0))
-                    .align(Align::End),
-            )
+            .child(t(label.to_string(), ink.muted).w(ch(12.0)))
+            .child(t(model::gb(bytes), ink.muted).w(ch(9.0)).align(Align::End))
+            .child(t(how.to_string(), ink.faint).pl(ch(0.4)).truncate())
     };
     col()
-        .gap(ch(0.35))
-        .child(
-            row()
-                .items_center()
-                .child(tb(model::gb(total), ink.green))
-                .child(t(" rebuildable", ink.muted)),
-        )
-        .child(row_for(Cat::Deps, "dependencies", sizes[1]))
-        .child(row_for(Cat::Build, "build output", sizes[2]))
+        .gap(ch(0.3))
+        .child(section_label("across the whole disk", ink).pt(ch(0.5)))
+        .child(row_for(Cat::Deps, "dependencies", "reinstall", sizes[1]))
+        .child(row_for(Cat::Build, "build output", "rebuild", sizes[2]))
 }
 
 /// The whole disk in one row: the default view, and the way back out of any filter.
+/// It carries the same parts as a category row (marker, square, name, size, dot bar) so it
+/// reads as one more option in the column rather than a heading above them. Its bar is full
+/// width because every byte on the disk is what it stands for, and it has no hue of its own:
+/// nothing is a category here, so the square is the neutral foreground.
 fn all_line(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
     let active = s.ui.filter.cat().is_none();
     let total: u64 = sizes.iter().sum();
@@ -486,14 +491,21 @@ fn all_line(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
         .cursor(Cursor::Pointer)
         .fill(if active { ink.picked } else { Color::TRANSPARENT })
         .hover(ink.hover)
+        .on_hover_change(|s: &mut State, inside, _| {
+            // Hovering the whole-disk row names no band, so the meter and the category rows
+            // stop dimming: nothing is being singled out.
+            if inside {
+                s.ui.set_hover(None);
+            }
+        })
         .on_press(|s: &mut State| s.filter_to(store::Filter::All))
-        .child(tb(if active { "·" } else { "" }, ink.fg).w(MARK_W))
-        .child(t("□", if active { ink.fg } else { ink.muted }).w(ch(1.0)))
+        .child(marker(active, ink.fg))
+        .child(t("■", if active { ink.fg } else { ink.muted }).w(ch(1.0)))
         .child(
             text("All projects")
                 .font(mono(FS, if active { 700.0 } else { 400.0 }))
                 .color(if active { ink.fg } else { ink.row })
-                .w(ch(12.0)),
+                .w(ch(11.0)),
         )
         .child(
             text(model::gb(total))
@@ -502,6 +514,7 @@ fn all_line(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
                 .w(ch(9.0))
                 .align(Align::End),
         )
+        .child(dots(1.0, [230, 230, 230], 14, 0, !active))
 }
 
 fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
@@ -511,9 +524,13 @@ fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
         .w(width)
         .shrink()
         .gap(ch(0.2))
+        // What the highlighted row is comes first, the way the sidebar in the design leads
+        // with the thing being looked at rather than the list of views.
+        .child(details(s, ink))
         .child(
-            t("filter by", ink.faint)
+            t("categories", ink.faint)
                 .pl(ch(2.0))
+                .pt(ch(1.1))
                 .pb(ch(0.4)),
         )
         .child(all_line(s, ink, sizes))
@@ -527,7 +544,7 @@ fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
             col()
                 .gap(ch(0.5))
                 .pl(ch(1.2))
-                .child(reclaimable_line(s, ink))
+                .child(reclaim_line(s, ink))
                 .child(quick_wins(s, ink, sizes)),
         )
 }
@@ -658,7 +675,7 @@ fn project_age(s: &State, item: &Item) -> Option<u64> {
         .and_then(|p| p.days)
 }
 
-fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
+fn item_line(ctx: &Ctx, item: &Item, index: usize) -> El {
     let s = ctx.s;
     let ink = ctx.ink;
     let selected = s.ui.row == index;
@@ -688,7 +705,7 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
             s.ui.set_row(index);
         })
         .on_double_press(|s: &mut State| s.open())
-        .child(tb(if selected { "·" } else { "" }, color_of(category.color)).w(MARK_W))
+        .child(marker(selected, color_of(category.color)))
         .child(
             // The disclosure arrow is its own target: one click opens the folder, the way a
             // tree in a file manager does.
@@ -768,25 +785,29 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
                 .w(AGE_W)
                 .align(Align::End),
         )
+        // The pointer tooltip says the same thing the card says, in one line: what this is,
+        // how big, and what that means. It used to end in "last commit known", which repeated
+        // the age column beside it without telling the reader anything.
         .help(format!(
             "{} · {}{}",
+            item.name,
             model::gb(item.size),
             if label.reason.is_empty() {
-                item.name.clone()
+                String::new()
             } else {
-                format!("{} · {}", item.name, label.reason)
+                format!(" · {}", label.reason)
             },
-            if days.is_some() {
-                " · last commit known"
-            } else {
-                ""
-            }
         ))
 }
 
-/// "└ mostly in node_modules/  31.2 GB · 77%", printed under a folder.
-fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit) -> El {
-    let line = row().w_full().h(FS * 1.45).items_center().pl(ch(4.0));
+/// A faint lowercase heading, the same voice as "categories" in the sidebar.
+fn section_label(text_: &str, ink: &Ink) -> El {
+    t(text_, ink.faint).pb(ch(0.2))
+}
+
+/// Where the folder's space sits, drawn like a category row: name, size, share and a dot
+/// bar in the verdict's colour, so it reads as part of the sidebar rather than a footnote.
+fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit, color: cats::Rgb) -> El {
     let Some(last) = culprit.chain.last() else {
         if culprit.top.len() <= 1 {
             return el();
@@ -797,45 +818,44 @@ fn culprit_line(ink: &Ink, item: &Item, culprit: &Culprit) -> El {
             .iter()
             .map(|t| format!("{} {}", t.name, model::gb(t.size)))
             .collect::<Vec<_>>()
-            .join("  ·  ");
-        return line
-            .child(t("└ spread out:", ink.faint))
-            .child(t(spread, ink.muted).pl(ch(1.0)).truncate());
+            .join(" · ");
+        return col()
+            .w_full()
+            .gap(ch(0.2))
+            .child(section_label("spread across", ink))
+            .child(t(spread, ink.muted).truncate());
     };
-    let verdict = cats::classify(&last.name, last.dir, None);
-    line.child(t("└ mostly in", ink.faint))
+    let whole = culprit.root_size.max(item.size).max(last.size);
+    let fraction = if whole > 0 {
+        last.size as f32 / whole as f32
+    } else {
+        0.0
+    };
+    // Bucket names from the scan already end in a slash; a real folder needs one added.
+    let name = if last.dir && !last.name.ends_with('/') {
+        format!("{}/", last.name)
+    } else {
+        last.name.clone()
+    };
+    col()
+        .w_full()
+        .gap(ch(0.3))
+        .child(section_label("most of it is in", ink))
         .child(
-            t(
-                format!("{}{}", last.name, if last.dir { "" } else { "" }),
-                ink.fg,
-            )
-            .pl(ch(1.0))
-            .truncate(),
+            row()
+                .w_full()
+                .items_center()
+                .gap(ch(0.6))
+                .child(t(name, ink.row).grow(1.0).min_w(0.0).truncate())
+                .child(t(model::gb(last.size), ink.muted).shrink())
+                .child(t(pct(last.size, whole), ink.faint).w(ch(4.0)).align(Align::End)),
         )
-        .child(t(model::gb(last.size), ink.muted).pl(ch(2.0)))
-        .child(
-            t(
-                // Share of the thing being jumped into, which is what the line claims.
-                format!(
-                    "· {}",
-                    pct(last.size, culprit.root_size.max(item.size).max(last.size))
-                ),
-                ink.faint,
-            )
-            .pl(ch(1.0)),
-        )
-        .children(
-            (!verdict.verdict.tag().is_empty()).then(|| {
-                t(
-                    verdict.verdict.tag(),
-                    color_of(verdict.verdict.color()),
-                )
-                .pl(ch(2.0))
-            }),
-        )
+        .child(dots(fraction, color, 14, last.name.len() * 7, false))
 }
 
-/// What the highlighted row is, where its space is, and what you can do with it.
+/// What the highlighted row is, where its space is, and what you can do with it. It is
+/// laid out like the rest of the sidebar: flat on the background, a faint heading, bold
+/// name and figure, a coloured square for the verdict, dot bars and the shared chips.
 fn item_details(ctx: &Ctx, item: &Item) -> El {
     let s = ctx.s;
     let ink = ctx.ink;
@@ -845,77 +865,102 @@ fn item_details(ctx: &Ctx, item: &Item) -> El {
     let can_open = item.dir && s.ui.stack.len() < 12;
     let has_culprit = culprit.as_ref().is_some_and(|c| c.chain.len() > 1);
 
-    let verdict_name = match label.verdict {
-        Verdict::Unused => "probably unused".to_string(),
-        other => other.tag().to_string(),
-    };
     let category = s.ui.filter.cat().unwrap_or(cats::Cat::Source).category();
     let share = s.ui.share(item, &s.projects);
-    let mut body = col()
+    let verdict_rgb = label.verdict.color();
+
+    col()
+        .key("detail")
         .w_full()
-        .pl(ch(4.0))
-        .gap(ch(0.1))
+        .gap(ch(0.5))
+        .pl(ch(2.0))
+        .pr(ch(0.5))
+        .child(section_label("selected", ink))
         .child(
-            // Which folder, and how the size column splits: the row's total first, then the
-            // slice this category is, so the two numbers on screen can be told apart.
             row()
-                .h(FS * 1.45)
+                .w_full()
                 .items_center()
-                .gap(ch(0.8))
-                .child(tb(
-                    format!("{}{}", item.name, if item.dir { "/" } else { "" }),
-                    ink.fg,
-                ))
-                .child(tb(model::gb(item.size), ink.fg))
-                .children((s.ui.stack.is_empty() && share != item.size).then(|| {
-                    row()
-                        .items_center()
-                        .gap(ch(0.6))
-                        .child(t("■", color_of(category.color)))
-                        .child(t(
+                .gap(ch(0.6))
+                .child(
+                    tb(
+                        format!("{}{}", item.name, if item.dir { "/" } else { "" }),
+                        ink.fg,
+                    )
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate(),
+                )
+                .child(tb(model::gb(item.size), ink.fg).shrink()),
+        )
+        .children(
+            // Which part of the folder is being counted, when the list is filtered to one
+            // category and the row's number is bigger than that category's slice.
+            (s.ui.stack.is_empty() && share != item.size).then(|| {
+                row()
+                    .items_center()
+                    .gap(ch(0.6))
+                    .child(t("■", color_of(category.color)))
+                    .child(
+                        t(
                             format!("{} in {}", model::gb(share), category.name),
                             ink.muted,
-                        ))
-                }))
-                .children((!label.reason.is_empty() || label.verdict != Verdict::Yours).then(|| {
-                    row()
-                        .items_center()
-                        .child(tb(verdict_name, color_of(label.verdict.color())))
-                        .children((!label.reason.is_empty()).then(|| {
-                            t(format!("· {}", label.reason), ink.muted).pl(ch(1.0))
-                        }))
-                })),
-        );
-
-    if pending {
-        body = body.child(
+                        )
+                        .truncate(),
+                    )
+            }),
+        )
+        .children(verdict_block(&label, color_of(verdict_rgb), ink))
+        .children(pending.then(|| t("finding what is taking the space…", ink.faint)))
+        .children(
+            culprit
+                .as_ref()
+                .filter(|c| !c.chain.is_empty() || c.top.len() > 1)
+                .map(|c| culprit_line(ink, item, c, verdict_rgb).pt(ch(0.4))),
+        )
+        .child(
+            // The buttons wrap rather than shrink: two fit side by side in the column, and a
+            // third starts a new line instead of poking out of it. Same chip as Rescan.
             row()
-                .h(FS * 1.45)
+                .w_full()
+                .wrap()
                 .items_center()
-                .child(t("└ finding what is taking the space…", ink.faint)),
-        );
-    } else if let Some(culprit) =
-        culprit.as_ref().filter(|c| !c.chain.is_empty() || c.top.len() > 1)
-    {
-        body = body.child(culprit_line(ink, item, culprit));
-    }
+                .gap(ch(0.6))
+                .pt(ch(0.4))
+                .children(can_open.then(|| {
+                    chip("Open folder", ink.fg, [230, 230, 230], |s: &mut State| s.open())
+                }))
+                .children(has_culprit.then(|| {
+                    chip("Culprit", ink.fg, [230, 230, 230], |s: &mut State| {
+                        s.go_to_culprit()
+                    })
+                }))
+                .child(chip("Reveal", ink.fg, [230, 230, 230], |s: &mut State| {
+                    s.reveal()
+                })),
+        )
+}
 
-    body.child(
-        row()
-            .h(FS * 1.7)
-            .items_center()
-            .gap(ch(1.4))
-            .children(can_open.then(|| {
-                chip("Open folder", ink.fg, [120, 140, 200], |s: &mut State| s.open())
-            }))
-            .children(has_culprit.then(|| {
-                chip("Go to the culprit", ink.fg, [251, 191, 36], |s: &mut State| {
-                    s.go_to_culprit()
-                })
-            }))
-            .child(chip("Reveal in Explorer", ink.muted, [140, 140, 140], |s: &mut State| {
-                s.reveal()
-            })),
+/// The verdict and its reason: a coloured square and the verdict word, the way categories
+/// are marked, with the reason on its own line so the narrow column never cuts it short.
+fn verdict_block(label: &Label, coloured: Color, ink: &Ink) -> Option<El> {
+    if label.tag_line().is_empty() && label.reason.is_empty() {
+        return None;
+    }
+    Some(
+        col()
+            .w_full()
+            .gap(ch(0.2))
+            .child(
+                row()
+                    .items_center()
+                    .gap(ch(0.6))
+                    .child(t("■", coloured))
+                    .child(t(label.tag_line(), coloured)),
+            )
+            .children(
+                (!label.reason.is_empty())
+                    .then(|| t(label.reason.clone(), ink.muted).pl(ch(1.6)).truncate()),
+            ),
     )
 }
 
@@ -952,9 +997,9 @@ fn header_cell(
         .hover(Color::WHITE)
         .on_press(move |s: &mut State| s.ui.set_sort(sort))
         .help(if active {
-            "Click to flip the order"
+            "Reverse the order"
         } else {
-            "Click to order by this column"
+            "Sort by this column"
         })
 }
 
@@ -965,51 +1010,24 @@ fn dots_width() -> f32 {
     DOTS as f32 * dot + (DOTS as f32 - 1.0) * gap
 }
 
-/// The strip under the list: what the selected row is, where its space is, and what to do
-/// with it. Always in the same place, so selecting rows never moves the list.
-fn preview(ctx: &Ctx, entries: &[Item], selected: usize) -> El {
-    let s = ctx.s;
-    let ink = ctx.ink;
-    let Some(item) = entries.get(selected).or_else(|| entries.first()) else {
-        return el().key("preview").h(PREVIEW_H);
+/// What the highlighted row is, where its space went, and what to do about it: the detail
+/// block in the sidebar, above the categories. It reads the row from the list rather than
+/// taking it, so the sidebar and the table can never disagree about which row is current.
+fn details(s: &State, ink: &Ink) -> El {
+    let ctx = Ctx { s, ink };
+    let Some(item) = s.ui.entries(&s.projects).into_iter().nth(s.ui.row) else {
+        return col().key("details").w_full();
     };
     col()
-        .key("preview")
+        .key("details")
         .w_full()
-        .h(PREVIEW_H)
         .gap(ch(0.1))
-        .pt(ch(0.5))
-        .child(item_details(ctx, item))
-        .children(
-            // Filler so the strip keeps its height on rows with nothing to blame.
-            (item_details_lines(ctx, item) < 3).then(|| el().grow(1.0)),
-        )
-}
-
-/// How many lines `item_details` draws for a row, so the strip can hold its height.
-fn item_details_lines(ctx: &Ctx, item: &Item) -> usize {
-    let s = ctx.s;
-    let label = s.ui.label(item, &s.projects);
-    let culprit = s.ui.culprit(item, &s.projects);
-    let mut lines = 1; // the action row
-    if !label.reason.is_empty() || label.verdict != Verdict::Yours {
-        lines += 1;
-    }
-    if s.ui.culprit_pending(item)
-        || culprit
-            .as_ref()
-            .is_some_and(|c| !c.chain.is_empty() || c.top.len() > 1)
-    {
-        lines += 1;
-    }
-    lines
+        .child(item_details(&ctx, &item))
 }
 
 fn empty(s: &State, ink: &Ink) -> El {
     let line = if s.ui.listing {
         "measuring what is inside…"
-    } else if s.ui.junk_only {
-        "nothing here looks like junk"
     } else if s.scanning && s.ui.stack.is_empty() {
         "still measuring…"
     } else if !s.ui.stack.is_empty() {
@@ -1026,10 +1044,10 @@ fn inside(ctx: &Ctx) -> El {
     let s = ctx.s;
     let ink = ctx.ink;
     let entries = s.ui.entries(&s.projects);
-    let all = s.ui.all_entries(&s.projects);
-    let max = entries.first().map(|e| e.size).unwrap_or(1);
+    // The count line is the only thing that needs the untruncated list, so it asks for the
+    // length rather than building a second sorted copy of every row every frame.
+    let listing = s.ui.listing_count(&s.projects);
     let total = s.ui.total(&s.projects);
-    let selected = s.ui.row.min(entries.len().saturating_sub(1));
 
     let mut rows = col()
         .key("rows")
@@ -1041,26 +1059,17 @@ fn inside(ctx: &Ctx) -> El {
             entries
                 .iter()
                 .enumerate()
-                .map(|(index, item)| item_line(ctx, item, index, max).into()),
+                .map(|(index, item)| item_line(ctx, item, index)),
         );
 
-    rows = rows.children((all.len() > store::MAX_ROWS).then(|| {
-        t(format!("… and {} smaller", all.len() - store::MAX_ROWS), ink.faint)
+    rows = rows.children((listing > store::MAX_ROWS).then(|| {
+        t(
+            format!("… and {} smaller", listing - store::MAX_ROWS),
+            ink.faint,
+        )
             .pt(ch(0.4))
             .pl(ch(2.4))
     }));
-
-    let count = format!(
-        "{} {}{}{}",
-        all.len(),
-        if all.len() == 1 { "item" } else { "items" },
-        if s.ui.junk_only {
-            " labelled junk or unused"
-        } else {
-            ""
-        },
-        if s.ui.listing { " · measuring" } else { "" }
-    );
 
     let mut list = col()
         .grow(1.0)
@@ -1102,23 +1111,20 @@ fn inside(ctx: &Ctx) -> El {
                 .child(rows),
         );
     }
-    // Fixed, below the list: clicking a row fills this in, it never reflows the list.
-    list = list.child(preview(ctx, &entries, selected));
     list.key("inside")
 }
 
 // ---- bottom line -----------------------------------------------------------
 
 fn bottom_line(s: &State, ink: &Ink) -> El {
-    // No back button: the breadcrumb above the list is the way up, and it names where it goes.
-    let mut actions = row().key("actions").items_center().gap(ch(1.4));
-
+    // No back button: the breadcrumb above the list is the way up, and it names where it
+    // goes. The action slot is kept so the line's layout stays fixed when chips come back.
     row()
         .key("bottom")
         .w_full()
         .items_center()
         .gap(ch(2.0))
-        .child(actions)
+        .child(row().key("actions").items_center().gap(ch(1.4)))
         .child(el().grow(1.0))
         .children(s.ui.note.clone().map(|note| t(note, ink.muted).truncate()))
 }
@@ -1163,9 +1169,4 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(inside(&ctx)),
         )
         .child(bottom_line(s, &ink))
-}
-
-/// The projects a row's label needs, for tests that render without a scan.
-pub fn projects<'a>(s: &'a State) -> &'a [Project] {
-    &s.projects
 }

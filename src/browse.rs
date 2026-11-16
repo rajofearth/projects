@@ -74,14 +74,27 @@ pub fn cancel_flag() -> Cancel {
 }
 
 /// Bytes on disk under `path`: every file's length, junctions and symlinks left alone.
-pub fn folder_size(path: &Path) -> u64 {
+/// Returns `None` when `cancel` was raised mid-walk, so a navigated-away listing stops
+/// instead of measuring a tree nobody is looking at any more.
+pub fn folder_size(path: &Path, cancel: &AtomicBool) -> Option<u64> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let mut total = 0;
     let mut stack = vec![path.to_path_buf()];
+    let mut entries_seen = 0u32;
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            // The flag is read once every 4096 entries: often enough to abandon a big
+            // node_modules within a few milliseconds, rare enough to stay off the per-file
+            // path of a size walk.
+            entries_seen += 1;
+            if entries_seen % 4096 == 0 && cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_symlink() {
                 continue;
@@ -93,7 +106,7 @@ pub fn folder_size(path: &Path) -> u64 {
             }
         }
     }
-    total
+    Some(total)
 }
 
 fn child(path: &Path, name: &str, size: u64, dir: bool) -> Item {
@@ -126,14 +139,28 @@ pub fn list_immediate(path: &Path) -> (Vec<Item>, Vec<Item>) {
     (files, dirs)
 }
 
-/// The whole list, measured, largest first. Blocking; used by tests and by the worker.
-pub fn list_folder_blocking(path: &Path, mut on_progress: impl FnMut(&[Item])) -> Vec<Item> {
-    let (mut files, dirs) = list_immediate(path);
-    let mut items = std::mem::take(&mut files);
+/// The whole list, measured, largest first. Blocking, and used by the tests only: the
+/// window's own listing streams through `list_folder`.
+/// `cancel` stops the walk between folders; `on_progress` sees each interim list.
+#[cfg(test)]
+pub fn list_folder_blocking(
+    path: &Path,
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(&[Item]),
+) -> Vec<Item> {
+    let (files, dirs) = list_immediate(path);
+    let mut items: Vec<Item> = files;
     items.sort_by(|a, b| b.size.cmp(&a.size));
     on_progress(&items);
     for mut dir in dirs {
-        dir.size = folder_size(&dir.path);
+        if cancel.load(Ordering::Relaxed) {
+            return items;
+        }
+        let Some(size) = folder_size(&dir.path, cancel) else {
+            // Cancelled mid-folder: the list stays as it is rather than showing a wrong size.
+            return items;
+        };
+        dir.size = size;
         items.push(dir);
         items.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
         on_progress(&items);
@@ -146,7 +173,7 @@ pub fn list_folder(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
     std::thread::spawn(move || {
         let (files, dirs) = list_immediate(&path);
         let mut items = files;
-        let mut send = |items: &[Item], done: bool| {
+        let send = |items: &[Item], done: bool| {
             let _ = tx.send(BrowseEvent::Listing {
                 path: path.clone(),
                 items: items.to_vec(),
@@ -158,7 +185,10 @@ pub fn list_folder(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            dir.size = folder_size(&dir.path);
+            let Some(size) = folder_size(&dir.path, &cancel) else {
+                return;
+            };
+            dir.size = size;
             items.push(dir);
             items.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
             send(&items, false);
@@ -171,20 +201,23 @@ pub fn list_folder(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
 const DOMINANT: f64 = 0.5;
 const DEPTH: usize = 12;
 
-pub fn find_culprit_blocking(path: &Path) -> Culprit {
+pub fn find_culprit_blocking(path: &Path, cancel: &AtomicBool) -> Culprit {
     let mut chain: Vec<Item> = Vec::new();
     let mut current = path.to_path_buf();
-    let mut current_size = folder_size(path);
+    let mut current_size = folder_size(path, cancel).unwrap_or(0);
     let root_size = current_size;
     let mut top: Vec<Item> = Vec::new();
 
     for depth in 0..DEPTH {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let (files, dirs) = list_immediate(&current);
         let mut kids: Vec<Item> = files
             .into_iter()
-            .chain(dirs.into_iter().map(|mut d| {
-                d.size = folder_size(&d.path);
-                d
+            .chain(dirs.into_iter().filter_map(|mut d| {
+                d.size = folder_size(&d.path, cancel)?;
+                Some(d)
             }))
             .collect();
         kids.sort_by(|a, b| b.size.cmp(&a.size));
@@ -212,13 +245,14 @@ pub fn find_culprit_blocking(path: &Path) -> Culprit {
     }
 }
 
-/// Searches for the culprit on a thread.
+/// Searches for the culprit on a thread. A cancel before the walk starts or after it
+/// ends means nothing is sent, and the caller drops the receiver when the thread ends.
 pub fn find_culprit(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
     std::thread::spawn(move || {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        let culprit = find_culprit_blocking(&path);
+        let culprit = find_culprit_blocking(&path, &cancel);
         if cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -227,11 +261,25 @@ pub fn find_culprit(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
 }
 
 /// Shows the item in Explorer (Finder, or the desktop's file manager elsewhere).
+///
+/// `/select,` highlights the path it is given and opens the folder that *contains* it.
+/// Handed a directory, that means the row is selected inside its parent, and the folder
+/// the reader wanted is one level up and not open. So the switch gets the folder itself
+/// only when the path is a file; for a directory the folder is opened directly, which is
+/// what "reveal" means when the thing is already a place.
 pub fn reveal(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        let is_dir = path.is_dir();
+        // One argv entry: no shell sees this, and `/select,` splits on a comma, so a path
+        // holding one would select the wrong item unless it is quoted.
+        let arg = if is_dir {
+            format!("\"{}\"", path.display())
+        } else {
+            format!("/select,\"{}\"", path.display())
+        };
         std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .arg(arg)
             .spawn()
             .map(|_| ())
     }
@@ -272,7 +320,8 @@ mod tests {
         fs::write(root.join("loose.txt"), "x".repeat(500)).unwrap();
 
         let mut progress = 0;
-        let items = list_folder_blocking(&root, |_| progress += 1);
+        let live = AtomicBool::new(false);
+        let items = list_folder_blocking(&root, &live, |_| progress += 1);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].name, "big", "the folder with 9 kB leads");
         assert_eq!(items[0].size, 9000);
@@ -292,7 +341,8 @@ mod tests {
         fs::create_dir_all(root.join("node_modules/dep")).unwrap();
         fs::write(root.join("node_modules/dep/index.js"), "x".repeat(20_000)).unwrap();
 
-        let culprit = find_culprit_blocking(&root);
+        let live = AtomicBool::new(false);
+        let culprit = find_culprit_blocking(&root, &live);
         let names: Vec<&str> = culprit.chain.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["node_modules"], "the search stops at node_modules");
         assert_eq!(culprit.chain[0].size, 20_000);
@@ -308,9 +358,42 @@ mod tests {
             fs::create_dir_all(root.join(name)).unwrap();
             fs::write(root.join(name).join("f.bin"), "x".repeat(1000)).unwrap();
         }
-        let culprit = find_culprit_blocking(&root);
+        let live = AtomicBool::new(false);
+        let culprit = find_culprit_blocking(&root, &live);
         assert!(culprit.chain.is_empty(), "no one child holds half of it");
         assert_eq!(culprit.top.len(), 3);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cancelled_walk_returns_no_size_and_stops() {
+        let root = scratch("cancel");
+        fs::create_dir_all(root.join("deep")).unwrap();
+        fs::write(root.join("deep/a.txt"), "x".repeat(100)).unwrap();
+        // Raised before the walk starts: the first check inside `folder_size` returns None
+        // rather than measuring a tree the user navigated away from.
+        let stop = AtomicBool::new(true);
+        assert_eq!(folder_size(&root, &stop), None, "a raised flag yields no size");
+        // And a live flag still measures, so the check is not just refusing everything.
+        let live = AtomicBool::new(false);
+        assert_eq!(folder_size(&root, &live), Some(100));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cancelled_listing_keeps_the_list_it_had() {
+        let root = scratch("listing-cancel");
+        fs::create_dir_all(root.join("one")).unwrap();
+        fs::write(root.join("one/a.txt"), "x".repeat(10)).unwrap();
+        fs::write(root.join("loose.txt"), "x".repeat(50)).unwrap();
+        let stop = AtomicBool::new(true);
+        let items = list_folder_blocking(&root, &stop, |_| {});
+        // Nothing beyond the immediate files is measured: the folders keep size 0.
+        assert!(items.iter().any(|i| i.name == "loose.txt" && i.size == 50));
+        assert!(
+            items.iter().filter(|i| i.dir).all(|i| i.size == 0),
+            "cancelled folders are never walked: {items:?}"
+        );
         fs::remove_dir_all(&root).ok();
     }
 }
