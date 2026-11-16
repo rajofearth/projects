@@ -27,6 +27,16 @@ pub const CELL: f32 = 7.5;
 /// Rows the detail pane's list draws before it stops.
 const DOTS: usize = 16;
 
+// The table's column widths, in points. The header and every row read these same numbers,
+// so a heading can never drift off the column it names.
+const MARK_W: f32 = FS * 1.2;
+const ARROW_W: f32 = FS * 1.2;
+const VERDICT_W: f32 = FS * 7.0;
+const SIZE_W: f32 = FS * 8.0;
+const PCT_W: f32 = FS * 4.5;
+const AGE_W: f32 = FS * 6.0;
+const GAP: f32 = FS * 0.9;
+
 /// The port's palette, decoded once per view.
 struct Ink {
     fg: Color,
@@ -615,6 +625,9 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
     let stale = days.is_some_and(|d| d > 180);
     let scope = s.ui.scope_size(&s.projects).max(1);
     let under_root = s.ui.stack.is_empty();
+    let share = s.ui.share(item, &s.projects);
+    let disk = s.ui.disk_size(&s.projects).max(1);
+    let disk_share = item.size as f32 / disk as f32;
 
     row()
         .key(format!("row/{index}"))
@@ -623,7 +636,7 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
         .px(ch(0.5))
         .radius(4.0)
         .items_center()
-        .gap(ch(1.0))
+        .gap(GAP)
         .cursor(Cursor::Pointer)
         // A picked row keeps a surface, so the selection is visible without a keystroke.
         .fill(if selected { ink.picked } else { Color::TRANSPARENT })
@@ -632,7 +645,7 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
             s.ui.set_row(index);
         })
         .on_double_press(|s: &mut State| s.open())
-        .child(tb(if selected { "·" } else { "" }, color_of(category.color)).w(ch(1.0)))
+        .child(tb(if selected { "·" } else { "" }, color_of(category.color)).w(MARK_W))
         .child(
             // The disclosure arrow is its own target: one click opens the folder, the way a
             // tree in a file manager does.
@@ -644,8 +657,7 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
                     ink.faint
                 },
             )
-            .w(ch(1.0))
-            .px(ch(0.3))
+            .w(ARROW_W)
             .cursor(if item.dir {
                 Cursor::Pointer
             } else {
@@ -675,39 +687,42 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
                 })),
         )
         .child(
-            t(label.verdict.tag(), color_of(label.verdict.color()))
-                .w(ch(6.0)),
+            t(label.verdict.tag(), color_of(label.verdict.color())).w(VERDICT_W),
         )
         .child(
             text(model::gb(item.size))
-                .font(mono(FS, 400.0))
+                .font(mono(FS, if selected { 700.0 } else { 400.0 }))
                 .color(if selected { ink.fg } else { ink.muted })
-                .w(ch(8.0))
+                .w(SIZE_W)
                 .align(Align::End),
         )
-        .child(dots(
-            item.size as f32 / max.max(1) as f32,
-            if label.verdict == Verdict::Yours {
-                category.color
-            } else {
-                label.verdict.color()
-            },
-            DOTS,
-            index + 3,
-            label.verdict == Verdict::Yours && !selected,
-        ))
         .child(
-            text(pct(item.size, scope))
+            // Every row's dots share one denominator, the whole disk, so a column of dots
+            // reads as an amount of data rather than as a per-category ranking.
+            dots(
+                disk_share,
+                if label.verdict == Verdict::Yours {
+                    category.color
+                } else {
+                    label.verdict.color()
+                },
+                DOTS,
+                index + 3,
+                !selected,
+            ),
+        )
+        .child(
+            text(pct(share, scope))
                 .font(mono(FS, 400.0))
-                .color(ink.faint)
-                .w(ch(4.0))
+                .color(if selected { ink.muted } else { ink.faint })
+                .w(PCT_W)
                 .align(Align::End),
         )
         .child(
             text(days.map(cats::short_age).unwrap_or_default())
                 .font(mono(FS, 400.0))
                 .color(if stale { ink.amber } else { ink.faint })
-                .w(ch(6.0))
+                .w(AGE_W)
                 .align(Align::End),
         )
         .help(format!(
@@ -842,21 +857,34 @@ fn item_details(ctx: &Ctx, item: &Item) -> El {
 }
 
 /// A column header: clicking it orders the list by that column, clicking it again flips it.
-fn header_cell(s: &State, ink: &Ink, sort: store::Sort, label: &str, width: f32) -> El {
-    let active = s.ui.sort == sort;
+fn header_cell(
+    s: &State,
+    ink: &Ink,
+    sort: store::Sort,
+    label: &str,
+    width: f32,
+    numeric: bool,
+) -> El {
+    let active = sort != store::Sort::None && s.ui.sort == sort;
     let arrow = if !active {
         ""
     } else if s.ui.sort_down {
-        " ↓"
+        "↓"
     } else {
-        " ↑"
+        "↑"
     };
-    text(format!("{label}{arrow}"))
+    // The arrow never widens the heading: it sits in a slot the row reserves too, so the
+    // numbers stay under the word that names them.
+    let mut cell = text(format!("{label}{arrow}"))
         .font(mono(FS, if active { 700.0 } else { 400.0 }))
         .color(if active { ink.row } else { ink.faint })
-        .w(width)
-        .align(Align::End)
-        .pr(ch(0.4))
+        .align(if numeric { Align::End } else { Align::Start });
+    // The growing column takes whatever is left; the rest keep the row's exact widths.
+    cell = if numeric { cell.w(width) } else { cell.grow(1.0).min_w(0.0) };
+    if sort == store::Sort::None {
+        return cell;
+    }
+    cell.px(0.0)
         .cursor(Cursor::Pointer)
         .hover(Color::WHITE)
         .on_press(move |s: &mut State| s.ui.set_sort(sort))
@@ -865,6 +893,13 @@ fn header_cell(s: &State, ink: &Ink, sort: store::Sort, label: &str, width: f32)
         } else {
             "Click to order by this column"
         })
+}
+
+/// Width of one row's dot block, so the header can reserve exactly that much.
+fn dots_width() -> f32 {
+    let dot = (FS * 0.26).max(2.0).round();
+    let gap = (FS * 0.14).max(1.0).round();
+    DOTS as f32 * dot + (DOTS as f32 - 1.0) * gap
 }
 
 fn empty(s: &State, ink: &Ink) -> El {
@@ -930,16 +965,24 @@ fn inside(ctx: &Ctx) -> El {
         .child(inside_header(s, ink, total))
         .child(blurb_line(s, ink))
         .child(
+            // Laid out with the row's own widths and gaps, so every heading sits over the
+            // column it names: the name cell is the one that grows, exactly as in a row.
             row()
                 .w_full()
                 .items_center()
-                .gap(ch(0.6))
+                .gap(GAP)
                 .pt(ch(0.7))
-                .pb(ch(0.1))
-                .child(t(count, ink.faint).grow(1.0).pl(ch(2.0)))
-                .child(header_cell(s, ink, store::Sort::Name, "name", ch(11.0)))
-                .child(header_cell(s, ink, store::Sort::Size, "size", ch(8.0)))
-                .child(header_cell(s, ink, store::Sort::Age, "last commit", ch(11.0))),
+                .pb(ch(0.15))
+                // Same inset as a row's own padding, so the two grids coincide.
+                .px(ch(0.5))
+                .child(el().size(MARK_W, 0.0))
+                .child(el().size(ARROW_W, 0.0))
+                .child(header_cell(s, ink, store::Sort::Name, "folder", 0.0, true))
+                .child(header_cell(s, ink, store::Sort::None, "", VERDICT_W, false))
+                .child(header_cell(s, ink, store::Sort::Size, "size", SIZE_W, true))
+                .child(el().size(dots_width(), 0.0))
+                .child(el().size(PCT_W, 0.0))
+                .child(header_cell(s, ink, store::Sort::Age, "last commit", AGE_W, true)),
         );
 
     if entries.is_empty() {

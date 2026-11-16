@@ -21,6 +21,8 @@ pub enum Sort {
     Size,
     Name,
     Age,
+    /// Not a column: a heading that names a cell nothing sorts by.
+    None,
 }
 
 impl Sort {
@@ -29,6 +31,7 @@ impl Sort {
             Sort::Size => "size",
             Sort::Name => "name",
             Sort::Age => "last commit",
+            Sort::None => "",
         }
     }
 }
@@ -108,6 +111,18 @@ impl Ui {
         projects.iter().map(|p| p.bytes).sum()
     }
 
+    /// How much of a row belongs to the category being viewed. At the top level that is the
+    /// project's slice of it; inside a folder it is the folder's own size.
+    pub fn share(&self, item: &Item, projects: &[Project]) -> u64 {
+        if self.stack.is_empty() {
+            return match self.project(&item.name, projects) {
+                Some(p) => self.selected.bytes(p),
+                None => item.size,
+            };
+        }
+        item.size
+    }
+
     /// The project a top-level row names, if any.
     fn project<'a>(&self, name: &str, projects: &'a [Project]) -> Option<&'a Project> {
         projects.iter().find(|p| p.name == name)
@@ -116,15 +131,12 @@ impl Ui {
     /// Everything the detail pane lists right now, largest first.
     pub fn all_entries(&self, projects: &[Project]) -> Vec<Item> {
         let mut list: Vec<Item> = if self.stack.is_empty() {
+            // A row is the whole project, not just the slice being viewed: one row's numbers
+            // always describe that folder, and `share` says how much of it this category is.
             let mut rows: Vec<Item> = projects
                 .iter()
-                .map(|p| Item {
-                    path: self.root.join(&p.name),
-                    name: p.name.clone(),
-                    size: self.selected.bytes(p),
-                    dir: true,
-                })
-                .filter(|i| i.size > 0)
+                .map(|p| Item::folder(self.root.join(&p.name), p.name.clone(), p.bytes))
+                .filter(|i| self.share(i, projects) > 0)
                 .collect();
             rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
             rows
@@ -148,6 +160,7 @@ impl Ui {
                 list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             }
             // Rows without a commit date sort last, whichever way the column runs.
+            Sort::None => {}
             Sort::Age => list.sort_by(|a, b| {
                 let key = |item: &Item| self.age_of(item, projects);
                 match (key(a), key(b)) {
@@ -234,6 +247,17 @@ impl Ui {
             Some(top) => top.size,
             None => self.category_sizes(projects)[cat_index(self.selected)],
         }
+    }
+
+    /// The whole disk: every byte of every project, the denominator the dots share.
+    pub fn disk_size(&self, projects: &[Project]) -> u64 {
+        self.total(projects)
+    }
+
+    /// The four-way split of one project, for the hover readout.
+    pub fn split(&self, item: &Item, projects: &[Project]) -> Option<[(Cat, u64); 4]> {
+        let p = self.project(&item.name, projects)?;
+        Some(cats::CATEGORIES.map(|c| (c.id, c.id.bytes(p))))
     }
 
     /// How much of what is listed is labelled junk, and how much is probably unused.
@@ -720,7 +744,10 @@ mod tests {
         ui.selected = Cat::Deps;
         let rows = ui.entries(&projects);
         assert_eq!(rows[0].name, "heavy-deps");
-        assert_eq!(rows[0].size, 900);
+        // The row is the whole project; its share is the slice of that category, and the
+        // two are different numbers so no row can be misread as the other.
+        assert_eq!(rows[0].size, 1000, "the row is the whole folder");
+        assert_eq!(ui.share(&rows[0], &projects), 900, "900 of it is dependencies");
         // Projects with none of that category are left out rather than listed at zero.
         assert!(!rows.iter().any(|r| r.name == "native"));
     }

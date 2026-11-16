@@ -25,6 +25,25 @@ pub struct Item {
     pub dir: bool,
 }
 
+impl Item {
+    pub fn file(path: PathBuf, name: String, size: u64) -> Self {
+        Self {
+            path,
+            name,
+            size,
+            dir: false,
+        }
+    }
+    pub fn folder(path: PathBuf, name: String, size: u64) -> Self {
+        Self {
+            path,
+            name,
+            size,
+            dir: true,
+        }
+    }
+}
+
 /// Where a folder's space actually is: folders (and maybe one file) each holding most of the
 /// one before, plus the biggest things directly inside for when no single one dominates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

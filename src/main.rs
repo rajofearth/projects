@@ -638,6 +638,38 @@ mod tests {
     }
 
     #[test]
+    fn every_header_sits_over_the_column_it_names() {
+        let rt = demo_runtime();
+        // Find the header by its label and the row cell by the text it shows.
+        let mut at = |want: &str| -> Option<[f32; 4]> {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.text.as_deref().is_some_and(|t| t.starts_with(want)))
+                .map(|e| e.rect)
+        };
+        for header in ["folder", "size", "last commit"] {
+            assert!(at(header).is_some(), "header {header} is laid out");
+        }
+        let h = at("size").unwrap();
+        let sizecells: Vec<f32> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| {
+                e.text
+                    .as_deref()
+                    .is_some_and(|t| t.ends_with(" GiB") || t.ends_with(" MiB"))
+            })
+            .map(|e| e.rect[0] + e.rect[2])
+            .collect();
+        assert!(
+            sizecells.iter().any(|right| (right - (h[0] + h[2])).abs() < 1.0),
+            "a size cell ends where the size header does: header {}, cells {:?}",
+            h[0] + h[2],
+            sizecells
+        );
+    }
+
+    #[test]
     fn clicking_a_breadcrumb_walks_back_up_the_path() {
         let mut rt = demo_runtime();
         // Open the first project folder, then a folder inside it.
