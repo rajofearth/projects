@@ -138,6 +138,47 @@ pub fn open_terminal(path: &Path) -> io::Result<()> {
     spawn_detached(&mut cmd, flags)
 }
 
+/// Open a terminal at `path` that runs `command` and stays open afterwards (a dev server, a
+/// test run): Windows Terminal when present, otherwise a new `cmd` console.
+pub fn run_in_terminal(path: &Path, command: &str) -> io::Result<()> {
+    require_dir(path)?;
+    if find_on_path("wt").is_some() {
+        let mut cmd = Command::new("wt");
+        cmd.arg("-d").arg(path).arg("cmd").arg("/k").arg(command);
+        return spawn_detached(&mut cmd, 0);
+    }
+    let mut cmd = Command::new("cmd");
+    cmd.current_dir(path).arg("/k").arg(command);
+    #[cfg(windows)]
+    let flags = CREATE_NEW_CONSOLE;
+    #[cfg(not(windows))]
+    let flags = 0;
+    spawn_detached(&mut cmd, flags)
+}
+
+/// Open an http(s) link in the default browser.
+pub fn open_url(url: &str) -> io::Result<()> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a web link: {url}"),
+        ));
+    }
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler").arg(url);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    spawn_detached(&mut cmd, 0)
+}
+
 /// Create `parent\name` as a new folder, optionally running `git init` in it.
 ///
 /// Fails if `name` is not a valid Windows folder name, if `parent` is not a folder, or if

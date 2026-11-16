@@ -30,10 +30,14 @@ pub struct Usage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost_usd: f64,
+    /// False when some of these tokens had no price: no cost in the log and no list price
+    /// for the model, so `cost_usd` undercounts them.
+    pub priced: bool,
 }
 
 #[derive(Clone, Copy, Default)]
 struct Acc {
+    unpriced: bool,
     input: u64,
     output: u64,
     cache_read: u64,
@@ -85,6 +89,7 @@ pub fn load() -> Vec<Usage> {
             cache_read: a.cache_read,
             cache_write: a.cache_write,
             cost_usd: a.cost,
+            priced: !a.unpriced,
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -94,6 +99,7 @@ pub fn load() -> Vec<Usage> {
 }
 
 fn add(acc: &mut HashMap<Key, Acc>, raw: RawUse, provider: &'static str) {
+    let known = raw.cost.is_some() || has_price(&raw.model);
     let cost = raw.cost.unwrap_or_else(|| {
         price(
             &raw.model,
@@ -115,6 +121,7 @@ fn add(acc: &mut HashMap<Key, Acc>, raw: RawUse, provider: &'static str) {
     a.cache_read += raw.cache_read;
     a.cache_write += raw.cache_write;
     a.cost += cost;
+    a.unpriced |= !known;
 }
 
 // ---------------------------------------------------------------- Claude Code
@@ -411,6 +418,12 @@ const PRICES: &[(&str, [f64; 4])] = &[
     ("gemini-1.5-pro", [1.25, 5.0, 0.3125, 1.25]),
     ("gemini-1.5-flash", [0.075, 0.3, 0.01875, 0.075]),
 ];
+
+/// Whether the built-in table has a list price for this model.
+pub fn has_price(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    PRICES.iter().any(|(needle, _)| m.contains(needle))
+}
 
 /// Estimated cost in USD for the given usage at list prices, 0.0 if unknown.
 fn price(model: &str, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
