@@ -178,10 +178,12 @@ impl Meter {
             moving = true;
         }
 
-        self.draw(model);
-        self.push();
-        // A settling edge still has to draw, but nothing else does: report movement so the
-        // frame loop keeps running until the bar comes to rest.
+        // Only a frame that would look different is worth drawing and handing to the GPU.
+        if moving || self.edge > 0.004 {
+            self.draw(model);
+            self.push();
+        }
+        // Report movement so the frame loop keeps running until the bar comes to rest.
         moving || self.edge > 0.004 || self.edge < 0.996 && model.scanning
     }
 
