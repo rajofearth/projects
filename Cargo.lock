@@ -2161,6 +2161,7 @@ checksum = "9c4482d912d7671a7cd2089794f90ef3bb5f5f8c738230fb0fcd50fa020f0ed3"
 [[package]]
 name = "parley_engine"
 version = "0.12.0"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "fontique",
  "harfrust",
@@ -2552,6 +2553,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2608,6 +2610,7 @@ dependencies = [
  "swash",
  "symphonia",
  "taffy",
+ "tiny-skia-path 0.11.4 (git+https://github.com/anomalyco/rune?rev=eb5ae6c)",
  "tokio",
  "unicode-segmentation",
  "wasm-bindgen",
@@ -2635,10 +2638,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "wgpu",
 ]
@@ -2646,6 +2651,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "taffy",
 ]
@@ -3207,7 +3213,7 @@ dependencies = [
  "cfg-if",
  "log",
  "png 0.17.16",
- "tiny-skia-path",
+ "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -3215,6 +3221,16 @@ name = "tiny-skia-path"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
+]
+
+[[package]]
+name = "tiny-skia-path"
+version = "0.11.4"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -3378,7 +3394,7 @@ dependencies = [
  "siphasher",
  "strict-num",
  "svgtypes",
- "tiny-skia-path",
+ "tiny-skia-path 0.11.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "xmlwriter",
 ]
 
@@ -3713,6 +3729,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -3994,6 +4011,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
+source = "git+https://github.com/anomalyco/rune?rev=eb5ae6c#eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90"
 dependencies = [
  "ahash",
  "android-activity",

@@ -260,26 +260,19 @@ pub fn find_culprit(path: PathBuf, tx: Sender<BrowseEvent>, cancel: Cancel) {
     });
 }
 
-/// Shows the item in Explorer (Finder, or the desktop's file manager elsewhere).
+/// Shows the item in Explorer (Finder, or the desktop's file manager elsewhere), opening
+/// its parent folder with the item highlighted. "Open folder" is the action that opens a
+/// folder itself.
 ///
-/// `/select,` highlights the path it is given and opens the folder that *contains* it.
-/// Handed a directory, that means the row is selected inside its parent, and the folder
-/// the reader wanted is one level up and not open. So the switch gets the folder itself
-/// only when the path is a file; for a directory the folder is opened directly, which is
-/// what "reveal" means when the thing is already a place.
+/// The argument goes to Explorer raw: `Command::arg` escapes embedded quotes as `\"`,
+/// which Explorer can't parse, so it falls back to opening Documents. The quotes are still
+/// needed because `/select,` splits on a comma.
 pub fn reveal(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let is_dir = path.is_dir();
-        // One argv entry: no shell sees this, and `/select,` splits on a comma, so a path
-        // holding one would select the wrong item unless it is quoted.
-        let arg = if is_dir {
-            format!("\"{}\"", path.display())
-        } else {
-            format!("/select,\"{}\"", path.display())
-        };
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("explorer")
-            .arg(arg)
+            .raw_arg(format!("/select,\"{}\"", path.display()))
             .spawn()
             .map(|_| ())
     }

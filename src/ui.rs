@@ -34,7 +34,7 @@ const MARK_W: f32 = FS * 1.2;
 const ARROW_W: f32 = FS * 1.2;
 const VERDICT_W: f32 = FS * 7.0;
 const SIZE_W: f32 = FS * 8.0;
-const PCT_W: f32 = FS * 4.5;
+const PCT_W: f32 = FS * 3.0;
 const AGE_W: f32 = FS * 6.0;
 const GAP: f32 = FS * 0.9;
 /// The preview strip under the list: tall enough for verdict, blame and actions.
@@ -67,7 +67,7 @@ impl Ink {
         Self {
             fg: rgb([230, 230, 230]),
             muted: rgb([140, 140, 140]),
-            faint: rgb([79, 79, 79]),
+            faint: rgb([108, 108, 108]),
             red: rgb([248, 113, 113]),
             green: rgb([74, 222, 128]),
             amber: rgb([251, 191, 36]),
@@ -684,7 +684,6 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize) -> El {
     let days = project_age(s, item);
     let stale = days.is_some_and(|d| d > 180);
     let scope = s.ui.scope_size(&s.projects).max(1);
-    let under_root = s.ui.stack.is_empty();
     let share = s.ui.share(item, &s.projects);
     let disk = s.ui.disk_size(&s.projects).max(1);
     let disk_share = item.size as f32 / disk as f32;
@@ -730,21 +729,14 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize) -> El {
             }),
         )
         .child(
-            row()
+            // The arrow already marks a folder, and every row shares the parent the header
+            // shows, so the name stands alone: no trailing slash, no repeated path.
+            text(item.name.clone())
+                .font(mono(FS, if selected { 700.0 } else { 400.0 }))
+                .color(if selected { ink.fg } else { ink.row })
                 .grow(1.0)
                 .min_w(0.0)
-                .child(
-                    text(format!("{}{}", item.name, if item.dir { "/" } else { "" }))
-                        .font(mono(FS, if selected { 700.0 } else { 400.0 }))
-                        .color(if selected { ink.fg } else { ink.row })
-                        .truncate(),
-                )
-                .children(under_root.then(|| {
-                    t(
-                        format!(" {}", clip_path(&format!("{}", s.ui.root().display()), 24)),
-                        ink.faint,
-                    )
-                })),
+                .truncate(),
         )
         .child(
             t(label.verdict.tag(), color_of(label.verdict.color())).w(VERDICT_W),
@@ -775,13 +767,12 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize) -> El {
             text(pct(share, scope))
                 .font(mono(FS, 400.0))
                 .color(if selected { ink.muted } else { ink.faint })
-                .w(PCT_W)
-                .align(Align::End),
+                .w(PCT_W),
         )
         .child(
             text(days.map(cats::short_age).unwrap_or_default())
                 .font(mono(FS, 400.0))
-                .color(if stale { ink.amber } else { ink.faint })
+                .color(if stale { ink.amber } else if selected { ink.muted } else { ink.faint })
                 .w(AGE_W)
                 .align(Align::End),
         )
