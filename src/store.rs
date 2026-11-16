@@ -15,6 +15,39 @@ use crate::model::Project;
 /// Longest list the detail pane draws.
 pub const MAX_ROWS: usize = 150;
 
+/// What the list is narrowed to. "All" is the default view and the only one where a row is
+/// unambiguously the whole project; the categories below it filter that same list down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    All,
+    Only(Cat),
+}
+
+impl Filter {
+    pub fn cat(self) -> Option<Cat> {
+        match self {
+            Filter::All => None,
+            Filter::Only(c) => Some(c),
+        }
+    }
+
+    /// The colour the view accents with. "All" is not a disk category, so it takes the
+    /// neutral foreground rather than borrowing one category's hue.
+    pub fn color(self) -> cats::Rgb {
+        match self {
+            Filter::All => [230, 230, 230],
+            Filter::Only(c) => c.color(),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Filter::All => "All projects",
+            Filter::Only(c) => c.name(),
+        }
+    }
+}
+
 /// How the detail pane orders its rows. Clicking a column header sets one of these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sort {
@@ -39,9 +72,9 @@ impl Sort {
 const MAX_DEPTH: usize = 12;
 
 pub struct Ui {
-    /// The category the detail pane shows.
-    pub selected: Cat,
-    /// The category under the pointer, in the meter or the category column.
+    /// What the list is narrowed to: everything, or one category.
+    pub filter: Filter,
+    /// The category under the pointer, in the meter or the filter column.
     pub hover: Option<Cat>,
     /// The highlighted row in the detail pane.
     pub row: usize,
@@ -73,7 +106,7 @@ pub struct Ui {
 impl Ui {
     pub fn new(root: PathBuf) -> Self {
         Self {
-            selected: Cat::Source,
+            filter: Filter::All,
             hover: None,
             row: 0,
             stack: Vec::new(),
@@ -113,11 +146,14 @@ impl Ui {
 
     /// How much of a row belongs to the category being viewed. At the top level that is the
     /// project's slice of it; inside a folder it is the folder's own size.
+    /// How much of a row the current filter keeps. Under "All" that is the whole project;
+    /// under a category it is only that category's slice of it.
     pub fn share(&self, item: &Item, projects: &[Project]) -> u64 {
         if self.stack.is_empty() {
-            return match self.project(&item.name, projects) {
-                Some(p) => self.selected.bytes(p),
-                None => item.size,
+            return match (self.filter.cat(), self.project(&item.name, projects)) {
+                (Some(cat), Some(p)) => cat.bytes(p),
+                (None, Some(_)) => item.size,
+                _ => item.size,
             };
         }
         item.size
@@ -138,6 +174,7 @@ impl Ui {
                 .map(|p| Item::folder(self.root.join(&p.name), p.name.clone(), p.bytes))
                 .filter(|i| self.share(i, projects) > 0)
                 .collect();
+            let _ = &mut rows;
             rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
             rows
         } else {
@@ -213,9 +250,10 @@ impl Ui {
     /// What a row is, and why.
     pub fn label(&self, item: &Item, projects: &[Project]) -> cats::Label {
         if self.stack.is_empty() {
-            return match self.project(&item.name, projects) {
-                Some(p) => cats::classify_project(p, self.selected),
-                None => cats::classify(&item.name, item.dir, None),
+            return match (self.filter.cat(), self.project(&item.name, projects)) {
+                (Some(cat), Some(p)) => cats::classify_project(p, cat),
+                (None, Some(p)) => cats::classify_row(p),
+                _ => cats::classify(&item.name, item.dir, None),
             };
         }
         // Inside a project, a folder's age is the project's: git knows when work last happened.
@@ -245,7 +283,10 @@ impl Ui {
     pub fn scope_size(&self, projects: &[Project]) -> u64 {
         match self.stack.last() {
             Some(top) => top.size,
-            None => self.category_sizes(projects)[cat_index(self.selected)],
+            None => match self.filter.cat() {
+                Some(cat) => self.category_sizes(projects)[cat_index(cat)],
+                None => self.total(projects),
+            },
         }
     }
 
@@ -278,13 +319,13 @@ impl Ui {
         self.hover = hover;
     }
 
-    pub fn select(&mut self, cat: Cat) {
-        if cat == self.selected && self.stack.is_empty() {
+    pub fn select(&mut self, filter: Filter) {
+        if filter == self.filter && self.stack.is_empty() {
             return;
         }
         self.cancel_work();
         self.culprits.clear();
-        self.selected = cat;
+        self.filter = filter;
         self.stack.clear();
         self.children.clear();
         self.listing = false;
@@ -737,11 +778,43 @@ mod tests {
     }
 
     #[test]
+    fn all_projects_is_the_default_and_lists_every_folder_at_its_whole_size() {
+        let projects = fixture();
+        let mut ui = Ui::new(PathBuf::from(r"P:\Projects"));
+        assert_eq!(ui.filter, Filter::All, "the window opens showing everything");
+        let rows = ui.entries(&projects);
+        assert_eq!(rows.len(), projects.len(), "every project is listed");
+        // Under All the row, its share and the dot denominator agree: the whole project.
+        for row in &rows {
+            assert_eq!(ui.share(row, &projects), row.size, "{}", row.name);
+        }
+        // And the percentages of the disk add up to 100.
+        let total: u64 = rows.iter().map(|r| r.size).sum();
+        assert_eq!(total, ui.total(&projects));
+    }
+
+    #[test]
+    fn choosing_a_category_narrows_the_same_list_and_keeping_all_clears_it() {
+        let projects = fixture();
+        let mut ui = Ui::new(PathBuf::from(r"P:\Projects"));
+        let all = ui.entries(&projects).len();
+        ui.select(Filter::Only(Cat::Deps));
+        let filtered = ui.entries(&projects);
+        assert!(filtered.len() < all, "a category shows fewer rows");
+        assert_eq!(ui.filter, Filter::Only(Cat::Deps));
+        // The row keeps its whole size; the share is what the filter keeps.
+        assert_eq!(filtered[0].size, 1000);
+        assert_eq!(ui.share(&filtered[0], &projects), 900);
+        ui.select(Filter::All);
+        assert_eq!(ui.entries(&projects).len(), all, "All restores the list");
+    }
+
+    #[test]
     fn a_category_lists_the_projects_by_that_categories_bytes() {
         let projects = fixture();
         let ui = Ui::new(PathBuf::from(r"P:\Projects"));
         let mut ui = ui;
-        ui.selected = Cat::Deps;
+        ui.filter = Filter::Only(Cat::Deps);
         let rows = ui.entries(&projects);
         assert_eq!(rows[0].name, "heavy-deps");
         // The row is the whole project; its share is the slice of that category, and the
@@ -787,7 +860,7 @@ mod tests {
     fn the_demo_drill_down_lands_on_a_culprit() {
         let projects = fixture();
         let mut ui = Ui::new(PathBuf::from("root"));
-        ui.selected = Cat::Source;
+        ui.filter = Filter::Only(Cat::Source);
         ui.set_row(0);
         ui.open(&projects, true);
         assert_eq!(ui.stack.len(), 1, "the first row opened");
@@ -812,7 +885,7 @@ mod tests {
     /// A drill-down four folders deep, the way a click path goes.
     fn deep_ui(projects: &[Project]) -> Ui {
         let mut ui = Ui::new(PathBuf::from("root"));
-        ui.selected = Cat::Source;
+        ui.filter = Filter::Only(Cat::Source);
         for _ in 0..4 {
             match ui.entries(projects).iter().position(|i| i.dir) {
                 Some(k) => {
@@ -850,7 +923,7 @@ mod tests {
     fn going_back_restores_the_category_list() {
         let projects = fixture();
         let mut ui = Ui::new(PathBuf::from("root"));
-        ui.selected = Cat::Source;
+        ui.filter = Filter::Only(Cat::Source);
         ui.open(&projects, true);
         assert_eq!(ui.stack.len(), 1);
         ui.back(&projects, true);
@@ -863,7 +936,7 @@ mod tests {
     fn junk_only_keeps_the_rows_worth_looking_at() {
         let projects = fixture();
         let mut ui = Ui::new(PathBuf::from("root"));
-        ui.selected = Cat::Source;
+        ui.filter = Filter::Only(Cat::Source);
         let all = ui.entries(&projects).len();
         ui.toggle_junk_only();
         let only = ui.entries(&projects);

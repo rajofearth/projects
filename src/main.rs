@@ -218,9 +218,14 @@ impl State {
 
     // ---- pointer actions -----------------------------------------------------
 
-    /// Shows a category in the detail pane, back at its top level.
+    /// Narrows the list to a category, or to everything, back at its top level.
     pub fn pick(&mut self, cat: cats::Cat) {
-        self.ui.select(cat);
+        self.ui.select(store::Filter::Only(cat));
+    }
+
+    /// Shows every project again.
+    pub fn filter_to(&mut self, filter: store::Filter) {
+        self.ui.select(filter);
     }
 
     /// Opens the highlighted folder and measures what is inside.
@@ -275,8 +280,9 @@ impl State {
                     fraction: (bytes as f64 / total as f64).min(1.0) as f32,
                 })
                 .collect(),
+            // Nothing is "the" segment under "All"; a filter lights only its own band.
             hover: self.ui.hover.or(match self.ui.stack.is_empty() {
-                true => Some(self.ui.selected),
+                true => self.ui.filter.cat(),
                 false => None,
             }),
             scanning: self.scanning,
@@ -565,7 +571,7 @@ mod tests {
         let mut rt = demo_runtime();
         rt.update(|s, _| s.pick(cats::Cat::Build));
         rt.frame(0.0);
-        assert_eq!(rt.state.ui.selected, cats::Cat::Build);
+        assert_eq!(rt.state.ui.filter, store::Filter::Only(cats::Cat::Build));
         let entries = rt.state.ui.entries(&rt.state.projects);
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         let want: Vec<String> = rt
@@ -816,8 +822,8 @@ mod tests {
         }
         assert!(picked.is_some(), "some column of the meter is a segment");
         assert_eq!(
-            rt.state.ui.selected,
-            picked.unwrap(),
+            rt.state.ui.filter,
+            store::Filter::Only(picked.unwrap()),
             "the click picked what the pointer was over"
         );
     }

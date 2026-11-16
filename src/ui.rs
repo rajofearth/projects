@@ -334,7 +334,7 @@ fn meter(s: &State, _cx: &mut Cx<State>) -> El {
 // ---- left column: categories ----------------------------------------------
 
 fn category_line(s: &State, ink: &Ink, category: &cats::Category, sizes: &[u64; 4], largest: u64) -> El {
-    let selected = s.ui.selected == category.id;
+    let selected = s.ui.filter.cat() == Some(category.id);
     let dimmed = s.ui.hover.is_some() && s.ui.hover != Some(category.id) && !selected;
     let bytes = sizes[store::cat_index(category.id)];
     let fraction = if largest > 0 {
@@ -469,6 +469,39 @@ fn quick_wins(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
         .child(row_for(Cat::Build, "build output", sizes[2]))
 }
 
+/// The whole disk in one row: the default view, and the way back out of any filter.
+fn all_line(s: &State, ink: &Ink, sizes: &[u64; 4]) -> El {
+    let active = s.ui.filter.cat().is_none();
+    let total: u64 = sizes.iter().sum();
+    row()
+        .key("filter/all")
+        .w_full()
+        .h(FS * 2.0)
+        .px(ch(0.5))
+        .radius(4.0)
+        .items_center()
+        .gap(ch(0.6))
+        .cursor(Cursor::Pointer)
+        .fill(if active { ink.picked } else { Color::TRANSPARENT })
+        .hover(ink.hover)
+        .on_press(|s: &mut State| s.filter_to(store::Filter::All))
+        .child(tb(if active { "·" } else { "" }, ink.fg).w(MARK_W))
+        .child(t("□", if active { ink.fg } else { ink.muted }).w(ch(1.0)))
+        .child(
+            text("All projects")
+                .font(mono(FS, if active { 700.0 } else { 400.0 }))
+                .color(if active { ink.fg } else { ink.row })
+                .w(ch(12.0)),
+        )
+        .child(
+            text(model::gb(total))
+                .font(mono(FS, if active { 700.0 } else { 400.0 }))
+                .color(if active { ink.fg } else { ink.muted })
+                .w(ch(9.0))
+                .align(Align::End),
+        )
+}
+
 fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
     let largest = sizes.iter().copied().max().unwrap_or(0);
     col()
@@ -477,10 +510,11 @@ fn categories(s: &State, ink: &Ink, sizes: &[u64; 4], width: f32) -> El {
         .shrink()
         .gap(ch(0.2))
         .child(
-            t("categories", ink.faint)
+            t("filter by", ink.faint)
                 .pl(ch(2.0))
                 .pb(ch(0.4)),
         )
+        .child(all_line(s, ink, sizes))
         .children(
             CATEGORIES
                 .iter()
@@ -536,12 +570,13 @@ fn crumb(
 }
 
 fn breadcrumb(s: &State, ink: &Ink) -> El {
-    let category = s.ui.selected.category();
+    // The trail starts at whatever the list is showing: every project, or one category.
+    let accent = s.ui.filter.color();
     let depth = s.ui.stack.len();
     let mut bar = row().items_center().shrink().gap(ch(0.15));
     bar = bar.child(crumb(
-        category.name.to_string(),
-        color_of(category.color),
+        s.ui.filter.name().to_string(),
+        color_of(accent),
         ink,
         depth == 0,
         0,
@@ -551,7 +586,7 @@ fn breadcrumb(s: &State, ink: &Ink) -> El {
         bar = bar.child(t("/", ink.faint).px(ch(0.3)));
         bar = bar.child(crumb(
             format!("{}{}", level.name, if level.dir { "/" } else { "" }),
-            if last { color_of(category.color) } else { ink.muted },
+            if last { color_of(accent) } else { ink.muted },
             ink,
             last,
             i + 1,
@@ -561,7 +596,7 @@ fn breadcrumb(s: &State, ink: &Ink) -> El {
 }
 
 fn inside_header(s: &State, ink: &Ink, total: u64) -> El {
-    let category = s.ui.selected.category();
+    let category = s.ui.filter.cat().unwrap_or(cats::Cat::Source).category();
     let scope = s.ui.scope_size(&s.projects);
     row()
         .w_full()
@@ -591,7 +626,11 @@ fn inside_header(s: &State, ink: &Ink, total: u64) -> El {
 fn blurb_line(s: &State, ink: &Ink) -> El {
     let line = match s.ui.stack.last() {
         Some(level) => level.path.display().to_string(),
-        None => s.ui.selected.category().blurb.to_string(),
+        None => match s.ui.filter.cat() {
+            Some(cat) => cat.category().blurb.to_string(),
+            None => "Every project under this folder. Pick a category to narrow it down."
+                .to_string(),
+        },
     };
     row()
         .w_full()
@@ -621,7 +660,7 @@ fn item_line(ctx: &Ctx, item: &Item, index: usize, max: u64) -> El {
     let s = ctx.s;
     let ink = ctx.ink;
     let selected = s.ui.row == index;
-    let category = s.ui.selected.category();
+    let category = s.ui.filter.cat().unwrap_or(cats::Cat::Source).category();
     let label = s.ui.label(item, &s.projects);
     let days = project_age(s, item);
     let stale = days.is_some_and(|d| d > 180);
@@ -808,7 +847,7 @@ fn item_details(ctx: &Ctx, item: &Item) -> El {
         Verdict::Unused => "probably unused".to_string(),
         other => other.tag().to_string(),
     };
-    let category = s.ui.selected.category();
+    let category = s.ui.filter.cat().unwrap_or(cats::Cat::Source).category();
     let share = s.ui.share(item, &s.projects);
     let mut body = col()
         .w_full()
