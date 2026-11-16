@@ -36,6 +36,8 @@ const SIZE_W: f32 = FS * 8.0;
 const PCT_W: f32 = FS * 4.5;
 const AGE_W: f32 = FS * 6.0;
 const GAP: f32 = FS * 0.9;
+/// The preview strip under the list: tall enough for verdict, blame and actions.
+const PREVIEW_H: f32 = FS * 6.2;
 
 /// The port's palette, decoded once per view.
 struct Ink {
@@ -806,22 +808,42 @@ fn item_details(ctx: &Ctx, item: &Item) -> El {
         Verdict::Unused => "probably unused".to_string(),
         other => other.tag().to_string(),
     };
+    let category = s.ui.selected.category();
+    let share = s.ui.share(item, &s.projects);
     let mut body = col()
         .w_full()
         .pl(ch(4.0))
         .gap(ch(0.1))
-        .children(
-            (!label.reason.is_empty() || label.verdict != Verdict::Yours).then(|| {
-                row()
-                    .h(FS * 1.45)
-                    .items_center()
-                    .child(tb(verdict_name, color_of(label.verdict.color())))
-                    .children((!label.reason.is_empty()).then(|| {
-                        t(format!("· {}", label.reason), ink.muted)
-                            .pl(ch(1.0))
-                            .truncate()
-                    }))
-            }),
+        .child(
+            // Which folder, and how the size column splits: the row's total first, then the
+            // slice this category is, so the two numbers on screen can be told apart.
+            row()
+                .h(FS * 1.45)
+                .items_center()
+                .gap(ch(0.8))
+                .child(tb(
+                    format!("{}{}", item.name, if item.dir { "/" } else { "" }),
+                    ink.fg,
+                ))
+                .child(tb(model::gb(item.size), ink.fg))
+                .children((s.ui.stack.is_empty() && share != item.size).then(|| {
+                    row()
+                        .items_center()
+                        .gap(ch(0.6))
+                        .child(t("■", color_of(category.color)))
+                        .child(t(
+                            format!("{} in {}", model::gb(share), category.name),
+                            ink.muted,
+                        ))
+                }))
+                .children((!label.reason.is_empty() || label.verdict != Verdict::Yours).then(|| {
+                    row()
+                        .items_center()
+                        .child(tb(verdict_name, color_of(label.verdict.color())))
+                        .children((!label.reason.is_empty()).then(|| {
+                            t(format!("· {}", label.reason), ink.muted).pl(ch(1.0))
+                        }))
+                })),
         );
 
     if pending {
@@ -902,6 +924,46 @@ fn dots_width() -> f32 {
     DOTS as f32 * dot + (DOTS as f32 - 1.0) * gap
 }
 
+/// The strip under the list: what the selected row is, where its space is, and what to do
+/// with it. Always in the same place, so selecting rows never moves the list.
+fn preview(ctx: &Ctx, entries: &[Item], selected: usize) -> El {
+    let s = ctx.s;
+    let ink = ctx.ink;
+    let Some(item) = entries.get(selected).or_else(|| entries.first()) else {
+        return el().key("preview").h(PREVIEW_H);
+    };
+    col()
+        .key("preview")
+        .w_full()
+        .h(PREVIEW_H)
+        .gap(ch(0.1))
+        .pt(ch(0.5))
+        .child(item_details(ctx, item))
+        .children(
+            // Filler so the strip keeps its height on rows with nothing to blame.
+            (item_details_lines(ctx, item) < 3).then(|| el().grow(1.0)),
+        )
+}
+
+/// How many lines `item_details` draws for a row, so the strip can hold its height.
+fn item_details_lines(ctx: &Ctx, item: &Item) -> usize {
+    let s = ctx.s;
+    let label = s.ui.label(item, &s.projects);
+    let culprit = s.ui.culprit(item, &s.projects);
+    let mut lines = 1; // the action row
+    if !label.reason.is_empty() || label.verdict != Verdict::Yours {
+        lines += 1;
+    }
+    if s.ui.culprit_pending(item)
+        || culprit
+            .as_ref()
+            .is_some_and(|c| !c.chain.is_empty() || c.top.len() > 1)
+    {
+        lines += 1;
+    }
+    lines
+}
+
 fn empty(s: &State, ink: &Ink) -> El {
     let line = if s.ui.listing {
         "measuring what is inside…"
@@ -932,13 +994,14 @@ fn inside(ctx: &Ctx) -> El {
         .key("rows")
         .w_full()
         .gap(ch(0.15))
-        .children(entries.iter().enumerate().map(|(index, item)| {
-            let mut block = col().w_full().child(item_line(ctx, item, index, max));
-            if index == selected {
-                block = block.child(item_details(ctx, item));
-            }
-            block
-        }));
+        // Every row is one line, always: the selected row's detail lives in the preview strip
+        // below the list, in the same place for every row, instead of pushing the list around.
+        .children(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, item)| item_line(ctx, item, index, max).into()),
+        );
 
     rows = rows.children((all.len() > store::MAX_ROWS).then(|| {
         t(format!("… and {} smaller", all.len() - store::MAX_ROWS), ink.faint)
@@ -998,6 +1061,8 @@ fn inside(ctx: &Ctx) -> El {
                 .child(rows),
         );
     }
+    // Fixed, below the list: clicking a row fills this in, it never reflows the list.
+    list = list.child(preview(ctx, &entries, selected));
     list.key("inside")
 }
 

@@ -638,6 +638,43 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_row_never_moves_the_list() {
+        let mut rt = demo_runtime();
+        let row_rects = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
+            let mut v: Vec<(usize, [f32; 4])> = rt
+                .elements()
+                .into_iter()
+                .filter_map(|e| {
+                    let k = e.key?;
+                    let n = k.strip_prefix("row/")?.parse::<usize>().ok()?;
+                    Some((n, e.rect))
+                })
+                .collect();
+            v.sort_by_key(|(n, _)| *n);
+            v.into_iter().map(|(_, r)| r).collect()
+        };
+        let before = row_rects(&rt);
+        assert!(!before.is_empty(), "the demo lists rows");
+        // Pick a row two down, then one further, and the list must stay put both times.
+        for row in [1usize, 2] {
+            rt.update(move |s, _| s.ui.set_row(row));
+            rt.frame(0.0);
+            let after = row_rects(&rt);
+            assert_eq!(
+                before, after,
+                "picking row {row} moved the rows it was picked from"
+            );
+        }
+        // The detail lives in its own strip, below the list.
+        let (strip, _) = rt.presented("preview").expect("the preview strip is laid out");
+        let last = before.last().unwrap();
+        assert!(
+            strip[1] >= last[1],
+            "the strip sits under the rows: {strip:?} vs {last:?}"
+        );
+    }
+
+    #[test]
     fn every_header_sits_over_the_column_it_names() {
         let rt = demo_runtime();
         // Find the header by its label and the row cell by the text it shows.
