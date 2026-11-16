@@ -47,8 +47,12 @@ lucide!(DOWN, "chevron-down", r#"<path d="m6 9 6 6 6-6"/>"#);
 lucide!(CHEVRON_RIGHT, "chevron-right", r#"<path d="m9 18 6-6-6-6"/>"#);
 lucide!(CHECK, "check", r#"<path d="M20 6 9 17l-5-5"/>"#);
 lucide!(LINK, "link", r#"<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>"#);
-lucide!(ROUTE, "route", r#"<circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/>"#);
 lucide!(MORE, "ellipsis", r#"<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>"#);
 lucide!(KEYBOARD, "keyboard", r#"<path d="M10 8h.01"/><path d="M12 12h.01"/><path d="M14 8h.01"/><path d="M16 12h.01"/><path d="M18 8h.01"/><path d="M6 8h.01"/><path d="M7 16h10"/><path d="M8 12h.01"/><rect width="20" height="16" x="2" y="4" rx="2"/>"#);
 lucide!(CODE, "code", r#"<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>"#);
 lucide!(ALERT, "circle-alert", r#"<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>"#);
+// Provider marks for the usage page: plain line glyphs, not the vendors' logos.
+lucide!(P_CLAUDE, "asterisk", r#"<path d="M12 6v12"/><path d="M17.196 9 6.804 15"/><path d="m6.804 9 10.392 6"/>"#);
+lucide!(P_CODEX, "hexagon", r#"<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>"#);
+lucide!(P_OPENCODE, "square-code", r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/>"#);
+lucide!(P_PI, "pi", r#"<line x1="9" x2="9" y1="4" y2="20"/><path d="M4 7c0-1.7 1.3-3 3-3h13"/><path d="M18 20c-1.7 0-3-1.3-3-3V4"/>"#);

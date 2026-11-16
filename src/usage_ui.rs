@@ -1,43 +1,46 @@
-//! The usage page: tokens and cost from the coding agents' local logs. Totals with their
-//! change, thirty days as a segment chart (the meter's lit-segment look), breakdowns by
-//! provider, model and project, and what the prices say about which model to use for what.
-//! The logs are read on a worker thread, the way the scan is.
+//! The usage page, after t3code's usage view: a hero total with its providers, a daily line
+//! chart with a hover crosshair, the token totals, the split by type and a breakdown by model
+//! or day. One range control and one Cost / Tokens switch drive all of it. The logs are read
+//! on a worker thread, the way the scan is.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 
-use rune::{col, el, icon, row, Align, Color, El, ScrollSpec, Waker};
+use rune::{canvas, col, el, icon, row, Align, Color, El, Icon, LineCap, ScrollSpec, Shape, Waker};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl, Spinner};
 
 use crate::fmt::{count, usd};
 use crate::icons;
 use crate::shell;
-use crate::ui::{bar, card, data, label, Ink, S1, S2, S3, S4, S5, S6};
+use crate::ui::{card, data, label, rgb, Ink, R_CTRL, S1, S2, S3, S4, S5, S6, S8};
 use crate::usage::{self, Usage};
 use crate::State;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Range {
+    Day,
     Week,
     Month,
-    All,
+    Quarter,
 }
 
 impl Range {
-    const ALL: [Range; 3] = [Range::Week, Range::Month, Range::All];
+    const ALL: [Range; 4] = [Range::Day, Range::Week, Range::Month, Range::Quarter];
     fn days(self) -> i64 {
         match self {
+            Range::Day => 1,
             Range::Week => 7,
             Range::Month => 30,
-            Range::All => i64::MAX / 4,
+            Range::Quarter => 90,
         }
     }
     fn label(self) -> &'static str {
         match self {
+            Range::Day => "Past 24h",
             Range::Week => "7 days",
             Range::Month => "30 days",
-            Range::All => "All time",
+            Range::Quarter => "90 days",
         }
     }
 }
@@ -54,6 +57,10 @@ pub struct UsageState {
     pub loaded: bool,
     pub range: Range,
     pub metric: Metric,
+    /// The breakdown lists days instead of models.
+    pub by_day: bool,
+    /// The chart column under the pointer.
+    pub hover: Option<usize>,
     /// The demo scene reads the fixture instead of the logs.
     pub demo: bool,
     rx: Option<Receiver<Vec<Usage>>>,
@@ -67,6 +74,8 @@ impl UsageState {
             loaded: false,
             range: Range::Month,
             metric: Metric::Cost,
+            by_day: false,
+            hover: None,
             demo: false,
             rx: None,
         }
@@ -176,35 +185,47 @@ pub fn today() -> i64 {
 
 // ---- figures ---------------------------------------------------------------
 
-fn tokens(u: &Usage) -> u64 {
-    u.input + u.output + u.cache_read + u.cache_write
-}
-
 #[derive(Default, Clone, Copy)]
 struct Sum {
     tokens: u64,
-    /// Uncached input.
+    sessions: u64,
+    /// Uncached input, cached input (cache reads), cache writes, output (reasoning included).
     input: u64,
-    /// Cached input (cache reads).
     cache_read: u64,
-    /// Cache writes (5-minute and 1-hour combined).
     cache_write: u64,
-    /// Output, including reasoning tokens.
     output: u64,
     cost: f64,
+    c_input: f64,
+    c_cache_read: f64,
+    c_cache_write: f64,
+    c_output: f64,
+    c_other: f64,
+    /// What the cache reads would have cost at the uncached input rate, less what they cost.
+    savings: f64,
     /// Some tokens had no price.
     unpriced: bool,
+    provider: &'static str,
 }
 
 impl Sum {
     fn add(&mut self, u: &Usage) {
-        self.tokens += tokens(u);
+        self.tokens += u.input + u.output + u.cache_read + u.cache_write;
+        self.sessions += u.sessions as u64;
         self.input += u.input;
         self.cache_read += u.cache_read;
         self.cache_write += u.cache_write;
         self.output += u.output;
         self.cost += u.cost_usd;
+        self.c_input += u.cost_input;
+        self.c_cache_read += u.cost_cache_read;
+        self.c_cache_write += u.cost_cache_write;
+        self.c_output += u.cost_output;
+        self.c_other += u.cost_other;
+        if u.input > 0 && u.cost_input > 0.0 {
+            self.savings += (u.cache_read as f64 * u.cost_input / u.input as f64 - u.cost_cache_read).max(0.0);
+        }
         self.unpriced |= !u.priced;
+        self.provider = u.provider;
     }
     fn value(&self, m: Metric) -> f64 {
         match m {
@@ -212,29 +233,30 @@ impl Sum {
             Metric::Tokens => self.tokens as f64,
         }
     }
-    /// The input / cached / cache write / output split, for totals and breakdowns.
-    fn mix(&self) -> String {
-        format!(
-            "in {} · cached {} · cache write {} · out {}",
-            count(self.input),
-            count(self.cache_read),
-            count(self.cache_write),
-            count(self.output),
-        )
-    }
-    /// Cost, or "unpriced" when the total is zero only because a model has no price.
-    fn cost_label(&self) -> String {
-        if self.cost == 0.0 && self.unpriced {
-            "unpriced".into()
-        } else {
-            usd(self.cost)
-        }
+}
+
+fn fmt_value(m: Metric, v: f64) -> String {
+    match m {
+        Metric::Cost => usd(v),
+        Metric::Tokens => count(v.max(0.0) as u64),
     }
 }
 
-/// Rows `from` to `to` days back (inclusive), today being 0.
-fn between(rows: &[Usage], now: i64, from: i64, to: i64) -> impl Iterator<Item = &Usage> {
-    rows.iter().filter(move |u| parse_day(&u.day).is_some_and(|d| d <= now - from && d >= now.saturating_sub(to)))
+fn pct(part: f64, whole: f64) -> String {
+    if whole <= 0.0 {
+        return "0%".into();
+    }
+    let p = part / whole * 100.0;
+    if p > 0.0 && p < 0.1 {
+        "<0.1%".into()
+    } else {
+        format!("{p:.1}%")
+    }
+}
+
+/// Rows from `back` days ago through today.
+fn within(rows: &[Usage], now: i64, back: i64) -> impl Iterator<Item = &Usage> {
+    rows.iter().filter(move |u| parse_day(&u.day).is_some_and(|d| d <= now && d > now - back))
 }
 
 fn sum<'a>(it: impl Iterator<Item = &'a Usage>) -> Sum {
@@ -244,470 +266,412 @@ fn sum<'a>(it: impl Iterator<Item = &'a Usage>) -> Sum {
     })
 }
 
-/// Sums grouped by a key, biggest cost first (tokens break ties and order unpriced rows).
-fn group<'a>(it: impl Iterator<Item = &'a Usage>, key: impl Fn(&Usage) -> String) -> Vec<(String, Sum)> {
+/// Sums grouped by a key, biggest by `m` first (tokens break ties).
+fn group<'a>(it: impl Iterator<Item = &'a Usage>, m: Metric, key: impl Fn(&Usage) -> String) -> Vec<(String, Sum)> {
     let mut map: BTreeMap<String, Sum> = BTreeMap::new();
     for u in it {
         map.entry(key(u)).or_default().add(u);
     }
     let mut v: Vec<_> = map.into_iter().filter(|(_, s)| s.tokens > 0).collect();
-    v.sort_by(|a, b| b.1.cost.total_cmp(&a.1.cost).then(b.1.tokens.cmp(&a.1.tokens)));
+    v.sort_by(|a, b| b.1.value(m).total_cmp(&a.1.value(m)).then(b.1.tokens.cmp(&a.1.tokens)));
     v
 }
 
-fn change(now: f64, before: f64) -> Option<f64> {
-    (before > 0.0).then(|| (now - before) / before * 100.0)
-}
-
-// ---- routing ---------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Route {
-    pub model: String,
-    pub tokens: u64,
-    pub cost: f64,
-    /// Dollars per million tokens, cache reads included; `None` when unpriced.
-    pub per_m: Option<f64>,
-    pub tier: Tier,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tier {
-    Premium,
-    Middle,
-    Cheap,
-    Free,
-    Unpriced,
-}
-
-impl Tier {
-    pub fn job(self) -> &'static str {
-        match self {
-            Tier::Premium => "design, integration, review",
-            Tier::Middle => "features with a clear spec",
-            Tier::Cheap => "scoped modules, tests",
-            Tier::Free => "parsers, fixtures, bulk edits",
-            Tier::Unpriced => "no price known",
-        }
+/// The smallest 1 / 2 / 2.5 / 5 × 10ⁿ at or above `v`: the chart's top line.
+fn nice_ceil(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 1.0;
     }
-}
-
-/// Every model with tokens in the range, most expensive per token first, each with the kind
-/// of job its price suits.
-pub fn routes(rows: &[(String, Sum)]) -> Vec<Route> {
-    let mut out: Vec<Route> = rows
-        .iter()
-        .filter(|(_, s)| s.tokens > 0)
-        .map(|(m, s)| Route {
-            model: m.clone(),
-            tokens: s.tokens,
-            cost: s.cost,
-            per_m: (!s.unpriced || s.cost > 0.0).then(|| s.cost / s.tokens as f64 * 1e6),
-            tier: Tier::Unpriced,
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b.per_m.unwrap_or(-1.0).total_cmp(&a.per_m.unwrap_or(-1.0)).then(b.tokens.cmp(&a.tokens))
-    });
-    let paid: Vec<f64> = out.iter().filter_map(|r| r.per_m).filter(|p| *p > 0.0).collect();
-    let top = paid.first().copied().unwrap_or(0.0);
-    let bottom = paid.last().copied().unwrap_or(0.0);
-    for r in &mut out {
-        r.tier = match r.per_m {
-            None => Tier::Unpriced,
-            Some(p) if p <= 0.0 => Tier::Free,
-            Some(p) if paid.len() == 1 || p >= top * 0.5 => Tier::Premium,
-            Some(p) if p <= bottom * 1.5 => Tier::Cheap,
-            Some(_) => Tier::Middle,
-        };
-    }
-    out
-}
-
-/// One or two sentences from the routes: how far apart the prices are and where work goes.
-pub fn advice(routes: &[Route]) -> String {
-    let premium = routes.iter().find(|r| r.tier == Tier::Premium);
-    let cheap = routes.iter().rev().find(|r| r.tier == Tier::Cheap || r.tier == Tier::Middle);
-    let free = routes.iter().find(|r| r.tier == Tier::Free);
-    let spend: f64 = routes.iter().map(|r| r.cost).sum();
-    match (premium, cheap) {
-        (Some(p), Some(c)) => {
-            let ratio = p.per_m.unwrap_or(0.0) / c.per_m.unwrap_or(1.0).max(1e-9);
-            let share = if spend > 0.0 { p.cost / spend * 100.0 } else { 0.0 };
-            let mut line = format!(
-                "{} costs {:.0}\u{00d7} {} per token and took {:.0}% of spend. Keep it for design, integration and review; hand scoped modules to {}.",
-                short_model(&p.model),
-                ratio.max(1.0),
-                short_model(&c.model),
-                share,
-                short_model(&c.model)
-            );
-            if let Some(f) = free {
-                line.push_str(&format!(" Parsers and fixtures can go to {}, which is free.", short_model(&f.model)));
-            }
-            line
-        }
-        (Some(p), None) => match free {
-            Some(f) => format!(
-                "Only {} is paid here. Keep it for design and review; send parsers and fixtures to {}, which is free.",
-                short_model(&p.model),
-                short_model(&f.model)
-            ),
-            None => format!("Everything ran on {}. A cheaper model could take the scoped modules.", short_model(&p.model)),
-        },
-        _ => "Not enough priced usage in this range to compare models.".into(),
-    }
+    let mag = 10f64.powf(v.log10().floor());
+    [1.0, 2.0, 2.5, 5.0, 10.0].iter().map(|f| f * mag).find(|t| *t >= v).unwrap_or(10.0 * mag)
 }
 
 /// "claude-opus-4-1-20250805" → "claude-opus-4-1".
 pub fn short_model(m: &str) -> String {
-    let parts: Vec<&str> = m.split('-').collect();
-    let keep: Vec<&str> = parts.iter().copied().filter(|p| !(p.len() == 8 && p.chars().all(|c| c.is_ascii_digit()))).collect();
-    keep.join("-")
+    m.split('-').filter(|p| !(p.len() == 8 && p.chars().all(|c| c.is_ascii_digit()))).collect::<Vec<_>>().join("-")
+}
+
+/// A provider's name, mark and series colour.
+fn provider(p: &str) -> (String, &'static Icon, Color) {
+    match p {
+        "claude" => ("Claude Code".into(), &icons::P_CLAUDE, rgb([222, 128, 92])),
+        "codex" => ("Codex".into(), &icons::P_CODEX, rgb([214, 214, 220])),
+        "opencode" => ("OpenCode".into(), &icons::P_OPENCODE, rgb([96, 165, 250])),
+        "pi" => ("Pi".into(), &icons::P_PI, rgb([110, 208, 140])),
+        other => (other.to_string(), &icons::CODE, rgb([160, 160, 166])),
+    }
 }
 
 // ---- view ------------------------------------------------------------------
 
-fn stat(ink: &Ink, key: &str, title: &str, s: Sum, delta: Option<(f64, &str)>) -> El {
-    card(ink)
-        .key(format!("stat/{key}"))
-        .grow(1.0)
-        .min_w(0.0)
-        .h(116.0)
-        .padding(S4)
-        .gap(S1)
-        .child(label(title, 12.0, 400.0, ink.faint))
-        .child(
-            row()
-                .w_full()
-                .items_end()
-                .gap(S2)
-                .child(data(s.cost_label(), 24.0, ink.fg).shrink())
-                .child(el().grow(1.0))
-                .children(delta.map(|(pct, vs)| {
-                    let up = pct >= 0.0;
-                    col()
-                        .items_end()
-                        .gap(1.0)
-                        .child(data(format!("{}{:.0}%", if up { "+" } else { "\u{2212}" }, pct.abs()), 12.0, ink.muted))
-                        .child(data(format!("vs {vs}"), 10.5, ink.faint))
-                })),
-        )
-        .child(
-            row()
-                .w_full()
-                .gap(S2)
-                .items_center()
-                .child(data(format!("{} tokens", count(s.tokens)), 11.0, ink.muted))
-                .children(s.unpriced.then(|| {
-                    data("+ unpriced", 11.0, ink.faint).help("Some tokens ran on models with no known price, so the cost undercounts them")
-                })),
-        )
-        .child(
-            data(s.mix(), 10.5, ink.faint)
-                .truncate()
-                .help("Uncached input / cached input / cache writes (5m + 1h) / output. Reasoning is inside output and is not billed twice."),
-        )
+fn section(title: &str, ink: &Ink) -> El {
+    label(title, 13.0, 500.0, ink.fg)
 }
 
-const SEGMENTS: usize = 24;
-
-fn chart(s: &State, ink: &Ink, k: &Kit, now: i64) -> El {
-    let u = &s.usage;
-    let metric = u.metric;
-    let mut per_day: BTreeMap<i64, Sum> = BTreeMap::new();
-    for r in between(&u.rows, now, 0, 29) {
-        if let Some(d) = parse_day(&r.day) {
-            per_day.entry(d).or_default().add(r);
-        }
-    }
-    let max = per_day.values().map(|v| v.value(metric)).fold(0.0, f64::max);
-    let peak_day = per_day.iter().max_by(|a, b| a.1.value(metric).total_cmp(&b.1.value(metric))).map(|(d, _)| *d);
-    let total: f64 = per_day.values().map(|v| v.value(metric)).sum();
-    let fmt_v = |v: f64| match metric {
-        Metric::Cost => usd(v),
-        Metric::Tokens => count(v as u64),
-    };
-    let unlit = Color::WHITE.alpha(0.05);
-    let columns = (0..30).map(|i| {
-        let day = now - 29 + i;
-        let v = per_day.get(&day).copied().unwrap_or_default();
-        let value = v.value(metric);
-        let lit = if max > 0.0 && value > 0.0 { ((value / max) * SEGMENTS as f64).ceil().max(1.0) as usize } else { 0 };
-        let color = if day == now { ink.accent } else { ink.fg.alpha(if Some(day) == peak_day { 0.85 } else { 0.5 }) };
-        col()
-            .key(format!("day/{i}"))
-            .grow(1.0)
-            .min_w(0.0)
-            .h_full()
-            .gap(2.0)
-            .hover(Color::WHITE.alpha(0.03))
-            .radius(3.0)
-            .help(format!(
-                "{} · {} · {} tokens{} · {}",
-                if day == now { "Today".into() } else { short_date(day) },
-                v.cost_label(),
-                count(v.tokens),
-                if v.unpriced { " · some unpriced" } else { "" },
-                v.mix()
-            ))
-            .children((0..SEGMENTS).rev().map(move |seg| {
-                el().w_full().grow(1.0).min_h(2.0).radius(1.5).fill(if seg < lit { color } else { unlit })
-            }))
-    });
-    let axis = (0..30).map(|i| {
-        let day = now - 29 + i;
-        let show = i % 7 == 1 || day == now;
-        el().grow(1.0).min_w(0.0).child(
-            data(if day == now { "today".into() } else if show { short_date(day) } else { String::new() }, 10.5, ink.faint)
-                .align(Align::Center)
-                .w_full(),
-        )
-    });
-    let picks = ["Cost", "Tokens"];
-    card(ink)
-        .key("chart")
-        .grow(1.0)
-        .min_w(0.0)
-        .h_full()
-        .padding(S5)
-        .gap(S4)
+/// The hero total and one line per provider.
+fn summary(ink: &Ink, m: Metric, total: &Sum, providers: &[(String, Sum)]) -> El {
+    let whole = total.value(m);
+    let unit = if m == Metric::Cost { "cost" } else { "tokens" };
+    let sessions = format!("{} session{}", total.sessions, if total.sessions == 1 { "" } else { "s" });
+    col()
+        .key("usage-summary")
+        .w(300.0)
+        .shrink()
+        .gap(S5)
         .child(
-            row()
-                .w_full()
-                .items_center()
-                .gap(S3)
-                .child(
-                    col()
-                        .gap(2.0)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .child(label("Last 30 days", 13.0, 500.0, ink.fg))
-                        .child(data(
-                            format!(
-                                "{} total · peak {}{}",
-                                fmt_v(total),
-                                fmt_v(max),
-                                peak_day.map(|d| format!(" on {}", short_date(d))).unwrap_or_default()
-                            ),
-                            11.0,
-                            ink.faint,
-                        )
-                        .truncate()),
-                )
-                .child(
-                    SegmentedControl::new(&picks, Some(if metric == Metric::Cost { 0 } else { 1 }))
-                        .label("Chart shows")
-                        .fit()
-                        .on_pick(|s: &mut State, i, _| s.usage.metric = if i == 0 { Metric::Cost } else { Metric::Tokens })
-                        .build(k),
-                ),
-        )
-        .child(row().key("bars").w_full().grow(1.0).min_h(120.0).gap(3.0).children(columns))
-        .child(row().w_full().gap(3.0).children(axis))
-}
-
-fn breakdown(ink: &Ink, key: &str, title: &str, groups: &[(String, Sum)], limit: usize) -> El {
-    let max = groups.iter().map(|g| g.1.cost).fold(0.0, f64::max);
-    let max_tokens = groups.iter().map(|g| g.1.tokens).max().unwrap_or(0);
-    card(ink)
-        .key(format!("by/{key}"))
-        .grow(1.0)
-        .min_w(0.0)
-        .padding(S5)
-        .gap(S3)
-        .child(
-            row()
-                .w_full()
-                .items_center()
-                .child(label(title, 13.0, 500.0, ink.fg).grow(1.0))
-                .child(data(groups.len().to_string(), 11.0, ink.faint)),
-        )
-        .children(groups.is_empty().then(|| label("Nothing in this range", 12.0, 400.0, ink.faint)))
-        .children(groups.iter().take(limit).enumerate().map(|(i, (name, s))| {
-            // Bars compare cost, or tokens when nothing here is priced.
-            let f = if max > 0.0 { s.cost / max } else if max_tokens > 0 { s.tokens as f64 / max_tokens as f64 } else { 0.0 };
             col()
-                .key(format!("{key}/{i}"))
+                .gap(S1)
+                .child(label(fmt_value(m, whole), 34.0, 600.0, ink.fg))
+                .child(label(
+                    if m == Metric::Cost && total.unpriced { format!("{sessions} · unpriced models count as $0") } else { sessions },
+                    12.0,
+                    400.0,
+                    ink.faint,
+                )),
+        )
+        .child(col().gap(S4).children(providers.iter().map(|(p, s)| {
+            let (name, glyph, color) = provider(p);
+            let other = match m {
+                Metric::Cost => format!("{} tokens", count(s.tokens)),
+                Metric::Tokens => usd(s.cost),
+            };
+            col()
+                .key(format!("prov/{p}"))
                 .w_full()
-                .gap(6.0)
+                .gap(3.0)
                 .child(
                     row()
                         .w_full()
                         .gap(S2)
                         .items_center()
-                        .child(label(if key == "model" { short_model(name) } else { name.clone() }, 12.0, 400.0, ink.row).grow(1.0).min_w(0.0).truncate())
-                        .child(data(count(s.tokens), 11.0, ink.faint))
-                        .child(
-                            data(
-                                s.cost_label(),
-                                11.0,
-                                if s.cost == 0.0 && s.unpriced { ink.faint } else { ink.fg },
-                            )
-                            .w(56.0)
-                            .align(Align::End),
-                        ),
+                        .child(el().size(6.0, 6.0).radius(3.0).fill(color))
+                        .child(icon(glyph, 13.0).color(color))
+                        .child(label(name, 13.0, 500.0, ink.fg))
+                        .child(label(format!("{} sess.", s.sessions), 11.0, 400.0, ink.faint).truncate().shrink())
+                        .child(el().grow(1.0))
+                        .child(data(fmt_value(m, s.value(m)), 13.0, ink.fg)),
                 )
-                .child(data(s.mix(), 10.5, ink.faint).truncate())
-                .child(bar(f as f32, if i == 0 { ink.fg.alpha(0.8) } else { ink.fg.alpha(0.4) }, ink))
-        }))
-        .children((groups.len() > limit).then(|| data(format!("+{} more", groups.len() - limit), 11.0, ink.faint)))
+                .child(data(format!("{} of {unit} · {other}", pct(s.value(m), whole)), 11.0, ink.faint).pl(28.0))
+        })))
 }
 
-fn routing(ink: &Ink, models: &[(String, Sum)], range: Range, width: f32) -> El {
-    let routes = routes(models);
+const PLOT_H: f32 = 220.0;
+const AXIS_W: f32 = 52.0;
+const TIP_W: f32 = 184.0;
+
+/// One line per provider over the days, with a crosshair and tooltip on the hovered day.
+fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)]) -> El {
+    let m = u.metric;
+    let n = u.range.days().max(7) as usize;
+    let first = now - n as i64 + 1;
+    // series[p][i]: provider p on day first + i.
+    let mut series: Vec<Vec<f64>> = vec![vec![0.0; n]; providers.len()];
+    for r in within(&u.rows, now, n as i64) {
+        let (Some(d), Some(p)) = (parse_day(&r.day), providers.iter().position(|(p, _)| p == r.provider)) else { continue };
+        let v = match m {
+            Metric::Cost => r.cost_usd,
+            Metric::Tokens => (r.input + r.output + r.cache_read + r.cache_write) as f64,
+        };
+        series[p][(d - first) as usize] += v;
+    }
+    let top = nice_ceil(series.iter().flatten().copied().fold(0.0, f64::max));
+    let y = |v: f64| (100.0 - v / top * 100.0) as f32;
+    let mut shape = Shape::new().view_box(n as f32, 100.0);
+    for g in [0.0, 50.0, 100.0] {
+        shape = shape.line([0.0, g], [n as f32, g], 1.0, LineCap::Butt, ink.line);
+    }
+    // Biggest provider last, so it draws on top.
+    for (p, vals) in series.iter().enumerate().rev() {
+        let (_, _, color) = provider(&providers[p].0);
+        let pts: Vec<[f32; 2]> = vals.iter().enumerate().map(|(i, v)| [i as f32 + 0.5, y(*v)]).collect();
+        let mut area = pts.clone();
+        area.push([n as f32 - 0.5, 100.0]);
+        area.push([0.5, 100.0]);
+        shape = shape.fill(area, color.alpha(0.08)).stroke(pts, 1.5, color);
+    }
+    let columns = (0..n).map(|i| {
+        let on = u.hover == Some(i);
+        let tip = on.then(|| {
+            let total: f64 = series.iter().map(|s| s[i]).sum();
+            col()
+                .absolute(if i < n / 2 { S2 } else { -TIP_W - S2 }, S2)
+                .w(TIP_W)
+                .padding(S3)
+                .gap(S1)
+                .fill(ink.raised)
+                .radius(R_CTRL)
+                .border(1.0, ink.line_strong)
+                .child(label(short_date(first + i as i64), 12.0, 500.0, ink.fg).pb(2.0))
+                .children(providers.iter().zip(&series).map(|((p, _), s)| {
+                    let (name, glyph, color) = provider(p);
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .items_center()
+                        .child(icon(glyph, 11.0).color(color))
+                        .child(label(name, 11.5, 400.0, ink.muted).grow(1.0))
+                        .child(data(fmt_value(m, s[i]), 11.5, ink.fg))
+                }))
+                .child(
+                    row()
+                        .w_full()
+                        .pt(S1)
+                        .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
+                        .child(label("Total", 11.5, 400.0, ink.muted).grow(1.0))
+                        .child(data(fmt_value(m, total), 11.5, ink.fg)),
+                )
+        });
+        row()
+            .key(format!("cday/{i}"))
+            .grow(1.0)
+            .min_w(0.0)
+            .h_full()
+            .on_hover_change(move |s: &mut State, inside, _| {
+                if inside {
+                    s.usage.hover = Some(i);
+                } else if s.usage.hover == Some(i) {
+                    s.usage.hover = None;
+                }
+            })
+            .child(el().grow(1.0))
+            .child(el().w(1.0).h_full().fill(if on { ink.line_strong } else { Color::TRANSPARENT }).children(tip))
+            .child(el().grow(1.0))
+    });
+    let ticks = [first, first + n as i64 / 2, now];
+    col()
+        .key("usage-chart")
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(S3)
+        .child(section(if m == Metric::Cost { "Daily cost" } else { "Daily processed tokens" }, ink))
+        .child(
+            row()
+                .w_full()
+                .h(PLOT_H)
+                .child(
+                    col()
+                        .w(AXIS_W)
+                        .h_full()
+                        .pr(S2)
+                        .justify_between()
+                        .items_end()
+                        .children([top, top / 2.0, 0.0].map(|v| data(fmt_value(m, v), 10.5, ink.faint).offset(0.0, if v == top { -6.0 } else if v == 0.0 { 6.0 } else { 0.0 }))),
+                )
+                .child(
+                    el()
+                        .key("plot")
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .h_full()
+                        .child(canvas(shape).w_full().h_full())
+                        .child(row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).children(columns)),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .pl(AXIS_W)
+                .justify_between()
+                .children(ticks.map(|d| data(short_date(d).to_uppercase(), 10.5, ink.faint))),
+        )
+}
+
+fn totals(ink: &Ink, t: &Sum) -> El {
+    let cell = |k: &str, v: String| col().grow(1.0).min_w(0.0).gap(S1).child(label(k, 12.0, 400.0, ink.faint)).child(data(v, 18.0, ink.fg));
     card(ink)
-        .key("routing")
-        .w(width)
-        .shrink()
-        .h_full()
+        .key("usage-totals")
+        .w_full()
         .padding(S5)
         .gap(S3)
+        .child(section("Totals", ink))
         .child(
             row()
-                .gap(S2)
+                .w_full()
+                .gap(S4)
+                .child(cell("Processed tokens", count(t.tokens)))
+                .child(cell("Cached input", count(t.cache_read)))
+                .child(cell("Uncached input", count(t.input)))
+                .child(cell("Output", count(t.output)))
+                .child(cell("Cache savings", usd(t.savings))),
+        )
+}
+
+fn by_type(ink: &Ink, m: Metric, t: &Sum) -> El {
+    let parts: Vec<(&str, f64, Color)> = match m {
+        Metric::Cost => vec![
+            ("Input", t.c_input, ink.fg.alpha(0.35)),
+            ("Cache read", t.c_cache_read, ink.fg.alpha(0.18)),
+            ("Cache write", t.c_cache_write, ink.fg.alpha(0.6)),
+            ("Output", t.c_output, ink.accent),
+            ("Other", t.c_other, ink.fg.alpha(0.9)),
+        ],
+        Metric::Tokens => vec![
+            ("Input", t.input as f64, ink.fg.alpha(0.35)),
+            ("Cache read", t.cache_read as f64, ink.fg.alpha(0.18)),
+            ("Cache write", t.cache_write as f64, ink.fg.alpha(0.6)),
+            ("Output", t.output as f64, ink.accent),
+        ],
+    };
+    card(ink)
+        .key("usage-types")
+        .w_full()
+        .padding(S5)
+        .gap(S3)
+        .child(section(if m == Metric::Cost { "Cost by type" } else { "Tokens by type" }, ink))
+        .child(
+            row().w_full().h(8.0).gap(2.0).radius(4.0).fill(ink.raised).children(
+                parts.iter().filter(|p| p.1 > 0.0).map(|(_, v, c)| el().grow(*v as f32).min_w(3.0).h_full().radius(2.0).fill(*c)),
+            ),
+        )
+        .child(row().w_full().gap(S5).children(parts.iter().map(|(k, v, c)| {
+            row()
+                .gap(6.0)
                 .items_center()
-                .child(icon(&icons::ROUTE, 15.0).color(ink.accent))
-                .child(label("Which model for which job", 13.0, 500.0, ink.fg)),
+                .child(el().size(8.0, 8.0).radius(2.0).fill(*c))
+                .child(label(*k, 12.0, 400.0, ink.muted))
+                .child(data(fmt_value(m, *v), 12.0, ink.fg))
+        })))
+}
+
+const LIMIT: usize = 12;
+
+fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
+    let m = u.metric;
+    let scoped = || within(&u.rows, now, u.range.days());
+    let mut groups = if u.by_day {
+        let mut g = group(scoped(), m, |r| r.day.clone());
+        g.sort_by(|a, b| b.0.cmp(&a.0));
+        g
+    } else {
+        group(scoped(), m, |r| short_model(&r.model))
+    };
+    let whole: f64 = groups.iter().map(|g| g.1.value(m)).sum();
+    let best = groups.iter().map(|g| g.1.value(m)).fold(0.0, f64::max);
+    let more = groups.len().saturating_sub(LIMIT);
+    groups.truncate(LIMIT);
+    let head = |t: &str, w: f32| label(t, 11.5, 400.0, ink.faint).w(w).align(Align::End);
+    card(ink)
+        .key("usage-breakdown")
+        .w_full()
+        .padding(S5)
+        .gap(S2)
+        .child(
+            row().w_full().items_center().child(section("Breakdown", ink).grow(1.0)).child(
+                SegmentedControl::new(&["Model", "Day"], Some(u.by_day as usize))
+                    .label("Breakdown by")
+                    .fit()
+                    .on_pick(|s: &mut State, i, _| s.usage.by_day = i == 1)
+                    .build(k),
+            ),
         )
-        .child(label(advice(&routes), 12.0, 400.0, ink.row).wrap().w_full())
-        .child(el().grow(1.0))
         .child(
             row()
                 .w_full()
-                .gap(S2)
-                .child(label("Model", 11.0, 400.0, ink.faint).grow(1.0))
-                .child(label("per 1M tokens", 11.0, 400.0, ink.faint).align(Align::End))
-                .help("Cost divided by all tokens, cache reads included"),
+                .h(32.0)
+                .items_center()
+                .child(label("#", 11.5, 400.0, ink.faint).w(32.0))
+                .child(label(if u.by_day { "Day" } else { "Model" }, 11.5, 400.0, ink.faint).grow(1.0))
+                .child(head("Cost", 96.0))
+                .child(head("Share", 80.0))
+                .child(head("Tokens", 88.0)),
         )
-        .child(col().w_full().gap(2.0).children(routes.iter().take(4).map(|r| {
-            let rate = match (r.tier, r.per_m) {
-                (Tier::Free, _) => "free".to_string(),
-                (_, Some(p)) => usd(p),
-                (_, None) => "unpriced".to_string(),
-            };
+        .children(groups.iter().enumerate().map(|(i, (key, s))| {
+            let (_, glyph, color) = provider(s.provider);
+            let name = if u.by_day { parse_day(key).map(short_date).unwrap_or_else(|| key.clone()) } else { key.clone() };
+            let frac = if best > 0.0 { (s.value(m) / best) as f32 } else { 0.0 };
+            let unpriced = s.cost == 0.0 && s.unpriced;
             row()
+                .key(format!("brk/{i}"))
                 .w_full()
-                .h(36.0)
-                .gap(S2)
+                .h(48.0)
                 .items_center()
                 .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
+                .child(data((i + 1).to_string(), 12.0, ink.faint).w(32.0))
                 .child(
                     col()
                         .grow(1.0)
                         .min_w(0.0)
-                        .gap(2.0)
-                        .child(data(short_model(&r.model), 12.0, ink.fg).truncate())
-                        .child(label(r.tier.job(), 11.0, 400.0, ink.faint).truncate()),
+                        .gap(6.0)
+                        .child(
+                            row()
+                                .gap(S2)
+                                .items_center()
+                                .children((!u.by_day).then(|| icon(glyph, 12.0).color(color)))
+                                .child(data(name, 13.0, ink.fg).truncate()),
+                        )
+                        .child(
+                            row().w_frac(0.5).h(2.0).child(
+                                el().h_full().w_frac(frac).min_w(2.0).radius(1.0).fill(if u.by_day { ink.accent } else { color }),
+                            ),
+                        ),
                 )
-                .child(
-                    data(rate, 12.0, if r.tier == Tier::Premium { ink.accent } else { ink.muted })
-                        .w(72.0)
-                        .align(Align::End),
-                )
-        })))
-        .children((routes.len() > 4).then(|| data(format!("+{} more in {}", routes.len() - 4, range.label().to_lowercase()), 10.5, ink.faint)))
+                .child(data(if unpriced { "Unpriced".into() } else { usd(s.cost) }, 13.0, if unpriced { ink.faint } else { ink.fg }).w(96.0).align(Align::End))
+                .child(data(pct(s.value(m), whole), 13.0, ink.muted).w(80.0).align(Align::End))
+                .child(data(count(s.tokens), 13.0, ink.muted).w(88.0).align(Align::End))
+        }))
+        .children((more > 0).then(|| data(format!("+{more} more"), 11.5, ink.faint).pt(S2)))
+}
+
+fn reload(s: &mut State) {
+    let waker = s.waker.clone();
+    s.usage.start(waker);
 }
 
 pub fn view(s: &State, ink: &Ink, k: &Kit) -> El {
     let u = &s.usage;
     let range_pick = SegmentedControl::new(&Range::ALL.map(|r| r.label()), Range::ALL.iter().position(|r| *r == u.range))
         .label("Range")
-        .width(Some(220.0))
-        .on_pick(|s: &mut State, i, _| s.usage.range = Range::ALL[i])
+        .fit()
+        .on_pick(|s: &mut State, i, _| {
+            s.usage.range = Range::ALL[i];
+            s.usage.hover = None;
+        })
         .build(k);
-    let reload = IconButton::new(&icons::REFRESH)
+    let mode_pick = SegmentedControl::new(&["Cost", "Tokens"], Some((u.metric == Metric::Tokens) as usize))
+        .label("Show")
+        .fit()
+        .on_pick(|s: &mut State, i, _| s.usage.metric = if i == 0 { Metric::Cost } else { Metric::Tokens })
+        .build(k);
+    let refresh = IconButton::new(&icons::REFRESH)
         .variant(IconButtonVariant::Ghost)
         .control_size(ControlSize::Large)
         .label("Reload")
         .help("Read the logs again")
-        .on_press(|s: &mut State| {
-            let waker = s.waker.clone();
-            s.usage.start(waker);
-        })
+        .on_press(reload)
         .build(k);
-    let header = shell::header(
-        "Usage",
-        Some("Claude Code, Codex and OpenCode logs on this machine".into()),
-        vec![range_pick, reload],
-        ink,
-    );
-    if !u.loaded {
-        return col().key("usage").w_full().h_full().child(header).child(
+    let header = shell::header("Usage", None, vec![range_pick, mode_pick, refresh], ink);
+    let empty = |title: &str, body: &str, button: bool| {
+        col().key("usage").w_full().h_full().child(header.clone()).child(
             col()
                 .w_full()
                 .pt(120.0)
                 .gap(S3)
                 .items_center()
-                .child(Spinner::new().build(k))
-                .child(label(if u.loading { "Reading the logs" } else { "Not read yet" }, 13.0, 400.0, ink.muted)),
-        );
+                .children((!button).then(|| Spinner::new().build(k)))
+                .child(label(title, 15.0, 500.0, ink.fg))
+                .child(label(body, 13.0, 400.0, ink.muted))
+                .children(button.then(|| Button::new("Read again").variant(ButtonVariant::Neutral).on_press(reload).build(k))),
+        )
+    };
+    if !u.loaded {
+        return empty(if u.loading { "Reading the logs" } else { "Not read yet" }, "Claude Code, Codex, OpenCode and Pi", false);
     }
     if u.rows.is_empty() {
-        return col().key("usage").w_full().h_full().child(header).child(
-            col()
-                .w_full()
-                .pt(120.0)
-                .gap(S3)
-                .items_center()
-                .child(label("No usage found", 15.0, 500.0, ink.fg))
-                .child(label(
-                    "Looked in .claude\\projects, .codex\\sessions and .local\\share\\opencode under your user folder.",
-                    13.0,
-                    400.0,
-                    ink.muted,
-                ))
-                .child(
-                    Button::new("Read again")
-                        .variant(ButtonVariant::Neutral)
-                        .on_press(|s: &mut State| {
-                            let waker = s.waker.clone();
-                            s.usage.start(waker);
-                        })
-                        .build(k),
-                ),
+        return empty(
+            "No usage found",
+            "Looked in .claude, .codex, .local\\share\\opencode and .pi under your user folder.",
+            true,
         );
     }
     let now = today();
-    let rows = &u.rows;
-    let today_s = sum(between(rows, now, 0, 0));
-    let yesterday = sum(between(rows, now, 1, 1));
-    let week = sum(between(rows, now, 0, 6));
-    let prev_week = sum(between(rows, now, 7, 13));
-    let month = sum(between(rows, now, 0, 29));
-    let prev_month = sum(between(rows, now, 30, 59));
-    let all = sum(rows.iter());
-
-    let span = u.range.days();
-    let scoped = || between(rows, now, 0, span - 1);
-    let providers = group(scoped(), |r| r.provider.to_string());
-    let models = group(scoped(), |r| r.model.clone());
-    let projects = group(scoped(), |r| if r.project.is_empty() { "(no folder)".into() } else { r.project.clone() });
-
-    // A narrow window keeps each stat to its figure; the change vs the period before goes.
-    let wide = s.window_w >= 1100.0;
-    let stats = row()
-        .key("usage-totals")
+    let m = u.metric;
+    let total = sum(within(&u.rows, now, u.range.days()));
+    let providers = group(within(&u.rows, now, u.range.days()), m, |r| r.provider.to_string());
+    let top = card(ink)
+        .key("usage-top")
         .w_full()
-        .gap(S4)
-        .child(stat(ink, "today", "Today", today_s, change(today_s.cost, yesterday.cost).filter(|_| wide && !today_s.unpriced).map(|p| (p, "yesterday"))))
-        .child(stat(ink, "week", "Last 7 days", week, change(week.cost, prev_week.cost).filter(|_| wide && !week.unpriced).map(|p| (p, "prior 7"))))
-        .child(stat(ink, "month", "Last 30 days", month, change(month.cost, prev_month.cost).filter(|_| wide && !month.unpriced).map(|p| (p, "prior 30"))))
-        .child(stat(ink, "all", "All time", all, None));
-    let middle = row()
-        .w_full()
-        .h(356.0)
-        .gap(S4)
-        .items_stretch()
-        .child(chart(s, ink, k, now))
-        .child(routing(ink, &models, u.range, if s.window_w < 1100.0 { 300.0 } else { 380.0 }));
-    let bottom = row()
-        .w_full()
-        .gap(S4)
-        .items_stretch()
-        .child(breakdown(ink, "provider", "By tool", &providers, 5))
-        .child(breakdown(ink, "model", "By model", &models, 5))
-        .child(breakdown(ink, "project", "By project", &projects, 5));
+        .padding(S6)
+        .child(row().w_full().gap(S8).items_start().child(summary(ink, m, &total, &providers)).child(chart(u, ink, now, &providers)));
     col().key("usage").w_full().h_full().child(header).child(
         col()
             .key("usage-scroll")
@@ -716,7 +680,17 @@ pub fn view(s: &State, ink: &Ink, k: &Kit) -> El {
             .w_full()
             .scroll(ScrollSpec { stick_bottom: false })
             .scroll_edge_fade(16.0)
-            .child(col().w_full().px(S6).pb(S6).gap(S4).child(stats).child(middle).child(bottom)),
+            .child(
+                col()
+                    .w_full()
+                    .px(S6)
+                    .pb(S6)
+                    .gap(S4)
+                    .child(top)
+                    .child(totals(ink, &total))
+                    .child(by_type(ink, m, &total))
+                    .child(breakdown(u, ink, k, now)),
+            ),
     )
 }
 
@@ -729,41 +703,19 @@ mod tests {
         assert_eq!(parse_day("1970-01-01"), Some(0));
         assert_eq!(parse_day("2026-11-17").unwrap() - parse_day("2026-11-10").unwrap(), 7);
         assert_eq!(parse_day("bad"), None);
-        assert_eq!(count(1_500_000), "1.5M");
         let d = parse_day("2026-11-17").unwrap();
         assert_eq!(civil_from_days(d), (2026, 11, 17));
         assert_eq!(short_date(d), "Nov 17");
     }
 
-    fn sum_of(tokens: u64, cost: f64, priced: bool) -> Sum {
-        Sum {
-            tokens,
-            input: tokens / 2,
-            cache_read: tokens / 4,
-            cache_write: 0,
-            output: tokens - tokens / 2 - tokens / 4,
-            cost,
-            unpriced: !priced,
-        }
-    }
-
     #[test]
-    fn routing_ranks_by_price_and_names_unpriced_models() {
-        let rows = vec![
-            ("claude-opus-4-1".to_string(), sum_of(10_000_000, 60.0, true)),
-            ("claude-sonnet-4-5".to_string(), sum_of(40_000_000, 30.0, true)),
-            ("big-pickle".to_string(), sum_of(5_000_000, 0.0, true)),
-            ("mystery-model".to_string(), sum_of(1_000_000, 0.0, false)),
-        ];
-        let r = routes(&rows);
-        assert_eq!(r[0].model, "claude-opus-4-1");
-        assert_eq!(r[0].tier, Tier::Premium);
-        assert_eq!(r.iter().find(|x| x.model == "claude-sonnet-4-5").unwrap().tier, Tier::Cheap);
-        assert_eq!(r.iter().find(|x| x.model == "big-pickle").unwrap().tier, Tier::Free);
-        assert_eq!(r.iter().find(|x| x.model == "mystery-model").unwrap().tier, Tier::Unpriced);
-        let a = advice(&r);
-        assert!(a.contains("claude-opus-4-1") && a.contains("claude-sonnet-4-5") && a.contains("big-pickle"), "{a}");
-        assert!(a.contains("8\u{00d7}"), "opus is 8x sonnet per token here: {a}");
+    fn chart_tops_are_round() {
+        assert_eq!(nice_ceil(0.0), 1.0);
+        assert_eq!(nice_ceil(83.0), 100.0);
+        assert_eq!(nice_ceil(118.7), 200.0);
+        assert_eq!(nice_ceil(2.2e6), 2.5e6);
+        assert_eq!(pct(0.0001, 1.0), "<0.1%");
+        assert_eq!(pct(1.0, 4.0), "25.0%");
     }
 
     #[test]
@@ -771,9 +723,4 @@ mod tests {
         assert_eq!(short_model("claude-opus-4-1-20250805"), "claude-opus-4-1");
         assert_eq!(short_model("gpt-5-codex"), "gpt-5-codex");
     }
-}
-
-#[allow(dead_code)]
-fn unused() -> f32 {
-    S6
 }

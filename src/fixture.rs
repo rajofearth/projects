@@ -474,6 +474,12 @@ pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
                 cache_read: tokens - tokens / 10 - tokens / 20 - tokens / 40,
                 cache_write: tokens / 40,
                 cost_usd: tokens as f64 / 1e6 * rate,
+                cost_input: tokens as f64 / 1e6 * rate * 0.1,
+                cost_cache_read: tokens as f64 / 1e6 * rate * 0.6,
+                cost_cache_write: tokens as f64 / 1e6 * rate * 0.1,
+                cost_output: tokens as f64 / 1e6 * rate * 0.2,
+                cost_other: 0.0,
+                sessions: 1,
                 priced: *priced,
             });
         }
@@ -488,6 +494,12 @@ pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
                 cache_read: 0,
                 cache_write: 0,
                 cost_usd: 0.0,
+                cost_input: 0.0,
+                cost_cache_read: 0.0,
+                cost_cache_write: 0.0,
+                cost_output: 0.0,
+                cost_other: 0.0,
+                sessions: 1,
                 priced: false,
             });
         }

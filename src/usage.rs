@@ -4,7 +4,9 @@
 //! - Claude Code: `%USERPROFILE%\.claude\projects\**\*.jsonl` (assistant lines),
 //!   de-duplicated by `message.id` + `requestId`.
 //! - Codex: `%USERPROFILE%\.codex\sessions\**\*.jsonl` (`token_count` events).
-//! - OpenCode: `%USERPROFILE%\.local\share\opencode\storage\message\**\*.json`.
+//! - OpenCode: `%USERPROFILE%\.local\share\opencode\opencode.db` (the `message` and
+//!   `session_message` tables) plus the legacy `storage\message\**\*.json` files.
+//! - Pi: `%USERPROFILE%\.pi\agent\sessions\**\*.jsonl`.
 //!
 //! Token accounting and pricing follow t3code (https://github.com/pingdotgg/t3code),
 //! MIT License, Copyright (c) 2026 T3 Tools Inc. In particular: copies of one
@@ -17,11 +19,13 @@
 //! `model_prices_and_context_window.json`, the table t3code itself parses.
 //! The day bucket is the local (machine timezone) YYYY-MM-DD.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 /// One aggregated row: usage summed over (provider, model, local day, project).
@@ -41,12 +45,24 @@ pub struct Usage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub cost_usd: f64,
+    /// Portion of `cost_usd` attributed to each token channel. A logged cost is
+    /// scaled across these categories by the model's list price; when there is
+    /// no list price the whole cost goes to `cost_other` (t3code's "unsplit").
+    pub cost_input: f64,
+    pub cost_cache_read: f64,
+    pub cost_cache_write: f64,
+    pub cost_output: f64,
+    pub cost_other: f64,
+    /// Distinct sessions first contributing to this (provider, model, day, project)
+    /// bucket. Counting a session only once makes the sum over all rows equal the
+    /// source's distinct-session count, as in t3code's `mergeUsage`.
+    pub sessions: u32,
     /// False when some of these tokens had no price: no cost in the log and no list price
     /// for the model, so `cost_usd` undercounts them.
     pub priced: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Acc {
     unpriced: bool,
     input: u64,
@@ -54,6 +70,12 @@ struct Acc {
     cache_read: u64,
     cache_write: u64,
     cost: f64,
+    cost_input: f64,
+    cost_cache_read: f64,
+    cost_cache_write: f64,
+    cost_output: f64,
+    cost_other: f64,
+    sessions: HashSet<String>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -83,12 +105,50 @@ struct RawUse {
     reasoning: u64,
     /// Cost reported by the log itself, if any.
     cost: Option<f64>,
+    /// Session this message belongs to, for distinct-session counts.
+    session_id: String,
     /// Repeats of one billed message share this key and are merged by max.
     dedupe: Option<String>,
 }
 
+/// One record's list-price cost split by token channel (USD, not yet per-million scaled).
+#[derive(Clone, Copy, Default)]
+struct Category {
+    input: f64,
+    cache_read: f64,
+    cache_write: f64,
+    output: f64,
+}
+
+impl Category {
+    fn sum(self) -> f64 {
+        self.input + self.cache_read + self.cache_write + self.output
+    }
+
+    fn scaled(self, k: f64) -> Self {
+        Self {
+            input: self.input * k,
+            cache_read: self.cache_read * k,
+            cache_write: self.cache_write * k,
+            output: self.output * k,
+        }
+    }
+}
+
 /// Read every available source and aggregate. Blocking; call off the UI thread.
+///
+/// OpenCode's SQLite history is intentionally bounded to roughly the widest range
+/// the UI offers (a quarter plus a few days of timezone slack); the transcript
+/// files are small and are read in full.
 pub fn load() -> Vec<Usage> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    load_inner(now_ms - 92 * 86_400_000)
+}
+
+fn load_inner(cutoff_ms: i64) -> Vec<Usage> {
     let home = match std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
         Some(h) => PathBuf::from(h),
         None => return Vec::new(),
@@ -97,12 +157,16 @@ pub fn load() -> Vec<Usage> {
     // One table across all providers and files: Claude copies messages into
     // resumed/forked transcripts, and OpenCode can repeat an id across stores.
     let mut seen: HashMap<String, RawUse> = HashMap::new();
-    parse_claude_logs(&home, &mut acc, &mut seen);
-    parse_codex_logs(&home, &mut acc, &mut seen);
-    parse_opencode_logs(&home, &mut acc, &mut seen);
+    // A session is attributed to the first bucket that contributes to it, so
+    // summing `Usage.sessions` gives the source's distinct-session count.
+    let mut counted_sessions: HashSet<String> = HashSet::new();
+    parse_claude_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
+    parse_codex_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
+    parse_pi_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
+    parse_opencode_logs(&home, &mut acc, &mut seen, &mut counted_sessions, cutoff_ms);
     // Keyed copies are counted once, after every copy has been folded in.
     for raw in seen.into_values() {
-        accumulate(&mut acc, raw);
+        accumulate(&mut acc, raw, &mut counted_sessions);
     }
 
     let mut rows: Vec<Usage> = acc
@@ -117,6 +181,12 @@ pub fn load() -> Vec<Usage> {
             cache_read: a.cache_read,
             cache_write: a.cache_write,
             cost_usd: a.cost,
+            cost_input: a.cost_input,
+            cost_cache_read: a.cost_cache_read,
+            cost_cache_write: a.cost_cache_write,
+            cost_output: a.cost_output,
+            cost_other: a.cost_other,
+            sessions: a.sessions.len() as u32,
             priced: !a.unpriced,
         })
         .collect();
@@ -128,7 +198,12 @@ pub fn load() -> Vec<Usage> {
 
 /// Fold a partial copy into the held copy the way t3code's `mergeUsageCopies`
 /// does: the maximum of every token channel and the larger reported cost.
-fn add(acc: &mut HashMap<Key, Acc>, seen: &mut HashMap<String, RawUse>, mut raw: RawUse) {
+fn add(
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+    mut raw: RawUse,
+) {
     if let Some(key) = raw.dedupe.take() {
         if let Some(held) = seen.get_mut(&key) {
             held.input = held.input.max(raw.input);
@@ -147,22 +222,33 @@ fn add(acc: &mut HashMap<Key, Acc>, seen: &mut HashMap<String, RawUse>, mut raw:
         seen.insert(key, raw);
         return;
     }
-    accumulate(acc, raw);
+    accumulate(acc, raw, counted);
 }
 
-fn accumulate(acc: &mut HashMap<Key, Acc>, raw: RawUse) {
-    let known = raw.cost.is_some() || has_price(&raw.model);
+/// Price one record the way t3code's `priceUsage` does: a logged cost wins, but
+/// it is split across token categories in proportion to the model's list price.
+/// With no list price the logged cost is "unsplit" and lands in `cost_other`.
+fn accumulate(acc: &mut HashMap<Key, Acc>, raw: RawUse, counted: &mut HashSet<String>) {
+    let rate = price_for(&raw.model);
     let one_hour = raw.cache_write_1h.min(raw.cache_write);
-    let cost = raw.cost.unwrap_or_else(|| {
-        price(
-            &raw.model,
-            raw.input,
-            raw.output,
-            raw.cache_read,
-            raw.cache_write - one_hour,
-            one_hour,
-        )
+    let list = rate.map(|r| {
+        Category {
+            input: raw.input as f64 * r.input,
+            cache_read: raw.cache_read as f64 * r.read,
+            cache_write: (raw.cache_write - one_hour) as f64 * r.write_5m
+                + one_hour as f64 * r.write_1h,
+            output: raw.output as f64 * r.output,
+        }
+        .scaled(1.0 / 1_000_000.0)
     });
+    let list_total = list.map_or(0.0, Category::sum);
+    let (cost, categories) = match (raw.cost, list) {
+        (Some(reported), Some(c)) if list_total > 0.0 => (reported, Some(c.scaled(reported / list_total))),
+        (Some(reported), _) => (reported, None),
+        (None, Some(c)) if list_total > 0.0 => (list_total, Some(c)),
+        _ => (0.0, None),
+    };
+
     let key = Key {
         provider: raw.provider,
         model: raw.model,
@@ -175,12 +261,29 @@ fn accumulate(acc: &mut HashMap<Key, Acc>, raw: RawUse) {
     a.cache_read += raw.cache_read;
     a.cache_write += raw.cache_write;
     a.cost += cost;
-    a.unpriced |= !known;
+    match categories {
+        Some(c) => {
+            a.cost_input += c.input;
+            a.cost_cache_read += c.cache_read;
+            a.cost_cache_write += c.cache_write;
+            a.cost_output += c.output;
+        }
+        None => a.cost_other += cost,
+    }
+    a.unpriced |= raw.cost.is_none() && rate.is_none();
+    if !raw.session_id.is_empty() && counted.insert(raw.session_id.clone()) {
+        a.sessions.insert(raw.session_id);
+    }
 }
 
 // ---------------------------------------------------------------- Claude Code
 
-fn parse_claude_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap<String, RawUse>) {
+fn parse_claude_logs(
+    home: &Path,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+) {
     let mut files = Vec::new();
     walk_ext(&home.join(".claude").join("projects"), "jsonl", &mut files);
     for file in files {
@@ -201,7 +304,7 @@ fn parse_claude_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMa
             }
             let Some(raws) = parse_claude_value(&v) else { continue };
             for raw in raws {
-                add(acc, seen, raw);
+                add(acc, seen, counted, raw);
             }
         }
     }
@@ -229,6 +332,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
 
     let day = day_from_timestamp(v.get("timestamp").and_then(Value::as_str).unwrap_or(""));
     let project = project_from_cwd(v.get("cwd").and_then(Value::as_str).unwrap_or(""));
+    let session_id = v.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
     let cost = v.get("costUSD").and_then(Value::as_f64).filter(|c| c.is_finite());
     let count = |obj: &Value, name: &str| obj.get(name).and_then(Value::as_u64).unwrap_or(0);
 
@@ -258,6 +362,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
             cache_write_1h,
             reasoning,
             cost,
+            session_id: session_id.clone(),
             dedupe: dedupe.clone(),
         });
     }
@@ -294,6 +399,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
                 cache_write_1h: a1h,
                 reasoning: 0,
                 cost: None, // advisor calls are priced at their own model
+                session_id: session_id.clone(),
                 dedupe: dedupe.as_ref().map(|d| format!("{d}:advisor:{index}")),
             });
         }
@@ -304,7 +410,12 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
 
 // ---------------------------------------------------------------------- Codex
 
-fn parse_codex_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap<String, RawUse>) {
+fn parse_codex_logs(
+    home: &Path,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+) {
     let mut files = Vec::new();
     walk_ext(&home.join(".codex").join("sessions"), "jsonl", &mut files);
     for file in files {
@@ -316,6 +427,7 @@ fn parse_codex_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap
         // `total_token_usage`, from which we take deltas.
         let mut model = String::new();
         let mut cwd = String::new();
+        let mut session_id = String::new();
         let mut prev_total: Option<[u64; 5]> = None;
         for line in reader.lines() {
             let Ok(line) = line else { continue };
@@ -330,6 +442,14 @@ fn parse_codex_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap
                 "session_meta" => {
                     if let Some(c) = v.pointer("/payload/cwd").and_then(Value::as_str) {
                         cwd = c.to_string();
+                    }
+                    if session_id.is_empty() {
+                        session_id = v
+                            .pointer("/payload/id")
+                            .or_else(|| v.pointer("/payload/session_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                     }
                 }
                 "turn_context" => {
@@ -349,6 +469,7 @@ fn parse_codex_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap
                             add(
                                 acc,
                                 seen,
+                                counted,
                                 RawUse {
                                     provider: "codex",
                                     model: if model.is_empty() { "unknown".into() } else { model.clone() },
@@ -366,6 +487,7 @@ fn parse_codex_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap
                                     // Reported inside `output_tokens`, never charged twice.
                                     reasoning: toks[4],
                                     cost: None, // Codex logs carry no cost
+                                    session_id: session_id.clone(),
                                     dedupe: None,
                                 },
                             );
@@ -414,14 +536,41 @@ fn codex_tokens(info: &Value, prev_total: &mut Option<[u64; 5]>) -> Option<[u64;
 
 // ------------------------------------------------------------------- OpenCode
 
-fn parse_opencode_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut HashMap<String, RawUse>) {
-    let storage = home
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("storage");
-    // sessionID -> project directory, from storage/session/**/*.json.
-    let mut sessions: HashMap<String, String> = HashMap::new();
+fn parse_opencode_logs(
+    home: &Path,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+    cutoff_ms: i64,
+) {
+    let root = home.join(".local").join("share").join("opencode");
+    let mut projects: HashMap<String, String> = HashMap::new();
+
+    // Current OpenCode stores history in SQLite. `opencode.db` is read first,
+    // then any dated `opencode-*.db` files; ids duplicated across them or with
+    // the legacy JSON files are counted once.
+    if let Ok(entries) = fs::read_dir(&root) {
+        let mut dbs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("opencode") && n.ends_with(".db"))
+            })
+            .collect();
+        dbs.sort_by(|a, b| {
+            let main = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some("opencode.db");
+            main(b).cmp(&main(a)).then_with(|| a.cmp(b))
+        });
+        for db in &dbs {
+            read_opencode_database(db, cutoff_ms, &mut projects, acc, seen, counted);
+        }
+    }
+
+    let storage = root.join("storage");
+    // sessionID -> project directory, from legacy storage/session/**/*.json.
     let mut files = Vec::new();
     walk_ext(&storage.join("session"), "json", &mut files);
     for file in &files {
@@ -432,7 +581,7 @@ fn parse_opencode_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut Hash
                     .or_else(|| v.get("cwd"))
                     .and_then(Value::as_str),
             ) {
-                sessions.insert(id.to_string(), dir.to_string());
+                projects.entry(id.to_string()).or_insert_with(|| dir.to_string());
             }
         }
     }
@@ -440,47 +589,6 @@ fn parse_opencode_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut Hash
     walk_ext(&storage.join("message"), "json", &mut files);
     for file in &files {
         let Some(v) = read_json(&file) else { continue };
-        if v.get("role").is_some_and(|r| r.as_str() != Some("assistant")) {
-            continue;
-        }
-        let Some(tokens) = v.get("tokens") else { continue };
-        let input = tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
-        let output = tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
-        let cache_read = tokens
-            .pointer("/cache/read")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_write = tokens
-            .pointer("/cache/write")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        // OpenCode keeps reasoning separate from `output`; t3code adds it in.
-        let reasoning = tokens.get("reasoning").and_then(Value::as_u64).unwrap_or(0);
-        let output = output + reasoning;
-        if input + output + cache_read + cache_write == 0 {
-            continue;
-        }
-        let model = opencode_model(&v);
-        // OpenCode records zero for unknown rates and paid subscriptions alike,
-        // so only a positive cost (or an explicit free model) is a real report.
-        let cost = match v.get("cost").and_then(Value::as_f64) {
-            Some(c) if c > 0.0 => Some(c),
-            Some(0.0) if model.ends_with("-free") => Some(0.0),
-            _ => None,
-        };
-        // time.created is epoch milliseconds (number) or an ISO string.
-        let day = match v.pointer("/time/created") {
-            Some(Value::Number(n)) => n
-                .as_f64()
-                .map(|ms| local_day_from_epoch((ms / 1000.0) as i64))
-                .unwrap_or_default(),
-            Some(Value::String(s)) => day_from_timestamp(s),
-            _ => String::new(),
-        };
-        let project = sessions
-            .get(v.get("sessionID").and_then(Value::as_str).unwrap_or(""))
-            .map(|d| project_from_cwd(d))
-            .unwrap_or_default();
         // Legacy message files are named by message id; newer records carry it inline.
         let id = file
             .file_stem()
@@ -488,24 +596,175 @@ fn parse_opencode_logs(home: &Path, acc: &mut HashMap<Key, Acc>, seen: &mut Hash
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .or_else(|| v.get("id").and_then(Value::as_str).map(str::to_string));
-        add(
-            acc,
-            seen,
-            RawUse {
-                provider: "opencode",
-                model,
-                day,
-                project,
-                input,
-                output,
-                cache_read,
-                cache_write,
-                cache_write_1h: 0,
-                reasoning,
-                cost,
-                dedupe: id.map(|id| format!("opencode:{id}")),
-            },
-        );
+        if let Some(raw) = opencode_record(&v, id.as_deref(), None, None, &projects) {
+            add(acc, seen, counted, raw);
+        }
+    }
+}
+
+/// Parse one OpenCode assistant message. `fallback_id`/`fallback_session`/
+/// `fallback_created` carry values held in SQL columns rather than in `data`.
+fn opencode_record(
+    v: &Value,
+    fallback_id: Option<&str>,
+    fallback_session: Option<&str>,
+    fallback_created: Option<i64>,
+    projects: &HashMap<String, String>,
+) -> Option<RawUse> {
+    if v.get("role").is_some_and(|r| r.as_str() != Some("assistant")) {
+        return None;
+    }
+    let tokens = v.get("tokens")?;
+    let count = |obj: &Value, key: &str| obj.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let input = count(tokens, "input");
+    let cache_read = tokens.pointer("/cache/read").and_then(Value::as_u64).unwrap_or(0);
+    let cache_write = tokens.pointer("/cache/write").and_then(Value::as_u64).unwrap_or(0);
+    // OpenCode keeps reasoning separate from `output`; t3code adds it in.
+    let reasoning = count(tokens, "reasoning");
+    let output = count(tokens, "output") + reasoning;
+    if input + output + cache_read + cache_write == 0 {
+        return None;
+    }
+    let model = opencode_model(v);
+    if model.is_empty() {
+        return None;
+    }
+    let provider_id = v
+        .pointer("/model/providerID")
+        .or_else(|| v.get("providerID"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let day = match v.pointer("/time/created") {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|ms| ms as i64))
+            .map(|ms| local_day_from_epoch(ms / 1000)),
+        Some(Value::String(s)) => Some(day_from_timestamp(s)),
+        _ => None,
+    }
+    .or_else(|| fallback_created.map(|ms| local_day_from_epoch(ms / 1000)))?;
+    let session_id = v
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or(fallback_session)
+        .unwrap_or("")
+        .to_string();
+    // OpenCode records zero for unknown rates and paid subscriptions alike, so
+    // only a positive cost (or one of its own gateways' free models) is a report.
+    let cost = match v.get("cost").and_then(Value::as_f64) {
+        Some(c) if c > 0.0 => Some(c),
+        Some(0.0)
+            if matches!(provider_id, "opencode" | "opencode-go")
+                && model.ends_with("-free") =>
+        {
+            Some(0.0)
+        }
+        _ => None,
+    };
+    let project = projects
+        .get(&session_id)
+        .map(|d| project_from_cwd(d))
+        .unwrap_or_default();
+    let id = fallback_id
+        .filter(|s| !s.is_empty())
+        .or_else(|| v.get("id").and_then(Value::as_str));
+    Some(RawUse {
+        provider: "opencode",
+        model,
+        day,
+        project,
+        input,
+        output,
+        cache_read,
+        cache_write,
+        cache_write_1h: 0,
+        reasoning,
+        cost,
+        session_id,
+        dedupe: id.map(|id| format!("opencode:{id}")),
+    })
+}
+
+/// Project only the fields pricing needs, in SQLite, so the often-huge message
+/// bodies never cross the FFI boundary (the same projection t3code uses).
+const OPENCODE_PROJECTION: &str = "json_object(\
+    'tokens', data->'$.tokens', 'cost', data->'$.cost', \
+    'model', data->'$.model', 'modelID', data->'$.modelID', \
+    'providerID', data->'$.providerID', 'time', data->'$.time', \
+    'id', data->'$.id', 'sessionID', data->'$.sessionID')";
+
+fn read_opencode_database(
+    path: &Path,
+    cutoff_ms: i64,
+    projects: &mut HashMap<String, String>,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+) {
+    // Open read-only; WAL commits stay visible through the -shm file. If a fresh
+    // database has no -shm yet, a read-write handle with query_only recovers it
+    // without ever modifying a row.
+    let conn = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(c) => c,
+        Err(_) => match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) {
+            Ok(c) => {
+                let _ = c.pragma_update(None, "query_only", true);
+                c
+            }
+            Err(_) => return,
+        },
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(250));
+
+    for table in ["session", "session_v2"] {
+        let sql = format!("SELECT id, directory FROM {table}");
+        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            if !row.0.is_empty() && !row.1.is_empty() {
+                projects.entry(row.0).or_insert(row.1);
+            }
+        }
+    }
+
+    let queries = [
+        format!(
+            "SELECT id, session_id, time_created, {OPENCODE_PROJECTION} FROM message \
+             WHERE time_created >= ?1"
+        ),
+        format!(
+            "SELECT id, session_id, time_created, {OPENCODE_PROJECTION} FROM session_message \
+             WHERE type IN ('assistant','compaction') AND time_created >= ?1"
+        ),
+    ];
+    for sql in &queries {
+        let Ok(mut stmt) = conn.prepare(sql) else { continue };
+        let Ok(rows) = stmt.query_map([cutoff_ms], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            let (id, session_id, created, data) = row;
+            let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+            if let Some(raw) =
+                opencode_record(&v, Some(&id), Some(&session_id), created, projects)
+            {
+                add(acc, seen, counted, raw);
+            }
+        }
     }
 }
 
@@ -526,7 +785,102 @@ fn opencode_model(v: &Value) -> String {
             }
         }
     }
-    "unknown".into()
+    String::new()
+}
+
+// ------------------------------------------------------------------------- Pi
+
+fn parse_pi_logs(
+    home: &Path,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+) {
+    let mut files = Vec::new();
+    walk_ext(&home.join(".pi").join("agent").join("sessions"), "jsonl", &mut files);
+    for file in files {
+        let Ok(reader) = fs::File::open(&file).map(BufReader::new) else { continue };
+        let mut session_id = String::new();
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if !line.contains("\"usage\"") && !line.contains("\"session\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            match v.get("type").and_then(Value::as_str).unwrap_or("") {
+                "session" => {
+                    session_id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                }
+                "message" | "usage" | "compaction" | "branch_summary" => {
+                    let (usage, provider, model, response_model) = if v.get("type").and_then(Value::as_str) == Some("message") {
+                        let m = &v["message"];
+                        (
+                            m.get("usage"),
+                            m.get("provider").and_then(Value::as_str).unwrap_or(""),
+                            m.get("model").and_then(Value::as_str).unwrap_or(""),
+                            m.get("responseModel").and_then(Value::as_str).unwrap_or(""),
+                        )
+                    } else {
+                        (
+                            v.get("usage"),
+                            v.get("provider").and_then(Value::as_str).unwrap_or(""),
+                            v.get("model").and_then(Value::as_str).unwrap_or(""),
+                            "",
+                        )
+                    };
+                    let Some(usage) = usage else { continue };
+                    let count = |key: &str| {
+                        usage.get(key)
+                            .and_then(Value::as_u64)
+                            .or_else(|| usage.get(key).and_then(Value::as_i64).map(|n| n.max(0) as u64))
+                            .unwrap_or(0)
+                    };
+                    let input = count("input");
+                    let cache_read = count("cacheRead");
+                    let cache_write = count("cacheWrite");
+                    let output = count("output");
+                    let reasoning = count("reasoning").min(output);
+                    let cost = usage
+                        .pointer("/cost/total")
+                        .and_then(Value::as_f64)
+                        .filter(|c| c.is_finite() && *c > 0.0);
+                    if input + output + cache_read + cache_write == 0 && cost.is_none() {
+                        continue;
+                    }
+                    let model = if provider.is_empty() {
+                        "Tools/summaries".to_string()
+                    } else {
+                        format!("{provider}/{}", if response_model.is_empty() { model } else { response_model })
+                    };
+                    let id = v.get("id").and_then(Value::as_str).unwrap_or("");
+                    let ts = v.get("timestamp").and_then(Value::as_str).unwrap_or("");
+                    add(
+                        acc,
+                        seen,
+                        counted,
+                        RawUse {
+                            provider: "pi",
+                            model,
+                            day: day_from_timestamp(ts),
+                            project: project_from_cwd(
+                                v.get("cwd").and_then(Value::as_str).unwrap_or(""),
+                            ),
+                            input,
+                            output,
+                            cache_read,
+                            cache_write,
+                            cache_write_1h: 0,
+                            reasoning,
+                            cost,
+                            session_id: session_id.clone(),
+                            dedupe: Some(format!("pi:{id}:{ts}")),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -563,6 +917,7 @@ const PRICES: &[(&str, Price)] = &[
     ("claude-opus-5", p(5.0, 25.0, 0.5, 6.25, 10.0)),
     ("claude-sonnet-5", p(2.0, 10.0, 0.2, 2.5, 4.0)),
     // GPT-6 family (OpenAI has no distinct 1-hour cache-write rate)
+    ("gpt-5.6-luna", p(0.2, 1.2, 0.02, 0.25, 0.25)),
     ("gpt-6-astra-law", p(10.0, 50.0, 1.0, 10.0, 10.0)),
     ("gpt-6-rosalind", p(15.0, 75.0, 1.5, 18.75, 18.75)),
     ("gpt-6-cyber", p(20.0, 100.0, 2.0, 25.0, 25.0)),
@@ -842,12 +1197,14 @@ mod tests {
             cache_write_1h: 0,
             reasoning: 0,
             cost: None,
+            session_id: "s1".into(),
             dedupe: Some("claude:m:r".into()),
         };
-        add(&mut acc, &mut seen, mk(10, 20));
-        add(&mut acc, &mut seen, mk(5, 40)); // partial copy, higher output
+        let mut counted = HashSet::new();
+        add(&mut acc, &mut seen, &mut counted, mk(10, 20));
+        add(&mut acc, &mut seen, &mut counted, mk(5, 40)); // partial copy, higher output
         for raw in seen.into_values() {
-            accumulate(&mut acc, raw);
+            accumulate(&mut acc, raw, &mut counted);
         }
         let row = &acc[&Key { provider: "claude", model: "claude-opus-5-5".into(), day: "2026-11-16".into(), project: "app".into() }];
         assert_eq!((row.input, row.output), (10, 40));
@@ -906,5 +1263,60 @@ mod tests {
         let reasoning = tokens.get("reasoning").and_then(Value::as_u64).unwrap_or(0);
         let output = tokens.get("output").and_then(Value::as_u64).unwrap_or(0) + reasoning;
         assert_eq!(output, 60);
+    }
+
+    /// Prints the same per-provider 90-day figures t3code's Usage page shows.
+    /// Run with: cargo test -- --ignored --nocapture print_90_day_usage
+    #[test]
+    #[ignore]
+    fn print_90_day_usage() {
+        let rows = load();
+        let today = local_day_from_epoch(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        );
+        let cutoff = {
+            let (y, m, d) = (
+                today[0..4].parse::<i64>().unwrap(),
+                today[5..7].parse::<u32>().unwrap(),
+                today[8..10].parse::<u32>().unwrap(),
+            );
+            let (y, m, d) = civil_from_days(days_from_civil(y, m, d) - 89);
+            format!("{y:04}-{m:02}-{d:02}")
+        };
+        let rows: Vec<&Usage> = rows
+            .iter()
+            .filter(|u| u.day >= cutoff && u.day <= today)
+            .collect();
+        for provider in ["opencode", "claude", "codex", "pi"] {
+            let rs: Vec<&&Usage> = rows.iter().filter(|u| u.provider == provider).collect();
+            if rs.is_empty() { continue; }
+            let sum = |f: fn(&Usage) -> u64| rs.iter().map(|u| f(u)).sum::<u64>();
+            let cost: f64 = rs.iter().map(|u| u.cost_usd).sum();
+            println!(
+                "{provider:8} sessions={:5} tokens={:>13} cost=${:.2}",
+                rs.iter().map(|u| u.sessions as u64).sum::<u64>(),
+                sum(|u| u.input + u.output + u.cache_read + u.cache_write),
+                cost,
+            );
+        }
+        println!(
+            "TOTALS cached_read={} uncached_input={} output={} cache_write={}",
+            sum_all(&rows, |u| u.cache_read),
+            sum_all(&rows, |u| u.input),
+            sum_all(&rows, |u| u.output),
+            sum_all(&rows, |u| u.cache_write),
+        );
+        println!(
+            "COST input=${:.2} cache_read=${:.2} cache_write=${:.2} output=${:.2} other=${:.2}",
+            rows.iter().map(|u| u.cost_input).sum::<f64>(),
+            rows.iter().map(|u| u.cost_cache_read).sum::<f64>(),
+            rows.iter().map(|u| u.cost_cache_write).sum::<f64>(),
+            rows.iter().map(|u| u.cost_output).sum::<f64>(),
+            rows.iter().map(|u| u.cost_other).sum::<f64>(),
+        );
+    }
+
+    fn sum_all(rows: &[&Usage], f: fn(&Usage) -> u64) -> u64 {
+        rows.iter().map(|u| f(u)).sum()
     }
 }

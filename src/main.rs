@@ -706,6 +706,8 @@ fn scene_storage_open(s: &mut State) {
 fn scene_usage(s: &mut State) {
     s.load_demo();
     s.page = shell::Page::Usage;
+    // Hold the chart crosshair on a day, so the scene shows the tooltip.
+    s.usage.hover = Some(22);
 }
 
 fn scene_templates(s: &mut State) {
