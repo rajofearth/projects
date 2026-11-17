@@ -1,57 +1,135 @@
-# Projects — Live Stats
+<p align="center">
+  <img src="assets/icon-256.png" width="96" alt="Projects app icon">
+</p>
 
-A native desktop dashboard for `P:\Projects`, built with [Rune](https://github.com/anomalyco/rune)
-(dev rev `14eb362e4e56aadf9b64c82640417ab0c9da5fe0`) — GPU-rendered, no web view.
+# Projects
 
-Mirrors the `stats-inline.html` mock: KPI row, squarified disk-footprint treemap, language mix
-bars, a project-pulse donut, a momentum scatter (recency × size × footprint), build-junk
-composition bars and insight cards.
+A Windows desktop project manager built with [Rune](https://github.com/anomalyco/rune).
 
-## Run
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/screenshots/home.png" width="100%" alt="Home page: project cards"><br><sub>Home: every project under the root folder, with search, filters and sorting</sub></td>
+    <td width="50%" valign="top"><img src="docs/screenshots/project-detail.png" width="100%" alt="Project detail panel"><br><sub>Project detail: git state, languages, scripts and disk use</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/screenshots/usage.png" width="100%" alt="Usage page"><br><sub>Usage: AI coding-agent tokens and estimated cost</sub></td>
+    <td width="50%" valign="top"><img src="docs/screenshots/templates.png" width="100%" alt="Templates page"><br><sub>Templates: the new-project recipes, editable in the app</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/screenshots/new-project.png" width="100%" alt="New project dialog"><br><sub>New project: pick a template and stream the command output</sub></td>
+    <td width="50%" valign="top"><img src="docs/screenshots/settings.png" width="100%" alt="Settings page"><br><sub>Settings: projects folder, editor, layout and rescans</sub></td>
+  </tr>
+  <!--
+  <tr>
+    <td width="50%" valign="top"><img src="docs/screenshots/storage.png" width="100%" alt="Storage page"><br><sub>Storage: disk use by category, with reclaimable space</sub></td>
+    <td width="50%" valign="top"></td>
+  </tr>
+  -->
+</table>
+
+## Features
+
+- Home: browse every project under the root folder as cards or a dense list. Search by name, stack or description, filter by how recently a project was worked on or by stack, sort by recent activity, name or size. Pin projects to the top, archive the ones you do not want to see, and keep a card detail panel beside the grid.
+- Project detail: description and stack tags, commit and line counts, language mix, git state (branch, dirty files, ahead/behind, remote and recent commits), runnable scripts from the project manifest, and a disk-space breakdown. Double-click a card or press Enter to open the folder in your editor; right-click for a menu with open-in-editor, terminal, run script, reveal in Explorer, copy path, show in storage, pin and archive.
+- New project: create a folder from an editable template, optionally with `git init`, while streaming the command output.
+- Storage: disk usage across the projects folder, broken down by category (source, dependencies, build output and other). Walk into folders to find what is taking space, with reclaimable space called out and the biggest rebuildable folder surfaced.
+- Usage: AI coding-agent token usage and estimated cost from local Claude Code, Codex and OpenCode logs, grouped by provider, model, day and project.
+- Templates: add, edit and remove the new-project templates stored on disk.
+- Settings: choose the projects folder, the default editor, the page layout and order, and whether the folder is rescanned automatically (every five minutes).
+- State such as pins, archives, recently opened projects, layout, folders and editor survives restarts, stored in a Rune preferences file.
+
+## Keyboard shortcuts
+
+- Ctrl+1 through Ctrl+5: go to Home, Storage, Usage, Templates, Settings
+- `/` or Ctrl+F: search projects
+- Ctrl+N: new project
+- Ctrl+R: rescan the projects folder
+- Arrow keys: move between projects
+- Enter: open the selected project in your editor
+- Space: show or hide details
+- P: pin or unpin
+- T: open a terminal in the project
+- Esc: close a dialog or menu, or clear the search
+- `?`: show the full shortcut sheet in the app
+
+## Build and run
 
 ```sh
-cargo run -p projects-stats                 # live scan of P:\Projects (override: RUNE_STATS_ROOT)
-cargo run -p projects-stats -- --scene demo # deterministic fixture, no scanning
+cargo run --release
 ```
 
-The window opens and a background scan starts immediately; projects fill in as they finish.
-It auto-rescans every 5 minutes, and the Rescan button forces one. The scan walks every folder
-in parallel (8 workers, hidden files included � `.git` history is real disk usage), buckets
-bytes into source / `node_modules` / `target` / other build output (`.git` lands in other),
-counts hand-written lines by extension (code files < 256 KiB only), and asks git for commits,
-last-commit age and dirty-file counts. Measured on this machine: 88 folders, 82.0 GiB
-(verified against robocopy's 88,039,170,366 bytes), 2.97 M LOC in ~13 s.
+The app scans the root folder on startup and fills in projects as they finish. Use `--scene demo` for built-in sample data with no disk scan.
 
-## Footprint
+Set `RUNE_STATS_ROOT` to point at a different projects folder for a run; it defaults to `P:\Projects`.
 
-- Frame CPU p50 2.4 ms / p95 3.0 ms (headless, 768 instances) against a 16.6 ms budget
-- Idle: 0.0% CPU � Rune draws nothing when nothing changes; gauge commits only fire when a
-  displayed fps/ram value actually changes
-- 128 MB working set at rest, ~175 MB peak while scanning
-- Footer shows live `fps � MB � scan` in mono, sampled once a second
+### Releasing a version
 
-## Check headlessly
+The version lives in `version` under `[package]` in `Cargo.toml`. To cut a release, bump it, commit, then tag and push the tag:
 
 ```sh
-cargo test -p projects-stats                                       # 10 tests incl. layout + scan
-cargo test -p projects-stats real_root_scan_smoke -- --ignored --nocapture  # real scan, timed
-cargo run -p projects-stats -- --scene demo --snap snap.png --tree tree.json
+# edit version = "X.Y.Z" in Cargo.toml, commit it, then:
+git tag vX.Y.Z && git push --tags
 ```
 
-`--tree` dumps the element tree (keys, rects, text, tooltips); `--snap` renders a PNG.
-`--size 1100x2500` shows the whole scrollable page in one snapshot.
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the release exe, packages it as a zip with the README (and LICENSE, when the repo has one), and publishes a GitHub release with notes generated from the merged PRs since the previous tag (grouped by label, as set in `.github/release.yml`). The workflow can also be started by hand from the Actions tab.
 
-## Layout
+## Templates
 
-- `src/scan.rs` — parallel walker + git facts, streaming `ScanEvent`s over a channel
-- `src/main.rs` — state, poll loop (drains events, auto-rescan), tests
-- `src/ui.rs` — the view: header, KPIs, cards, charts
-- `src/charts.rs` — squarified treemap + donut/circle geometry, tests
-- `src/model.rs` — `Project`, categories, colours, formatting
-- `src/fixture.rs` — the demo scene's data
+Templates live in `%APPDATA%\projects\templates.json` (or under `%USERPROFILE%` when `APPDATA` is not set). The file is a JSON array. On first run, if the file is missing or invalid, the built-in defaults are written out.
 
-## Notes
+Each template has an `id`, a display `name`, a short `kind` label, and a list of `steps`. A step has a `run` command executed through `cmd /C` and an `in_parent` flag: `true` runs the command in the parent folder, for generators that create the project folder themselves; `false` runs it inside the new folder. The placeholders `{name}` (project name) and `{path}` (absolute project path) are substituted in commands.
 
-- Rune's `[patch]` entries don't cross workspaces, so `Cargo.toml` re-patches
-  `wgpu-hal`, `winit` and `parley_engine` to the rune clone's `vendor/` copies.
-- Toolchain pinned to 1.99.1 (rune's `rust-toolchain.toml`).
+Example:
+
+```json
+[
+  {
+    "id": "empty-folder",
+    "name": "Empty folder",
+    "kind": "folder",
+    "steps": []
+  },
+  {
+    "id": "rust-bin",
+    "name": "Rust binary",
+    "kind": "rust",
+    "steps": [
+      {
+        "run": "cargo new {name}",
+        "in_parent": true
+      }
+    ]
+  },
+  {
+    "id": "vite-react",
+    "name": "Vite + React",
+    "kind": "vite",
+    "steps": [
+      {
+        "run": "npm create vite@latest {name} -- --template react-ts",
+        "in_parent": true
+      },
+      {
+        "run": "npm install",
+        "in_parent": false
+      }
+    ]
+  }
+]
+```
+
+You can edit this file by hand or use the Templates page in the app.
+
+## Where data comes from
+
+- Projects, disk usage, languages, scripts, git facts and commits: read from the folders under the root. The scanner walks each project in parallel, buckets disk space into source, dependencies, build output and other, counts code lines by file extension, and asks `git` for branch, history and working-tree state. Project descriptions and stack labels come from manifests and README files.
+- Usage: parsed from local log files. Claude Code from `%USERPROFILE%\.claude\projects\**\*.jsonl`, Codex from `%USERPROFILE%\.codex\sessions\**\*.jsonl`, and OpenCode from `%USERPROFILE%\.local\share\opencode\storage\message\**\*.json`. Cost uses the value in the log when present, otherwise a built-in list-price table; unknown models are counted as zero cost and flagged as unpriced.
+- Settings and pins: a Rune preferences file named `projects`, written whenever something changes.
+- Templates: `%APPDATA%\projects\templates.json`.
+
+## Credits
+
+- Built with [Rune](https://github.com/anomalyco/rune).
+- Usage-page log-parsing and cost logic adapted from t3code.

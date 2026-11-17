@@ -39,19 +39,6 @@ pub enum ScanEvent {
 
 // ---- formatting helpers ----
 
-pub fn fmt(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let bytes = s.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(b as char);
-    }
-    out
-}
-
 pub fn gib(b: u64) -> f64 {
     b as f64 / 1073741824.0
 }
@@ -63,15 +50,5 @@ pub fn gb(b: u64) -> String {
         format!("{g:.1} GiB")
     } else {
         format!("{:.0} MiB", b as f64 / 1048576.0)
-    }
-}
-
-/// Truncate a name to roughly fit a width, the way the mock does.
-pub fn fit(name: &str, max_chars: usize) -> String {
-    if name.chars().count() <= max_chars {
-        name.to_string()
-    } else {
-        let cut: String = name.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{cut}…")
     }
 }

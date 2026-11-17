@@ -114,7 +114,7 @@ fn ends_with_ci(name: &str, suffix: &str) -> bool {
     name.len() >= suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Agg {
     bytes: u64,
     files: u64,
@@ -311,7 +311,12 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
         "core.untrackedCache=false",
     ])
     .args(args)
-    .current_dir(dir);
+    .current_dir(dir)
+    // No credential prompt, no pager, no interactive anything: a repo with a helper
+    // configured fails the call instead of blocking a scan worker on stdin.
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "")
+    .env("GIT_PAGER", "cat");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -587,38 +592,32 @@ pub fn scan(
                 }
             })
         };
-        // The walk, on its own threads, concurrent with git; join git before draining its
-        // results, or the drain below would race the writers.
-        let aggs = walk_all(&dirs);
-        git_handle.join().unwrap();
-        let git_all = std::sync::Arc::try_unwrap(git_results)
-            .map(|m| m.into_inner().unwrap())
-            .unwrap_or_else(|a| std::mem::take(&mut a.lock().unwrap()));
-        for (i, dir) in dirs.iter().enumerate() {
+        // A row per project, the moment its walk finishes. Git runs alongside, so a row
+        // usually lands without history facts and gets them patched in once git catches up:
+        // the window fills while the scan runs instead of after it.
+        let send_row = |i: usize, agg: &Agg, facts: Option<GitFacts>| {
+            let dir = &dirs[i];
             let name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let facts = git_all[i].clone().unwrap_or_default();
-            let (cat, stack) = classify(dir, &aggs[i]);
-            let mut langs: Vec<(String, u64)> = aggs[i]
-                .langs
-                .iter()
-                .map(|(l, n)| (l.to_string(), *n))
-                .collect();
+            let (cat, stack) = classify(dir, agg);
+            let mut langs: Vec<(String, u64)> =
+                agg.langs.iter().map(|(l, n)| (l.to_string(), *n)).collect();
             langs.sort_by(|a, b| b.1.cmp(&a.1));
             langs.truncate(8);
+            let facts = facts.unwrap_or_default();
             let project = Project {
                 name,
                 cat,
                 stack,
-                bytes: aggs[i].bytes,
-                files: aggs[i].files,
-                loc: aggs[i].loc,
-                src: aggs[i].src,
-                nm: aggs[i].nm,
-                target: aggs[i].target,
-                other: aggs[i].other,
+                bytes: agg.bytes,
+                files: agg.files,
+                loc: agg.loc,
+                src: agg.src,
+                nm: agg.nm,
+                target: agg.target,
+                other: agg.other,
                 langs,
                 git: facts.repo,
                 commits: facts.commits,
@@ -627,6 +626,26 @@ pub fn scan(
             };
             let _ = tx.send(ScanEvent::Project(Box::new(project)));
             wake();
+        };
+        // Which rows were sent before git knew anything about them.
+        let waiting: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let on_project = |i: usize, agg: Agg| {
+            let facts = git_results.lock().unwrap()[i].clone();
+            if facts.is_none() {
+                waiting.lock().unwrap().push(i);
+            }
+            send_row(i, &agg, facts);
+        };
+        // The walk, on its own threads, concurrent with git; join git before reading its
+        // results, or the patch below would race the writers.
+        let aggs = walk_all(&dirs, &on_project);
+        git_handle.join().unwrap();
+        let git_all = std::sync::Arc::try_unwrap(git_results)
+            .map(|m| m.into_inner().unwrap())
+            .unwrap_or_else(|a| std::mem::take(&mut a.lock().unwrap()));
+        // Rows that landed before their history was read get it now, in place.
+        for i in waiting.into_inner().unwrap() {
+            send_row(i, &aggs[i], git_all[i].clone());
         }
     });
     let _ = tx.send(ScanEvent::Done {
@@ -639,7 +658,7 @@ pub fn scan(
 /// hand-rolled `FindFirstFileW` traversal: sizes arrive with the directory enumeration (no
 /// per-file stat), buckets are inherited down the tree, and nothing allocates per entry.
 #[cfg(windows)]
-fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
+fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -> Vec<Agg> {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -663,11 +682,16 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
         tasks: Mutex<(Vec<Task>, usize)>,
         cv: Condvar,
         pending: AtomicUsize,
+        /// Directories still outstanding per project: 0 means that project is fully
+        /// measured. `push` adds one and `finished_one` takes one, so the seed task and
+        /// every subdirectory it finds are all counted exactly once.
+        per_proj: Mutex<Vec<usize>>,
     }
 
     impl Queue {
         fn push(&self, t: Task) {
             self.pending.fetch_add(1, Ordering::Release);
+            self.per_proj.lock().unwrap()[t.proj] += 1;
             let mut g = self.tasks.lock().unwrap();
             g.0.push(t);
             if g.1 > 0 {
@@ -688,13 +712,20 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
                 g.1 -= 1;
             }
         }
-        fn finished_one(&self) {
+        /// One directory done: true when it was the last one of its project.
+        fn finished_one(&self, proj: usize) -> bool {
+            let left = {
+                let mut counts = self.per_proj.lock().unwrap();
+                counts[proj] = counts[proj].saturating_sub(1);
+                counts[proj]
+            };
             self.pending.fetch_sub(1, Ordering::Release);
             // Only the end of the walk needs a broadcast; new work arriving is covered by
             // push's own notify.
             if self.pending.load(Ordering::Acquire) == 0 {
                 self.cv.notify_all();
             }
+            left == 0
         }
     }
 
@@ -714,6 +745,11 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
         tasks: Mutex::new((Vec::new(), 0)),
         cv: Condvar::new(),
         pending: AtomicUsize::new(0),
+        // Zero to begin with: `push` counts each task as it is queued, including the seed
+        // task for each project root pushed below, and `finished_one` takes one back when
+        // that task's directory is measured. A project with no subfolders therefore goes
+        // seed (1) then done (0) and reports its row.
+        per_proj: Mutex::new(vec![0; dirs.len()]),
     });
     // `\\?\` lets paths run past the 260-char limit (node_modules gets deep), but only
     // accepts fully-qualified paths: canonicalize first (it returns the prefix on Windows).
@@ -807,7 +843,20 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
                             FindClose(handle);
                         }
                     }
-                    queue.finished_one();
+                    // This project's tree is fully enumerated: hand its numbers over now,
+                    // so the window fills row by row instead of after the whole walk.
+                    // The snapshot is taken under `aggs`; `on_project` runs after the
+                    // guard is gone, because it takes the git and waiting locks itself.
+                    // Lock order everywhere: aggs, then git_results, then waiting.
+                    if queue.finished_one(task.proj) {
+                        let mut mine = local.remove(&task.proj).unwrap_or_default();
+                        let snapshot = {
+                            let mut all = aggs.lock().unwrap();
+                            all[task.proj].merge(&mut mine);
+                            all[task.proj].clone()
+                        };
+                        on_project(task.proj, snapshot);
+                    }
                 }
                 let mut all = aggs.lock().unwrap();
                 for (i, mut a) in local {
@@ -841,6 +890,8 @@ fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
     let mut aggs: Vec<Agg> = (0..dirs.len()).map(|_| Agg::default()).collect();
     for (i, d) in dirs.iter().enumerate() {
         rec(d, i, 0, &mut aggs);
+        // Streamed the moment this project's tree is measured, not at the end of the walk.
+        on_project(i, aggs[i].clone());
     }
     aggs
 }
