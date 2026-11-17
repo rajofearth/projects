@@ -4,7 +4,9 @@
 //! hover tooltip, the token totals, the split by type and a breakdown by model or day. Limits
 //! shows each provider's plan windows. Logs and limits are read on worker threads.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
@@ -84,6 +86,11 @@ pub struct UsageState {
     /// The demo scene reads the fixture instead of the logs.
     pub demo: bool,
     rx: Option<Receiver<Vec<Usage>>>,
+    /// Bumped whenever `rows` changes, so the cached figures know to rebuild.
+    generation: u64,
+    /// Everything the Cost/Tokens view derives from the rows, built once per range, metric,
+    /// filter and data change. Hovering the chart only moves the crosshair and tooltip.
+    cache: RefCell<Option<Rc<Figures>>>,
     limits_rx: Option<Receiver<Vec<Limits>>>,
 }
 
@@ -105,6 +112,8 @@ impl UsageState {
             limit_hover: None,
             demo: false,
             rx: None,
+            generation: 0,
+            cache: RefCell::new(None),
             limits_rx: None,
         }
     }
@@ -124,6 +133,7 @@ impl UsageState {
         }
         if self.demo {
             self.rows = crate::fixture::demo_usage(today());
+            self.generation += 1;
             self.loaded = true;
             return;
         }
@@ -164,6 +174,7 @@ impl UsageState {
             match rx.try_recv() {
                 Ok(rows) => {
                     self.rows = rows;
+                    self.generation += 1;
                     self.finish_rows();
                     changed = true;
                 }
@@ -359,11 +370,158 @@ fn pct(part: f64, whole: f64) -> String {
     }
 }
 
-/// Rows of the shown providers from `back` days ago through today.
-fn within(u: &UsageState, now: i64, back: i64) -> impl Iterator<Item = &Usage> {
-    u.rows
-        .iter()
-        .filter(move |r| u.shown(r.provider) && parse_day(&r.day).is_some_and(|d| d <= now && d > now - back))
+/// Epoch hour now.
+fn now_hour() -> i64 {
+    limits::now_secs().div_euclid(3600)
+}
+
+/// Rows of the shown providers in the range: the last 24 hours by the hour for Past 24h,
+/// else from `days` days ago through today.
+fn within<'a>(u: &'a UsageState, now: i64, hour: i64, range: Range) -> impl Iterator<Item = &'a Usage> {
+    u.rows.iter().filter(move |r| {
+        u.shown(r.provider)
+            && match range {
+                Range::Day => r.hour > hour - 24 && r.hour <= hour,
+                _ => parse_day(&r.day).is_some_and(|d| d <= now && d > now - range.days()),
+            }
+    })
+}
+
+#[derive(Clone, PartialEq)]
+struct FigKey {
+    generation: u64,
+    range: Range,
+    metric: Metric,
+    hidden: Vec<&'static str>,
+    by_day: bool,
+    now: i64,
+    hour: i64,
+}
+
+/// The Cost/Tokens page's figures and chart geometry.
+struct Figures {
+    key: FigKey,
+    total: Sum,
+    providers: Vec<(String, Sum)>,
+    /// series[p][i]: provider p in column i.
+    series: Vec<Vec<f64>>,
+    /// Tooltip title per column.
+    titles: Vec<String>,
+    ticks: [String; 3],
+    top: f64,
+    areas: Shape,
+    lines: Shape,
+    groups: Vec<(String, Sum)>,
+    more: usize,
+    whole: f64,
+    best: f64,
+}
+
+fn hour_label(h: i64) -> String {
+    match usage::local_parts(h * 3600) {
+        Some((_, mo, d, hh, _)) => {
+            let (h12, ap) = match hh {
+                0 => (12, "AM"),
+                1..=11 => (hh, "AM"),
+                12 => (12, "PM"),
+                _ => (hh - 12, "PM"),
+            };
+            format!("{} {d}, {h12} {ap}", MONTHS[(mo as usize).clamp(1, 12) - 1])
+        }
+        None => String::new(),
+    }
+}
+
+fn figures(u: &UsageState) -> Rc<Figures> {
+    let key = FigKey {
+        generation: u.generation,
+        range: u.range,
+        metric: u.metric(),
+        hidden: u.hidden.clone(),
+        by_day: u.by_day,
+        now: today(),
+        hour: now_hour(),
+    };
+    if let Some(f) = u.cache.borrow().as_ref().filter(|f| f.key == key) {
+        return f.clone();
+    }
+    let f = Rc::new(build_figures(u, key));
+    *u.cache.borrow_mut() = Some(f.clone());
+    f
+}
+
+fn build_figures(u: &UsageState, key: FigKey) -> Figures {
+    let (m, now, hour, range) = (key.metric, key.now, key.hour, key.range);
+    let total = sum(within(u, now, hour, range));
+    let providers = group(within(u, now, hour, range), m, |r| r.provider.to_string());
+    // Columns: 24 hours, or at least a week of days.
+    let hourly = range == Range::Day;
+    let n = if hourly { 24 } else { range.days().max(7) as usize };
+    let first_day = now - n as i64 + 1;
+    let first_hour = hour - 23;
+    let mut series: Vec<Vec<f64>> = vec![vec![0.0; n]; providers.len()];
+    let chart_rows = u.rows.iter().filter(|r| {
+        u.shown(r.provider)
+            && if hourly { r.hour >= first_hour && r.hour <= hour } else { parse_day(&r.day).is_some_and(|d| d >= first_day && d <= now) }
+    });
+    for r in chart_rows {
+        let Some(p) = providers.iter().position(|(p, _)| p == r.provider) else { continue };
+        let col = if hourly { r.hour - first_hour } else { parse_day(&r.day).map_or(-1, |d| d - first_day) };
+        if !(0..n as i64).contains(&col) {
+            continue;
+        }
+        series[p][col as usize] += match m {
+            Metric::Cost => r.cost_usd,
+            Metric::Tokens => (r.input + r.output + r.cache_read + r.cache_write) as f64,
+        };
+    }
+    let titles: Vec<String> =
+        (0..n as i64).map(|i| if hourly { hour_label(first_hour + i) } else { short_date(first_day + i) }).collect();
+    let tick = |i: usize| if hourly { hour_label(first_hour + i as i64).to_uppercase() } else { short_date(first_day + i as i64).to_uppercase() };
+    let ticks = [tick(0), tick(n / 2), tick(n - 1)];
+    let top = nice_ceil(series.iter().flatten().copied().fold(0.0, f64::max));
+    let (areas, lines) = chart_shapes(&series, &providers, top, n);
+
+    let mut groups = if key.by_day {
+        let mut g = group(within(u, now, hour, range), m, |r| r.day.clone());
+        g.sort_by(|a, b| b.0.cmp(&a.0));
+        g
+    } else {
+        group(within(u, now, hour, range), m, |r| short_model(&r.model))
+    };
+    let whole: f64 = groups.iter().map(|g| g.1.value(m)).sum();
+    let best = groups.iter().map(|g| g.1.value(m)).fold(0.0, f64::max);
+    let more = groups.len().saturating_sub(LIMIT);
+    groups.truncate(LIMIT);
+    Figures { key, total, providers, series, titles, ticks, top, areas, lines, groups, more, whole, best }
+}
+
+/// The chart's two layers: the areas under each provider's line, and the gridlines with the
+/// lines themselves. A vertical fade between them makes the areas' gradient, as t3code's
+/// SVG gradient does, so the geometry stays one polygon and one stroke per provider: cheap
+/// to draw again on every hover.
+fn chart_shapes(series: &[Vec<f64>], providers: &[(String, Sum)], top: f64, n: usize) -> (Shape, Shape) {
+    let ink = Ink::new();
+    let y = |v: f64| (100.0 - v / top * 100.0) as f32;
+    let mut areas = Shape::new().view_box(n as f32, 100.0);
+    let mut lines = Shape::new().view_box(n as f32, 100.0);
+    for g in [0.0, 50.0] {
+        lines = lines.line([0.0, g], [n as f32, g], 1.0, LineCap::Butt, ink.line);
+    }
+    lines = lines.line([0.0, 100.0], [n as f32, 100.0], 1.0, LineCap::Butt, ink.line_strong);
+    let steps = if n > 40 { 4 } else { 8 };
+    // Biggest provider last, so it draws on top.
+    for (p, vals) in series.iter().enumerate().rev() {
+        let (_, _, color) = provider(&providers[p].0);
+        let ys: Vec<f32> = vals.iter().map(|v| y(*v)).collect();
+        let line = smooth(&ys, steps);
+        let mut poly = line.clone();
+        poly.push([n as f32 - 0.5, 100.0]);
+        poly.push([0.5, 100.0]);
+        areas = areas.fill(poly, color.alpha(0.3));
+        lines = lines.stroke(line, 1.75, color);
+    }
+    (areas, lines)
 }
 
 fn sum<'a>(it: impl Iterator<Item = &'a Usage>) -> Sum {
@@ -512,47 +670,10 @@ const PLOT_H: f32 = 216.0;
 const AXIS_W: f32 = 56.0;
 const TIP_W: f32 = 200.0;
 
-/// One smooth area per provider over the days, with one tooltip for the hovered day.
-fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)], layer: &mut Vec<El>) -> El {
-    let m = u.metric();
-    let n = u.range.days().max(7) as usize;
-    let first = now - n as i64 + 1;
-    // series[p][i]: provider p on day first + i.
-    let mut series: Vec<Vec<f64>> = vec![vec![0.0; n]; providers.len()];
-    for r in within(u, now, n as i64) {
-        let (Some(d), Some(p)) = (parse_day(&r.day), providers.iter().position(|(p, _)| p == r.provider)) else { continue };
-        let v = match m {
-            Metric::Cost => r.cost_usd,
-            Metric::Tokens => (r.input + r.output + r.cache_read + r.cache_write) as f64,
-        };
-        series[p][(d - first) as usize] += v;
-    }
-    let top = nice_ceil(series.iter().flatten().copied().fold(0.0, f64::max));
-    let y = |v: f64| (100.0 - v / top * 100.0) as f32;
-    let mut shape = Shape::new().view_box(n as f32, 100.0);
-    for g in [0.0, 50.0] {
-        shape = shape.line([0.0, g], [n as f32, g], 1.0, LineCap::Butt, ink.line);
-    }
-    shape = shape.line([0.0, 100.0], [n as f32, 100.0], 1.0, LineCap::Butt, ink.line_strong);
-    // Biggest provider last, so it draws on top.
-    const BANDS: usize = 12;
-    for (p, vals) in series.iter().enumerate().rev() {
-        let (_, _, color) = provider(&providers[p].0);
-        let ys: Vec<f32> = vals.iter().map(|v| y(*v)).collect();
-        let line = smooth(&ys, 8);
-        // A soft vertical gradient under the line: bands that follow the curve and fade out
-        // toward the axis.
-        // Nested areas that all start at the line and reach further down each time stack up
-        // to the densest colour under the line and thin out toward the axis.
-        let depth = 100.0 / BANDS as f32;
-        for b in 0..BANDS {
-            let reach = (b + 1) as f32 * depth;
-            let mut poly: Vec<[f32; 2]> = line.clone();
-            poly.extend(line.iter().rev().map(|[x, y]| [*x, (y + reach).min(100.0)]));
-            shape = shape.fill(poly, color.alpha(0.03));
-        }
-        shape = shape.stroke(line, 1.75, color);
-    }
+/// The cached chart, with a crosshair column under the pointer and one tooltip for it.
+fn chart(u: &UsageState, ink: &Ink, f: &Figures, layer: &mut Vec<El>) -> El {
+    let m = f.key.metric;
+    let n = f.titles.len();
     let columns = (0..n).map(|i| {
         let on = u.hover == Some(i);
         row()
@@ -574,7 +695,7 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)], layer
             .child(el().grow(1.0))
     });
     if let Some(i) = u.hover.filter(|i| *i < n) {
-        let total: f64 = series.iter().map(|s| s[i]).sum();
+        let total: f64 = f.series.iter().map(|s| s[i]).sum();
         let tip = col()
             .key("usage-tip")
             .anchored(format!("cline/{i}"), Side::Right, Align::Start, S2)
@@ -585,8 +706,8 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)], layer
             .fill(ink.raised)
             .radius(R_CTRL)
             .border(1.0, ink.line_strong)
-            .child(label(short_date(first + i as i64), 12.0, 600.0, ink.fg).pb(2.0))
-            .children(providers.iter().zip(&series).map(|((p, _), s)| {
+            .child(label(f.titles[i].clone(), 12.0, 600.0, ink.fg).pb(2.0))
+            .children(f.providers.iter().zip(&f.series).map(|((p, _), s)| {
                 let (name, glyph, color) = provider(p);
                 row()
                     .w_full()
@@ -606,13 +727,19 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)], layer
             );
         layer.push(tip);
     }
-    let ticks = [first, first + n as i64 / 2, now];
+    let top = f.top;
+    let title = match (m, f.key.range) {
+        (Metric::Cost, Range::Day) => "Hourly cost",
+        (Metric::Tokens, Range::Day) => "Hourly tokens",
+        (Metric::Cost, _) => "Daily cost",
+        (Metric::Tokens, _) => "Daily tokens",
+    };
     col()
         .key("usage-chart")
         .grow(1.0)
         .min_w(0.0)
         .gap(S3)
-        .child(section(if m == Metric::Cost { "Daily cost" } else { "Daily tokens" }, ink))
+        .child(section(title, ink))
         .child(
             row()
                 .w_full()
@@ -630,18 +757,14 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)], layer
                         })),
                 )
                 .child(
-                    el().key("plot").grow(1.0).min_w(0.0).h_full().child(canvas(shape).w_full().h_full()).child(
+                    el().key("plot").grow(1.0).min_w(0.0).h_full().child(canvas(f.areas.clone()).w_full().h_full())
+                        .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).gradient(ink.bg.alpha(0.0), ink.bg.alpha(0.92)))
+                        .child(canvas(f.lines.clone()).pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))).child(
                         row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).children(columns),
                     ),
                 ),
         )
-        .child(
-            row()
-                .w_full()
-                .pl(AXIS_W)
-                .justify_between()
-                .children(ticks.map(|d| data(short_date(d).to_uppercase(), 10.5, ink.faint))),
-        )
+        .child(row().w_full().pl(AXIS_W).justify_between().children(f.ticks.iter().map(|t| data(t.clone(), 10.5, ink.faint))))
 }
 
 fn totals(ink: &Ink, t: &Sum) -> El {
@@ -701,20 +824,9 @@ fn by_type(ink: &Ink, m: Metric, t: &Sum) -> El {
 
 const LIMIT: usize = 12;
 
-fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
-    let m = u.metric();
-    let scoped = || within(u, now, u.range.days());
-    let mut groups = if u.by_day {
-        let mut g = group(scoped(), m, |r| r.day.clone());
-        g.sort_by(|a, b| b.0.cmp(&a.0));
-        g
-    } else {
-        group(scoped(), m, |r| short_model(&r.model))
-    };
-    let whole: f64 = groups.iter().map(|g| g.1.value(m)).sum();
-    let best = groups.iter().map(|g| g.1.value(m)).fold(0.0, f64::max);
-    let more = groups.len().saturating_sub(LIMIT);
-    groups.truncate(LIMIT);
+fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, f: &Figures) -> El {
+    let m = f.key.metric;
+    let (groups, whole, best, more) = (&f.groups, f.whole, f.best, f.more);
     let head = |t: &str, w: f32| label(t, 12.0, 400.0, ink.muted).w(w).align(Align::End);
     col()
         .key("usage-breakdown")
@@ -1124,12 +1236,10 @@ pub fn view(s: &State, ink: &Ink, k: &Kit, layer: &mut Vec<El>) -> El {
     if u.rows.is_empty() {
         return empty("No usage found", "Looked in .claude, .codex, .local\\share\\opencode and .pi under your user folder.", true);
     }
-    let now = today();
-    let m = u.metric();
-    let total = sum(within(u, now, u.range.days()));
-    let providers = group(within(u, now, u.range.days()), m, |r| r.provider.to_string());
-    let top = row().key("usage-top").w_full().gap(S8).items_start().child(summary(ink, m, &total, &providers)).child(chart(u, ink, now, &providers, layer));
-    page(col().w_full().gap(S8).child(top).child(totals(ink, &total)).child(by_type(ink, m, &total)).child(breakdown(u, ink, k, now)))
+    let f = figures(u);
+    let m = f.key.metric;
+    let top = row().key("usage-top").w_full().gap(S8).items_start().child(summary(ink, m, &f.total, &f.providers)).child(chart(u, ink, &f, layer));
+    page(col().w_full().gap(S8).child(top).child(totals(ink, &f.total)).child(by_type(ink, m, &f.total)).child(breakdown(u, ink, k, &f)))
 }
 
 #[cfg(test)]

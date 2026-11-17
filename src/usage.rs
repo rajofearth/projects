@@ -40,6 +40,9 @@ pub struct Usage {
     pub day: String,
     /// Folder name of the session's cwd, or "" when unknown.
     pub project: String,
+    /// Epoch hour (seconds / 3600) for usage in the last 25 hours, -1 before that, so the
+    /// Past 24h view can slide by the hour as t3code's does.
+    pub hour: i64,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -84,7 +87,11 @@ struct Key {
     model: String,
     day: String,
     project: String,
+    hour: i64,
 }
+
+/// Usage at or after this epoch second is bucketed by hour too.
+static HOURLY_FROM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
 
 /// A single usage event before aggregation.
 struct RawUse {
@@ -109,6 +116,8 @@ struct RawUse {
     session_id: String,
     /// Repeats of one billed message share this key and are merged by max.
     dedupe: Option<String>,
+    /// Epoch seconds, 0 when unknown.
+    ts: i64,
     /// Service tier: 0 standard, 1 fast/priority, 2 ultrafast.
     speed: u8,
 }
@@ -151,6 +160,8 @@ pub fn load() -> Vec<Usage> {
 }
 
 fn load_inner(cutoff_ms: i64) -> Vec<Usage> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    HOURLY_FROM.store(now - 25 * 3600, std::sync::atomic::Ordering::Relaxed);
     let home = match std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
         Some(h) => PathBuf::from(h),
         None => return Vec::new(),
@@ -179,6 +190,7 @@ fn load_inner(cutoff_ms: i64) -> Vec<Usage> {
             model: k.model,
             day: k.day,
             project: k.project,
+            hour: k.hour,
             input: a.input,
             output: a.output,
             cache_read: a.cache_read,
@@ -258,6 +270,7 @@ fn accumulate(acc: &mut HashMap<Key, Acc>, raw: RawUse, counted: &mut HashSet<St
         model: raw.model,
         day: raw.day,
         project: raw.project,
+        hour: if raw.ts >= HOURLY_FROM.load(std::sync::atomic::Ordering::Relaxed) { raw.ts.div_euclid(3600) } else { -1 },
     };
     let a = acc.entry(key).or_default();
     a.input += raw.input;
@@ -335,6 +348,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
     };
 
     let day = day_from_timestamp(v.get("timestamp").and_then(Value::as_str).unwrap_or(""));
+    let ts = epoch_from_iso(v.get("timestamp").and_then(Value::as_str).unwrap_or("")).unwrap_or(0);
     let project = project_from_cwd(v.get("cwd").and_then(Value::as_str).unwrap_or(""));
     let session_id = v.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
     let cost = v.get("costUSD").and_then(Value::as_f64).filter(|c| c.is_finite());
@@ -369,6 +383,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
             cost,
             session_id: session_id.clone(),
             dedupe: dedupe.clone(),
+            ts,
             speed,
         });
     }
@@ -407,6 +422,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
                 cost: None, // advisor calls are priced at their own model
                 session_id: session_id.clone(),
                 dedupe: dedupe.as_ref().map(|d| format!("{d}:advisor:{index}")),
+                ts,
                 speed,
             });
         }
@@ -758,6 +774,7 @@ fn parse_codex_logs(
                         cost: None,
                         session_id: scan.session.clone(),
                         dedupe,
+                        ts: r.ts.div_euclid(1000),
                         speed: r.speed,
                     },
                 );
@@ -865,15 +882,13 @@ fn opencode_record(
         .or_else(|| v.get("providerID"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let day = match v.pointer("/time/created") {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_f64().map(|ms| ms as i64))
-            .map(|ms| local_day_from_epoch(ms / 1000)),
-        Some(Value::String(s)) => Some(day_from_timestamp(s)),
+    let secs = match v.pointer("/time/created") {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|ms| ms as i64)).map(|ms| ms / 1000),
+        Some(Value::String(s)) => epoch_from_iso(s),
         _ => None,
     }
-    .or_else(|| fallback_created.map(|ms| local_day_from_epoch(ms / 1000)))?;
+    .or_else(|| fallback_created.map(|ms| ms / 1000))?;
+    let day = local_day_from_epoch(secs);
     let session_id = v
         .get("sessionID")
         .and_then(Value::as_str)
@@ -913,6 +928,7 @@ fn opencode_record(
         cost,
         session_id,
         dedupe: id.map(|id| format!("opencode:{id}")),
+        ts: secs,
         speed: 0,
     })
 }
@@ -1092,6 +1108,7 @@ fn parse_pi_logs(
                             provider: "pi",
                             model,
                             day: day_from_timestamp(ts),
+                            ts: epoch_from_iso(ts).unwrap_or(0),
                             project: project_from_cwd(
                                 v.get("cwd").and_then(Value::as_str).unwrap_or(""),
                             ),
@@ -1232,6 +1249,7 @@ fn parse_grok_logs(
                         provider: "grok",
                         model,
                         day: local_day_from_epoch(ts.div_euclid(1000)),
+                        ts: ts.div_euclid(1000),
                         project: String::new(),
                         input: t[0],
                         output: t[3],
@@ -1610,6 +1628,7 @@ mod tests {
             cost: None,
             session_id: "s1".into(),
             dedupe: Some("claude:m:r".into()),
+            ts: 0,
             speed: 0,
         };
         let mut counted = HashSet::new();
@@ -1618,7 +1637,7 @@ mod tests {
         for raw in seen.into_values() {
             accumulate(&mut acc, raw, &mut counted);
         }
-        let row = &acc[&Key { provider: "claude", model: "claude-opus-5-5".into(), day: "2026-11-16".into(), project: "app".into() }];
+        let row = &acc[&Key { provider: "claude", model: "claude-opus-5-5".into(), day: "2026-11-16".into(), project: "app".into(), hour: -1 }];
         assert_eq!((row.input, row.output), (10, 40));
         assert!(row.cost > 0.0);
     }

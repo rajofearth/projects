@@ -719,6 +719,12 @@ fn scene_usage_tokens(s: &mut State) {
     s.usage.hover = None;
 }
 
+fn scene_usage_day(s: &mut State) {
+    scene_usage(s);
+    s.usage.range = usage_ui::Range::Day;
+    s.usage.hover = Some(20);
+}
+
 fn scene_usage_limits(s: &mut State) {
     scene_usage(s);
     s.usage.tab = usage_ui::Tab::Limits;
@@ -793,6 +799,7 @@ fn main() {
             ("demo-storage-open", scene_storage_open),
             ("demo-usage", scene_usage),
             ("demo-usage-tokens", scene_usage_tokens),
+            ("demo-usage-day", scene_usage_day),
             ("demo-usage-limits", scene_usage_limits),
             ("demo-usage-menu", scene_usage_menu),
             ("demo-templates", scene_templates),
