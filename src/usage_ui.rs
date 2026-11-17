@@ -1,19 +1,20 @@
-//! The usage page, after t3code's usage view: a hero total with its providers, a daily line
-//! chart with a hover crosshair, the token totals, the split by type and a breakdown by model
-//! or day. One range control and one Cost / Tokens switch drive all of it. The logs are read
-//! on a worker thread, the way the scan is.
+//! The usage page, a port of t3code's Usage view (MIT License, Copyright (c) 2026 T3 Tools
+//! Inc.): a breadcrumb with a provider filter, a range and a Cost / Tokens / Limits switch.
+//! Cost and Tokens show a hero total with its providers, a smooth daily area chart with one
+//! hover tooltip, the token totals, the split by type and a breakdown by model or day. Limits
+//! shows each provider's plan windows. Logs and limits are read on worker threads.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
-use rune::{canvas, col, el, icon, row, Align, Color, El, Icon, LineCap, ScrollSpec, Shape, Waker};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl, Spinner};
+use rune::{canvas, col, el, icon, row, Align, Color, El, Icon, LineCap, ScrollSpec, Shape, Side, Tx, Waker};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Menu, MenuItem, SegmentedControl, Spinner};
 
 use crate::fmt::{count, usd};
 use crate::icons;
-use crate::shell;
-use crate::ui::{card, data, label, rgb, Ink, R_CTRL, S1, S2, S3, S4, S5, S6, S8};
+use crate::limits::{self, Limits};
+use crate::ui::{data, label, rgb, Ink, R_CTRL, S1, S2, S3, S4, S5, S6, S8};
 use crate::usage::{self, Usage};
 use crate::State;
 
@@ -51,19 +52,36 @@ pub enum Metric {
     Tokens,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Cost,
+    Tokens,
+    Limits,
+}
+
+/// The providers the page reads, in t3code's menu order.
+const PROVIDERS: [&str; 4] = ["codex", "claude", "opencode", "pi"];
+
 pub struct UsageState {
     pub rows: Vec<Usage>,
     pub loading: bool,
     pub loaded: bool,
     pub range: Range,
-    pub metric: Metric,
+    pub tab: Tab,
     /// The breakdown lists days instead of models.
     pub by_day: bool,
     /// The chart column under the pointer.
     pub hover: Option<usize>,
+    /// Providers switched off in the breadcrumb menu.
+    pub hidden: Vec<&'static str>,
+    pub menu: bool,
+    pub limits: Vec<Limits>,
+    pub limits_loading: bool,
+    pub limits_loaded: bool,
     /// The demo scene reads the fixture instead of the logs.
     pub demo: bool,
     rx: Option<Receiver<Vec<Usage>>>,
+    limits_rx: Option<Receiver<Vec<Limits>>>,
 }
 
 impl UsageState {
@@ -73,12 +91,26 @@ impl UsageState {
             loading: false,
             loaded: false,
             range: Range::Month,
-            metric: Metric::Cost,
+            tab: Tab::Cost,
             by_day: false,
             hover: None,
+            hidden: Vec::new(),
+            menu: false,
+            limits: Vec::new(),
+            limits_loading: false,
+            limits_loaded: false,
             demo: false,
             rx: None,
+            limits_rx: None,
         }
+    }
+
+    fn metric(&self) -> Metric {
+        if self.tab == Tab::Tokens { Metric::Tokens } else { Metric::Cost }
+    }
+
+    fn shown(&self, provider: &str) -> bool {
+        !self.hidden.contains(&provider)
     }
 
     /// Reads the logs off the UI thread; the waker brings the answer back.
@@ -101,28 +133,89 @@ impl UsageState {
         });
     }
 
-    /// True when the load finished this turn.
-    pub fn drain(&mut self) -> bool {
-        let Some(rx) = &self.rx else { return false };
-        match rx.try_recv() {
-            Ok(rows) => {
-                self.rows = rows;
-                self.done();
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                self.done();
-                true
-            }
+    /// Reads plan limits off the UI thread (a log read and one HTTPS request).
+    pub fn start_limits(&mut self, waker: Option<Waker>) {
+        if self.limits_loading {
+            return;
         }
+        if self.demo {
+            self.limits = demo_limits();
+            self.limits_loaded = true;
+            return;
+        }
+        self.limits_loading = true;
+        let (tx, rx) = channel();
+        self.limits_rx = Some(rx);
+        let waker: Waker = waker.unwrap_or_else(|| Arc::new(|| ()));
+        std::thread::spawn(move || {
+            let _ = tx.send(limits::load());
+            waker();
+        });
     }
 
-    fn done(&mut self) {
+    /// True when a load finished this turn.
+    pub fn drain(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = &self.rx {
+            match rx.try_recv() {
+                Ok(rows) => {
+                    self.rows = rows;
+                    self.finish_rows();
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_rows();
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.limits_rx {
+            match rx.try_recv() {
+                Ok(l) => {
+                    self.limits = l;
+                    self.finish_limits();
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_limits();
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        changed
+    }
+
+    fn finish_rows(&mut self) {
         self.loading = false;
         self.loaded = true;
         self.rx = None;
     }
+
+    fn finish_limits(&mut self) {
+        self.limits_loading = false;
+        self.limits_loaded = true;
+        self.limits_rx = None;
+    }
+}
+
+fn demo_limits() -> Vec<Limits> {
+    let now = limits::now_secs();
+    let w = |label: &str, used: f64, left_secs: i64, mins: i64| limits::Window {
+        label: label.into(),
+        used_pct: used,
+        resets_at: Some(now + left_secs),
+        minutes: Some(mins),
+    };
+    vec![
+        Limits { provider: "codex", windows: vec![w("Monthly", 2.0, 7 * 86_400 + 19 * 3600, 43_200)], error: None },
+        Limits {
+            provider: "claude",
+            windows: vec![w("Session", 5.0, 3 * 3600 + 49 * 60, 300), w("Weekly", 65.0, 2 * 86_400 + 5 * 3600, 10_080)],
+            error: None,
+        },
+    ]
 }
 
 // ---- dates -----------------------------------------------------------------
@@ -244,7 +337,7 @@ fn fmt_value(m: Metric, v: f64) -> String {
 
 fn pct(part: f64, whole: f64) -> String {
     if whole <= 0.0 {
-        return "0%".into();
+        return "0.0%".into();
     }
     let p = part / whole * 100.0;
     if p > 0.0 && p < 0.1 {
@@ -254,9 +347,11 @@ fn pct(part: f64, whole: f64) -> String {
     }
 }
 
-/// Rows from `back` days ago through today.
-fn within(rows: &[Usage], now: i64, back: i64) -> impl Iterator<Item = &Usage> {
-    rows.iter().filter(move |u| parse_day(&u.day).is_some_and(|d| d <= now && d > now - back))
+/// Rows of the shown providers from `back` days ago through today.
+fn within(u: &UsageState, now: i64, back: i64) -> impl Iterator<Item = &Usage> {
+    u.rows
+        .iter()
+        .filter(move |r| u.shown(r.provider) && parse_day(&r.day).is_some_and(|d| d <= now && d > now - back))
 }
 
 fn sum<'a>(it: impl Iterator<Item = &'a Usage>) -> Sum {
@@ -302,17 +397,59 @@ fn provider(p: &str) -> (String, &'static Icon, Color) {
     }
 }
 
+/// Monotone cubic interpolation (Fritsch–Carlson, d3's `curveMonotoneX`) sampled densely:
+/// a smooth line through every point that never overshoots, so a zero day stays on the axis.
+fn smooth(ys: &[f32], steps: usize) -> Vec<[f32; 2]> {
+    let n = ys.len();
+    if n < 2 {
+        return ys.iter().enumerate().map(|(i, y)| [i as f32 + 0.5, *y]).collect();
+    }
+    let d: Vec<f32> = ys.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut m = vec![0.0f32; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for k in 1..n - 1 {
+        m[k] = if d[k - 1] * d[k] <= 0.0 { 0.0 } else { (d[k - 1] + d[k]) / 2.0 };
+    }
+    for k in 0..n - 1 {
+        if d[k] == 0.0 {
+            m[k] = 0.0;
+            m[k + 1] = 0.0;
+            continue;
+        }
+        let (a, b) = (m[k] / d[k], m[k + 1] / d[k]);
+        let h = a * a + b * b;
+        if h > 9.0 {
+            let t = 3.0 / h.sqrt();
+            m[k] = t * a * d[k];
+            m[k + 1] = t * b * d[k];
+        }
+    }
+    let mut out = Vec::with_capacity((n - 1) * steps + 1);
+    for k in 0..n - 1 {
+        for s in 0..steps {
+            let t = s as f32 / steps as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let y = (2.0 * t3 - 3.0 * t2 + 1.0) * ys[k] + (t3 - 2.0 * t2 + t) * m[k] + (-2.0 * t3 + 3.0 * t2) * ys[k + 1] + (t3 - t2) * m[k + 1];
+            out.push([k as f32 + 0.5 + t, y]);
+        }
+    }
+    out.push([n as f32 - 0.5, ys[n - 1]]);
+    out
+}
+
 // ---- view ------------------------------------------------------------------
 
 fn section(title: &str, ink: &Ink) -> El {
-    label(title, 13.0, 500.0, ink.fg)
+    label(title, 14.0, 600.0, ink.fg)
 }
 
 /// The hero total and one line per provider.
 fn summary(ink: &Ink, m: Metric, total: &Sum, providers: &[(String, Sum)]) -> El {
     let whole = total.value(m);
     let unit = if m == Metric::Cost { "cost" } else { "tokens" };
-    let sessions = format!("{} session{}", total.sessions, if total.sessions == 1 { "" } else { "s" });
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let sessions = format!("{} session{} · API estimate", total.sessions, plural(total.sessions));
     col()
         .key("usage-summary")
         .w(300.0)
@@ -321,15 +458,15 @@ fn summary(ink: &Ink, m: Metric, total: &Sum, providers: &[(String, Sum)]) -> El
         .child(
             col()
                 .gap(S1)
-                .child(label(fmt_value(m, whole), 34.0, 600.0, ink.fg))
+                .child(label(fmt_value(m, whole), 36.0, 700.0, ink.fg))
                 .child(label(
-                    if m == Metric::Cost && total.unpriced { format!("{sessions} · unpriced models count as $0") } else { sessions },
+                    if m == Metric::Cost && total.unpriced { format!("{sessions} · some models unpriced") } else { sessions },
                     12.0,
                     400.0,
-                    ink.faint,
+                    ink.muted,
                 )),
         )
-        .child(col().gap(S4).children(providers.iter().map(|(p, s)| {
+        .child(col().gap(S5).children(providers.iter().map(|(p, s)| {
             let (name, glyph, color) = provider(p);
             let other = match m {
                 Metric::Cost => format!("{} tokens", count(s.tokens)),
@@ -344,29 +481,29 @@ fn summary(ink: &Ink, m: Metric, total: &Sum, providers: &[(String, Sum)]) -> El
                         .w_full()
                         .gap(S2)
                         .items_center()
-                        .child(el().size(6.0, 6.0).radius(3.0).fill(color))
-                        .child(icon(glyph, 13.0).color(color))
-                        .child(label(name, 13.0, 500.0, ink.fg))
-                        .child(label(format!("{} sess.", s.sessions), 11.0, 400.0, ink.faint).truncate().shrink())
+                        .child(el().size(7.0, 7.0).radius(3.5).fill(color))
+                        .child(icon(glyph, 14.0).color(color))
+                        .child(label(name, 14.0, 500.0, ink.fg))
+                        .child(label(format!("{} session{}", s.sessions, plural(s.sessions)), 11.0, 400.0, ink.faint).truncate().shrink())
                         .child(el().grow(1.0))
-                        .child(data(fmt_value(m, s.value(m)), 13.0, ink.fg)),
+                        .child(data(fmt_value(m, s.value(m)), 14.0, ink.fg)),
                 )
-                .child(data(format!("{} of {unit} · {other}", pct(s.value(m), whole)), 11.0, ink.faint).pl(28.0))
+                .child(label(format!("{} of {unit} · {other}", pct(s.value(m), whole)), 12.0, 400.0, ink.muted))
         })))
 }
 
-const PLOT_H: f32 = 220.0;
-const AXIS_W: f32 = 52.0;
-const TIP_W: f32 = 184.0;
+const PLOT_H: f32 = 216.0;
+const AXIS_W: f32 = 56.0;
+const TIP_W: f32 = 200.0;
 
-/// One line per provider over the days, with a crosshair and tooltip on the hovered day.
-fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)]) -> El {
-    let m = u.metric;
+/// One smooth area per provider over the days, with one tooltip for the hovered day.
+fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)], layer: &mut Vec<El>) -> El {
+    let m = u.metric();
     let n = u.range.days().max(7) as usize;
     let first = now - n as i64 + 1;
     // series[p][i]: provider p on day first + i.
     let mut series: Vec<Vec<f64>> = vec![vec![0.0; n]; providers.len()];
-    for r in within(&u.rows, now, n as i64) {
+    for r in within(u, now, n as i64) {
         let (Some(d), Some(p)) = (parse_day(&r.day), providers.iter().position(|(p, _)| p == r.provider)) else { continue };
         let v = match m {
             Metric::Cost => r.cost_usd,
@@ -377,56 +514,39 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)]) -> El
     let top = nice_ceil(series.iter().flatten().copied().fold(0.0, f64::max));
     let y = |v: f64| (100.0 - v / top * 100.0) as f32;
     let mut shape = Shape::new().view_box(n as f32, 100.0);
-    for g in [0.0, 50.0, 100.0] {
+    for g in [0.0, 50.0] {
         shape = shape.line([0.0, g], [n as f32, g], 1.0, LineCap::Butt, ink.line);
     }
+    shape = shape.line([0.0, 100.0], [n as f32, 100.0], 1.0, LineCap::Butt, ink.line_strong);
     // Biggest provider last, so it draws on top.
+    const BANDS: usize = 12;
     for (p, vals) in series.iter().enumerate().rev() {
         let (_, _, color) = provider(&providers[p].0);
-        let pts: Vec<[f32; 2]> = vals.iter().enumerate().map(|(i, v)| [i as f32 + 0.5, y(*v)]).collect();
-        let mut area = pts.clone();
-        area.push([n as f32 - 0.5, 100.0]);
-        area.push([0.5, 100.0]);
-        shape = shape.fill(area, color.alpha(0.08)).stroke(pts, 1.5, color);
+        let ys: Vec<f32> = vals.iter().map(|v| y(*v)).collect();
+        let line = smooth(&ys, 8);
+        // A soft vertical gradient under the line: bands that follow the curve and fade out
+        // toward the axis.
+        // Nested areas that all start at the line and reach further down each time stack up
+        // to the densest colour under the line and thin out toward the axis.
+        let depth = 100.0 / BANDS as f32;
+        for b in 0..BANDS {
+            let reach = (b + 1) as f32 * depth;
+            let mut poly: Vec<[f32; 2]> = line.clone();
+            poly.extend(line.iter().rev().map(|[x, y]| [*x, (y + reach).min(100.0)]));
+            shape = shape.fill(poly, color.alpha(0.03));
+        }
+        shape = shape.stroke(line, 1.75, color);
     }
     let columns = (0..n).map(|i| {
         let on = u.hover == Some(i);
-        let tip = on.then(|| {
-            let total: f64 = series.iter().map(|s| s[i]).sum();
-            col()
-                .absolute(if i < n / 2 { S2 } else { -TIP_W - S2 }, S2)
-                .w(TIP_W)
-                .padding(S3)
-                .gap(S1)
-                .fill(ink.raised)
-                .radius(R_CTRL)
-                .border(1.0, ink.line_strong)
-                .child(label(short_date(first + i as i64), 12.0, 500.0, ink.fg).pb(2.0))
-                .children(providers.iter().zip(&series).map(|((p, _), s)| {
-                    let (name, glyph, color) = provider(p);
-                    row()
-                        .w_full()
-                        .gap(6.0)
-                        .items_center()
-                        .child(icon(glyph, 11.0).color(color))
-                        .child(label(name, 11.5, 400.0, ink.muted).grow(1.0))
-                        .child(data(fmt_value(m, s[i]), 11.5, ink.fg))
-                }))
-                .child(
-                    row()
-                        .w_full()
-                        .pt(S1)
-                        .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
-                        .child(label("Total", 11.5, 400.0, ink.muted).grow(1.0))
-                        .child(data(fmt_value(m, total), 11.5, ink.fg)),
-                )
-        });
         row()
             .key(format!("cday/{i}"))
             .grow(1.0)
             .min_w(0.0)
             .h_full()
-            .on_hover_change(move |s: &mut State, inside, _| {
+            .on_hover_change(move |s: &mut State, inside, tx: &mut Tx| {
+                // Swap the one tooltip in place: no enter/exit fades to overlap.
+                tx.instant();
                 if inside {
                     s.usage.hover = Some(i);
                 } else if s.usage.hover == Some(i) {
@@ -434,16 +554,49 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)]) -> El
                 }
             })
             .child(el().grow(1.0))
-            .child(el().w(1.0).h_full().fill(if on { ink.line_strong } else { Color::TRANSPARENT }).children(tip))
+            .child(el().key(format!("cline/{i}")).w(1.0).h_full().fill(if on { ink.line_strong } else { Color::TRANSPARENT }))
             .child(el().grow(1.0))
     });
+    if let Some(i) = u.hover.filter(|i| *i < n) {
+        let total: f64 = series.iter().map(|s| s[i]).sum();
+        let tip = col()
+            .key("usage-tip")
+            .anchored(format!("cline/{i}"), Side::Right, Align::Start, S2)
+            .instant_changes()
+            .w(TIP_W)
+            .padding(S3)
+            .gap(S1)
+            .fill(ink.raised)
+            .radius(R_CTRL)
+            .border(1.0, ink.line_strong)
+            .child(label(short_date(first + i as i64), 12.0, 600.0, ink.fg).pb(2.0))
+            .children(providers.iter().zip(&series).map(|((p, _), s)| {
+                let (name, glyph, color) = provider(p);
+                row()
+                    .w_full()
+                    .gap(6.0)
+                    .items_center()
+                    .child(icon(glyph, 11.0).color(color))
+                    .child(label(name, 12.0, 400.0, ink.muted).grow(1.0))
+                    .child(data(fmt_value(m, s[i]), 12.0, ink.fg))
+            }))
+            .child(
+                row()
+                    .w_full()
+                    .pt(S1)
+                    .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
+                    .child(label("Total", 12.0, 500.0, ink.muted).grow(1.0))
+                    .child(data(fmt_value(m, total), 12.0, ink.fg)),
+            );
+        layer.push(tip);
+    }
     let ticks = [first, first + n as i64 / 2, now];
     col()
         .key("usage-chart")
         .grow(1.0)
         .min_w(0.0)
         .gap(S3)
-        .child(section(if m == Metric::Cost { "Daily cost" } else { "Daily processed tokens" }, ink))
+        .child(section(if m == Metric::Cost { "Daily cost" } else { "Daily tokens" }, ink))
         .child(
             row()
                 .w_full()
@@ -455,16 +608,15 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)]) -> El
                         .pr(S2)
                         .justify_between()
                         .items_end()
-                        .children([top, top / 2.0, 0.0].map(|v| data(fmt_value(m, v), 10.5, ink.faint).offset(0.0, if v == top { -6.0 } else if v == 0.0 { 6.0 } else { 0.0 }))),
+                        .children([top, top / 2.0, 0.0].map(|v| {
+                            data(if v == 0.0 { "0".into() } else { fmt_value(m, v) }, 10.5, ink.faint)
+                                .offset(0.0, if v == top { -6.0 } else if v == 0.0 { 6.0 } else { 0.0 })
+                        })),
                 )
                 .child(
-                    el()
-                        .key("plot")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .h_full()
-                        .child(canvas(shape).w_full().h_full())
-                        .child(row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).children(columns)),
+                    el().key("plot").grow(1.0).min_w(0.0).h_full().child(canvas(shape).w_full().h_full()).child(
+                        row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).children(columns),
+                    ),
                 ),
         )
         .child(
@@ -477,11 +629,10 @@ fn chart(u: &UsageState, ink: &Ink, now: i64, providers: &[(String, Sum)]) -> El
 }
 
 fn totals(ink: &Ink, t: &Sum) -> El {
-    let cell = |k: &str, v: String| col().grow(1.0).min_w(0.0).gap(S1).child(label(k, 12.0, 400.0, ink.faint)).child(data(v, 18.0, ink.fg));
-    card(ink)
+    let cell = |k: &str, v: String| col().grow(1.0).min_w(0.0).gap(S1).child(label(k, 12.0, 400.0, ink.muted)).child(data(v, 18.0, ink.fg));
+    col()
         .key("usage-totals")
         .w_full()
-        .padding(S5)
         .gap(S3)
         .child(section("Totals", ink))
         .child(
@@ -499,31 +650,30 @@ fn totals(ink: &Ink, t: &Sum) -> El {
 fn by_type(ink: &Ink, m: Metric, t: &Sum) -> El {
     let parts: Vec<(&str, f64, Color)> = match m {
         Metric::Cost => vec![
-            ("Input", t.c_input, ink.fg.alpha(0.35)),
-            ("Cache read", t.c_cache_read, ink.fg.alpha(0.18)),
-            ("Cache write", t.c_cache_write, ink.fg.alpha(0.6)),
-            ("Output", t.c_output, ink.accent),
-            ("Other", t.c_other, ink.fg.alpha(0.9)),
+            ("Input", t.c_input, ink.fg.alpha(0.55)),
+            ("Cache read", t.c_cache_read, ink.fg.alpha(0.3)),
+            ("Cache write", t.c_cache_write, ink.fg.alpha(0.7)),
+            ("Output", t.c_output, ink.fg),
+            ("Other", t.c_other, ink.fg.alpha(0.42)),
         ],
         Metric::Tokens => vec![
-            ("Input", t.input as f64, ink.fg.alpha(0.35)),
-            ("Cache read", t.cache_read as f64, ink.fg.alpha(0.18)),
-            ("Cache write", t.cache_write as f64, ink.fg.alpha(0.6)),
-            ("Output", t.output as f64, ink.accent),
+            ("Input", t.input as f64, ink.fg.alpha(0.55)),
+            ("Cache read", t.cache_read as f64, ink.fg.alpha(0.3)),
+            ("Cache write", t.cache_write as f64, ink.fg.alpha(0.7)),
+            ("Output", t.output as f64, ink.fg),
         ],
     };
-    card(ink)
+    col()
         .key("usage-types")
         .w_full()
-        .padding(S5)
         .gap(S3)
         .child(section(if m == Metric::Cost { "Cost by type" } else { "Tokens by type" }, ink))
         .child(
-            row().w_full().h(8.0).gap(2.0).radius(4.0).fill(ink.raised).children(
+            row().w_frac(0.5).h(8.0).gap(3.0).children(
                 parts.iter().filter(|p| p.1 > 0.0).map(|(_, v, c)| el().grow(*v as f32).min_w(3.0).h_full().radius(2.0).fill(*c)),
             ),
         )
-        .child(row().w_full().gap(S5).children(parts.iter().map(|(k, v, c)| {
+        .child(row().w_frac(0.6).gap(S4).wrap().children(parts.iter().map(|(k, v, c)| {
             row()
                 .gap(6.0)
                 .items_center()
@@ -536,8 +686,8 @@ fn by_type(ink: &Ink, m: Metric, t: &Sum) -> El {
 const LIMIT: usize = 12;
 
 fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
-    let m = u.metric;
-    let scoped = || within(&u.rows, now, u.range.days());
+    let m = u.metric();
+    let scoped = || within(u, now, u.range.days());
     let mut groups = if u.by_day {
         let mut g = group(scoped(), m, |r| r.day.clone());
         g.sort_by(|a, b| b.0.cmp(&a.0));
@@ -549,11 +699,10 @@ fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
     let best = groups.iter().map(|g| g.1.value(m)).fold(0.0, f64::max);
     let more = groups.len().saturating_sub(LIMIT);
     groups.truncate(LIMIT);
-    let head = |t: &str, w: f32| label(t, 11.5, 400.0, ink.faint).w(w).align(Align::End);
-    card(ink)
+    let head = |t: &str, w: f32| label(t, 12.0, 400.0, ink.muted).w(w).align(Align::End);
+    col()
         .key("usage-breakdown")
         .w_full()
-        .padding(S5)
         .gap(S2)
         .child(
             row().w_full().items_center().child(section("Breakdown", ink).grow(1.0)).child(
@@ -569,8 +718,8 @@ fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
                 .w_full()
                 .h(32.0)
                 .items_center()
-                .child(label("#", 11.5, 400.0, ink.faint).w(32.0))
-                .child(label(if u.by_day { "Day" } else { "Model" }, 11.5, 400.0, ink.faint).grow(1.0))
+                .child(label("#", 12.0, 400.0, ink.muted).w(32.0))
+                .child(label(if u.by_day { "Day" } else { "Model" }, 12.0, 400.0, ink.muted).grow(1.0))
                 .child(head("Cost", 96.0))
                 .child(head("Share", 80.0))
                 .child(head("Tokens", 88.0)),
@@ -583,7 +732,7 @@ fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
             row()
                 .key(format!("brk/{i}"))
                 .w_full()
-                .h(48.0)
+                .h(49.0)
                 .items_center()
                 .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
                 .child(data((i + 1).to_string(), 12.0, ink.faint).w(32.0))
@@ -596,55 +745,263 @@ fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
                             row()
                                 .gap(S2)
                                 .items_center()
-                                .children((!u.by_day).then(|| icon(glyph, 12.0).color(color)))
-                                .child(data(name, 13.0, ink.fg).truncate()),
+                                .children((!u.by_day).then(|| icon(glyph, 13.0).color(color)))
+                                .child(data(name, 13.5, ink.fg).truncate()),
                         )
                         .child(
-                            row().w_frac(0.5).h(2.0).child(
-                                el().h_full().w_frac(frac).min_w(2.0).radius(1.0).fill(if u.by_day { ink.accent } else { color }),
+                            row().w_frac(0.4).h(2.0).child(
+                                el().h_full().w_frac(frac).min_w(4.0).radius(1.0).fill(if u.by_day { ink.fg.alpha(0.6) } else { color }),
                             ),
                         ),
                 )
-                .child(data(if unpriced { "Unpriced".into() } else { usd(s.cost) }, 13.0, if unpriced { ink.faint } else { ink.fg }).w(96.0).align(Align::End))
+                .child(
+                    data(if unpriced { "Unpriced".into() } else { usd(s.cost) }, 13.0, if unpriced { ink.faint } else { ink.fg })
+                        .w(96.0)
+                        .align(Align::End),
+                )
                 .child(data(pct(s.value(m), whole), 13.0, ink.muted).w(80.0).align(Align::End))
                 .child(data(count(s.tokens), 13.0, ink.muted).w(88.0).align(Align::End))
         }))
         .children((more > 0).then(|| data(format!("+{more} more"), 11.5, ink.faint).pt(S2)))
 }
 
-fn reload(s: &mut State) {
-    let waker = s.waker.clone();
-    s.usage.start(waker);
+// ---- limits -----------------------------------------------------------------
+
+const HATCH_W: f32 = 2400.0;
+const BAR_H: f32 = 32.0;
+
+/// One plan window: "NN% left", then a bar filled to what is left, hatched where it is used,
+/// with a marker at the share of the window's time still to run and the reset countdown.
+fn limit_window(ink: &Ink, color: Color, w: &limits::Window, now: i64, key: String) -> El {
+    let left = (100.0 - w.used_pct).clamp(0.0, 100.0);
+    let mut hatch = Shape::new();
+    let mut x = -BAR_H;
+    while x < HATCH_W {
+        hatch = hatch.line([x, BAR_H], [x + BAR_H, 0.0], 1.0, LineCap::Butt, color.alpha(0.35));
+        x += 7.0;
+    }
+    let remaining = w.resets_at.map(|t| t - now);
+    let time_left = match (remaining, w.minutes) {
+        (Some(r), Some(mins)) if mins > 0 => Some((r as f32 / (mins as f32 * 60.0)).clamp(0.0, 1.0)),
+        _ => None,
+    };
+    let pill = remaining.map(|r| {
+        row()
+            .h(20.0)
+            .px(6.0)
+            .gap(4.0)
+            .radius(5.0)
+            .items_center()
+            .fill(ink.bg)
+            .child(icon(&icons::REFRESH, 10.0).color(ink.fg))
+            .child(data(limits::countdown(r), 11.0, ink.fg))
+    });
+    let bar = el()
+        .key(format!("{key}/bar"))
+        .grow(1.0)
+        .min_w(0.0)
+        .h(BAR_H)
+        .clip_rounded(6.0)
+        .child(canvas(hatch).absolute(0.0, 0.0).size(HATCH_W, BAR_H))
+        .child(
+            row()
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .child(el().w_frac(left as f32 / 100.0).h_full().fill(ink.card).child(el().w_full().h_full().fill(color.alpha(0.42)))),
+        )
+        .children(time_left.map(|f| {
+            row()
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .child(el().w_frac(f).h_full())
+                .child(el().w(2.0).h_full().fill(ink.fg))
+        }))
+        .children(pill.map(|p| row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).pr(6.0).items_center().justify_end().child(p)));
+    row()
+        .key(key)
+        .w_full()
+        .padding(S4)
+        .gap(S6)
+        .items_center()
+        .fill(ink.card)
+        .radius(R_CTRL + 2.0)
+        .border(1.0, ink.line)
+        .child(
+            col().w(180.0).gap(2.0).child(label(w.label.clone(), 13.0, 600.0, ink.fg)).child(
+                row()
+                    .gap(S2)
+                    .items_end()
+                    .child(label(format!("{left:.0}%"), 30.0, 700.0, ink.fg))
+                    .child(label("left", 13.0, 400.0, ink.muted).pb(5.0)),
+            ),
+        )
+        .child(bar)
 }
 
-pub fn view(s: &State, ink: &Ink, k: &Kit) -> El {
+fn limits_view(u: &UsageState, ink: &Ink, k: &Kit) -> El {
+    if !u.limits_loaded {
+        return col().w_full().pt(120.0).gap(S3).items_center().child(Spinner::new().build(k)).child(label("Reading plan limits", 15.0, 500.0, ink.fg));
+    }
+    let now = limits::now_secs();
+    col().key("usage-limits").w_full().gap(S6).children(u.limits.iter().filter(|l| u.shown(l.provider)).map(|l| {
+        let (name, glyph, color) = provider(l.provider);
+        let name = if l.provider == "claude" { "Claude".to_string() } else { name };
+        col()
+            .key(format!("lim/{}", l.provider))
+            .w_full()
+            .gap(S3)
+            .child(row().gap(S2).items_center().child(icon(glyph, 15.0).color(color)).child(label(name, 14.0, 600.0, ink.fg)))
+            .children(l.windows.iter().enumerate().map(|(i, w)| limit_window(ink, color, w, now, format!("lim/{}/{i}", l.provider))))
+            .children(l.error.as_ref().map(|e| {
+                row()
+                    .w_full()
+                    .padding(S4)
+                    .gap(S2)
+                    .items_center()
+                    .fill(ink.card)
+                    .radius(R_CTRL + 2.0)
+                    .border(1.0, ink.line)
+                    .child(label("Unavailable", 13.0, 600.0, ink.fg))
+                    .child(label(e.clone(), 12.0, 400.0, ink.muted))
+            }))
+    }))
+}
+
+// ---- page -------------------------------------------------------------------
+
+fn reload(s: &mut State) {
+    let waker = s.waker.clone();
+    if s.usage.tab == Tab::Limits {
+        s.usage.start_limits(waker);
+    } else {
+        s.usage.start(waker);
+    }
+}
+
+fn toggle_provider(s: &mut State, p: &'static str) {
+    let h = &mut s.usage.hidden;
+    if let Some(i) = h.iter().position(|x| *x == p) {
+        h.remove(i);
+    } else if h.len() + 1 < PROVIDERS.len() {
+        h.push(p);
+    }
+    s.usage.hover = None;
+}
+
+/// "Usage / All providers ▾" with the provider checklist.
+fn crumbs(u: &UsageState, ink: &Ink, k: &Kit, layer: &mut Vec<El>) -> El {
+    let shown: Vec<&str> = PROVIDERS.iter().copied().filter(|p| u.shown(p)).collect();
+    let title = match shown.as_slice() {
+        all if all.len() == PROVIDERS.len() => "All providers".to_string(),
+        [one] => provider(one).0,
+        some => format!("{} providers", some.len()),
+    };
+    let trigger = row()
+        .key("usage-prov-btn")
+        .h(30.0)
+        .px(S2)
+        .gap(S1)
+        .radius(R_CTRL)
+        .items_center()
+        .fill(if u.menu { ink.hover } else { Color::TRANSPARENT })
+        .on_press(|s: &mut State| s.usage.menu = !s.usage.menu)
+        .child(label(title, 14.0, 600.0, ink.fg))
+        .child(icon(&icons::DOWN, 12.0).color(ink.muted));
+    let all = shown.len() == PROVIDERS.len();
+    let mut menu = Menu::new("usage-prov")
+        .trigger(trigger)
+        .open(u.menu)
+        .min_width(200.0)
+        .item(MenuItem::new("All providers").checked(all).on_select(|s: &mut State| s.usage.hidden.clear()))
+        .separator();
+    for p in PROVIDERS {
+        let (name, glyph, color) = provider(p);
+        menu = menu.item(
+            MenuItem::new(name)
+                .checked(u.shown(p))
+                .lead(icon(glyph, 14.0).color(color))
+                .on_select(move |s: &mut State| toggle_provider(s, p)),
+        );
+    }
+    let menu = menu.on_close(|s: &mut State| s.usage.menu = false).build(k, layer);
+    row()
+        .gap(S2)
+        .items_center()
+        .child(label("Usage", 14.0, 400.0, ink.muted))
+        .child(label("/", 14.0, 400.0, ink.faint))
+        .child(menu)
+}
+
+pub fn view(s: &State, ink: &Ink, k: &Kit, layer: &mut Vec<El>) -> El {
     let u = &s.usage;
-    let range_pick = SegmentedControl::new(&Range::ALL.map(|r| r.label()), Range::ALL.iter().position(|r| *r == u.range))
-        .label("Range")
-        .fit()
-        .on_pick(|s: &mut State, i, _| {
-            s.usage.range = Range::ALL[i];
-            s.usage.hover = None;
-        })
-        .build(k);
-    let mode_pick = SegmentedControl::new(&["Cost", "Tokens"], Some((u.metric == Metric::Tokens) as usize))
-        .label("Show")
-        .fit()
-        .on_pick(|s: &mut State, i, _| s.usage.metric = if i == 0 { Metric::Cost } else { Metric::Tokens })
-        .build(k);
-    let refresh = IconButton::new(&icons::REFRESH)
-        .variant(IconButtonVariant::Ghost)
-        .control_size(ControlSize::Large)
-        .label("Reload")
-        .help("Read the logs again")
-        .on_press(reload)
-        .build(k);
-    let header = shell::header("Usage", None, vec![range_pick, mode_pick, refresh], ink);
-    let empty = |title: &str, body: &str, button: bool| {
+    let mut trailing = Vec::new();
+    if u.tab != Tab::Limits {
+        trailing.push(
+            SegmentedControl::new(&Range::ALL.map(|r| r.label()), Range::ALL.iter().position(|r| *r == u.range))
+                .label("Range")
+                .fit()
+                .on_pick(|s: &mut State, i, _| {
+                    s.usage.range = Range::ALL[i];
+                    s.usage.hover = None;
+                })
+                .build(k),
+        );
+    }
+    trailing.push(
+        SegmentedControl::new(&["Cost", "Tokens", "Limits"], Some(u.tab as usize))
+            .label("Show")
+            .fit()
+            .on_pick(|s: &mut State, i, _| {
+                s.usage.tab = [Tab::Cost, Tab::Tokens, Tab::Limits][i];
+                s.usage.hover = None;
+                if s.usage.tab == Tab::Limits && !s.usage.limits_loaded {
+                    let waker = s.waker.clone();
+                    s.usage.start_limits(waker);
+                }
+            })
+            .build(k),
+    );
+    trailing.push(
+        IconButton::new(&icons::REFRESH)
+            .variant(IconButtonVariant::Ghost)
+            .control_size(ControlSize::Large)
+            .label("Refresh")
+            .help(if u.tab == Tab::Limits { "Read plan limits again" } else { "Read the logs again" })
+            .on_press(reload)
+            .build(k),
+    );
+    let header = row()
+        .key("topline")
+        .w_full()
+        .h(56.0)
+        .shrink()
+        .px(S6)
+        .gap(S3)
+        .items_center()
+        .border_sides([0.0, 0.0, 1.0, 0.0], ink.line)
+        .child(crumbs(u, ink, k, layer))
+        .child(el().grow(1.0))
+        .child(row().gap(S2).items_center().children(trailing));
+
+    let page = |body: El| {
         col().key("usage").w_full().h_full().child(header.clone()).child(
             col()
+                .key("usage-scroll")
+                .grow(1.0)
+                .min_h(0.0)
                 .w_full()
-                .pt(120.0)
+                .scroll(ScrollSpec { stick_bottom: false })
+                .scroll_edge_fade(16.0)
+                .items_center()
+                .child(col().w_full().max_w(1000.0).px(S6).pt(S6).pb(S8).gap(S8).child(body)),
+        )
+    };
+    if u.tab == Tab::Limits {
+        return page(limits_view(u, ink, k));
+    }
+    let empty = |title: &str, body: &str, button: bool| {
+        page(
+            col()
+                .w_full()
+                .pt(96.0)
                 .gap(S3)
                 .items_center()
                 .children((!button).then(|| Spinner::new().build(k)))
@@ -657,41 +1014,14 @@ pub fn view(s: &State, ink: &Ink, k: &Kit) -> El {
         return empty(if u.loading { "Reading the logs" } else { "Not read yet" }, "Claude Code, Codex, OpenCode and Pi", false);
     }
     if u.rows.is_empty() {
-        return empty(
-            "No usage found",
-            "Looked in .claude, .codex, .local\\share\\opencode and .pi under your user folder.",
-            true,
-        );
+        return empty("No usage found", "Looked in .claude, .codex, .local\\share\\opencode and .pi under your user folder.", true);
     }
     let now = today();
-    let m = u.metric;
-    let total = sum(within(&u.rows, now, u.range.days()));
-    let providers = group(within(&u.rows, now, u.range.days()), m, |r| r.provider.to_string());
-    let top = card(ink)
-        .key("usage-top")
-        .w_full()
-        .padding(S6)
-        .child(row().w_full().gap(S8).items_start().child(summary(ink, m, &total, &providers)).child(chart(u, ink, now, &providers)));
-    col().key("usage").w_full().h_full().child(header).child(
-        col()
-            .key("usage-scroll")
-            .grow(1.0)
-            .min_h(0.0)
-            .w_full()
-            .scroll(ScrollSpec { stick_bottom: false })
-            .scroll_edge_fade(16.0)
-            .child(
-                col()
-                    .w_full()
-                    .px(S6)
-                    .pb(S6)
-                    .gap(S4)
-                    .child(top)
-                    .child(totals(ink, &total))
-                    .child(by_type(ink, m, &total))
-                    .child(breakdown(u, ink, k, now)),
-            ),
-    )
+    let m = u.metric();
+    let total = sum(within(u, now, u.range.days()));
+    let providers = group(within(u, now, u.range.days()), m, |r| r.provider.to_string());
+    let top = row().key("usage-top").w_full().gap(S8).items_start().child(summary(ink, m, &total, &providers)).child(chart(u, ink, now, &providers, layer));
+    page(col().w_full().gap(S8).child(top).child(totals(ink, &total)).child(by_type(ink, m, &total)).child(breakdown(u, ink, k, now)))
 }
 
 #[cfg(test)]
@@ -716,6 +1046,15 @@ mod tests {
         assert_eq!(nice_ceil(2.2e6), 2.5e6);
         assert_eq!(pct(0.0001, 1.0), "<0.1%");
         assert_eq!(pct(1.0, 4.0), "25.0%");
+    }
+
+    #[test]
+    fn smooth_line_never_overshoots() {
+        let ys = [100.0, 100.0, 20.0, 100.0, 100.0, 60.0, 0.0];
+        let pts = smooth(&ys, 8);
+        assert!(pts.iter().all(|[_, y]| (0.0..=100.0).contains(y)));
+        assert_eq!(pts.first().unwrap()[1], 100.0);
+        assert_eq!(pts.last().unwrap()[1], 0.0);
     }
 
     #[test]

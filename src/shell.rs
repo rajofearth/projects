@@ -394,7 +394,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let body = match s.page {
         Page::Home => crate::home::view(s, &ink, &k, &mut layer),
         Page::Storage => crate::storage_ui::view(s, &ink, &k, cx),
-        Page::Usage => crate::usage_ui::view(s, &ink, &k),
+        Page::Usage => crate::usage_ui::view(s, &ink, &k, &mut layer),
         Page::Templates => crate::templates_ui::view(s, &ink, &k, &mut layer),
         Page::Settings => crate::settings_ui::view(s, &ink, &k, &mut layer),
     };

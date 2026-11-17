@@ -9,6 +9,7 @@ serde = { version = "1", features = ["derive"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c" }
 serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+ruzstd = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time"] }

@@ -109,6 +109,8 @@ struct RawUse {
     session_id: String,
     /// Repeats of one billed message share this key and are merged by max.
     dedupe: Option<String>,
+    /// Service tier: 0 standard, 1 fast/priority, 2 ultrafast.
+    speed: u8,
 }
 
 /// One record's list-price cost split by token channel (USD, not yet per-million scaled).
@@ -230,8 +232,9 @@ fn add(
 /// With no list price the logged cost is "unsplit" and lands in `cost_other`.
 fn accumulate(acc: &mut HashMap<Key, Acc>, raw: RawUse, counted: &mut HashSet<String>) {
     let rate = price_for(&raw.model);
+    let tiered = rate.map(|r| rates_at(r, raw.speed));
     let one_hour = raw.cache_write_1h.min(raw.cache_write);
-    let list = rate.map(|r| {
+    let list = tiered.map(|r| {
         Category {
             input: raw.input as f64 * r.input,
             cache_read: raw.cache_read as f64 * r.read,
@@ -347,6 +350,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
         .unwrap_or(0);
     // Anthropic folds thinking into `output_tokens` and does not break it out.
     let reasoning = 0;
+    let speed = u8::from(usage.get("speed").and_then(Value::as_str) == Some("fast"));
 
     let mut out = Vec::new();
     if input + output + cache_read + cache_write > 0 {
@@ -364,6 +368,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
             cost,
             session_id: session_id.clone(),
             dedupe: dedupe.clone(),
+            speed,
         });
     }
 
@@ -401,6 +406,7 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
                 cost: None, // advisor calls are priced at their own model
                 session_id: session_id.clone(),
                 dedupe: dedupe.as_ref().map(|d| format!("{d}:advisor:{index}")),
+                speed,
             });
         }
     }
@@ -409,6 +415,302 @@ fn parse_claude_value(v: &Value) -> Option<Vec<RawUse>> {
 }
 
 // ---------------------------------------------------------------------- Codex
+//
+// A port of t3code's `codexUsage.ts` scan state machine. Codex writes per-call usage in
+// `token_count` events (`last_token_usage`, with the running `total_token_usage`) and, in
+// newer builds, `token_usage_record` lines keyed by response id. The cumulative total is
+// used to drop replays, forked-session copies and malformed events, so each billed call
+// is counted once. Older sessions are compressed to `.jsonl.zst`.
+
+/// input, cached input, cache write, output, reasoning, total.
+type Tok = [u64; 6];
+
+fn tok_valid(t: &Tok) -> bool {
+    t[1] + t[2] <= t[0] && t[4] <= t[3] && t[5] >= t[0] + t[3]
+}
+
+fn read_tok(v: &Value) -> Option<Tok> {
+    let o = v.as_object()?;
+    let input = o.get("input_tokens")?.as_u64()?;
+    let output = o.get("output_tokens")?.as_u64()?;
+    let get = |k: &str, dflt: u64| match o.get(k) {
+        None => Some(dflt),
+        Some(x) => x.as_u64(),
+    };
+    let t = [
+        input,
+        get("cached_input_tokens", 0)?,
+        get("cache_write_input_tokens", 0)?,
+        output,
+        get("reasoning_output_tokens", 0)?,
+        get("total_tokens", input + output)?,
+    ];
+    tok_valid(&t).then_some(t)
+}
+
+fn tok_add(prev: Option<Tok>, last: &Tok) -> Option<Tok> {
+    let p = prev.unwrap_or_default();
+    let t: Tok = std::array::from_fn(|i| p[i] + last[i]);
+    tok_valid(&t).then_some(t)
+}
+
+fn tok_sub(a: &Tok, b: &Tok) -> Option<Tok> {
+    let mut t = [0; 6];
+    for i in 0..6 {
+        t[i] = a[i].checked_sub(b[i])?;
+    }
+    tok_valid(&t).then_some(t)
+}
+
+#[derive(Clone)]
+struct CodexReq {
+    ts: i64,
+    model: String,
+    speed: u8,
+    usage: Tok,
+}
+
+#[derive(Default)]
+struct CodexScan {
+    model: String,
+    speed: u8,
+    session: String,
+    cwd: String,
+    last_sig: Option<Tok>,
+    last_cum: Option<Tok>,
+    seq_start: Option<(i64, Tok)>,
+    latest_cum_at: Option<i64>,
+    pending: Option<Vec<CodexReq>>,
+    ledger: bool,
+    saw_meta: bool,
+    suppress_forks: bool,
+    fork_anchor: i64,
+}
+
+impl CodexScan {
+    fn date(&mut self, ts: i64) {
+        self.latest_cum_at = Some(self.latest_cum_at.unwrap_or(ts).max(ts));
+    }
+
+    fn rebase(&mut self, cum: Tok, ts: i64) {
+        self.last_cum = Some(cum);
+        self.date(ts);
+        self.pending = None;
+        if cum[0] + cum[3] == 0 {
+            self.seq_start = None;
+        }
+    }
+
+    /// Forked sessions open by replaying the parent's events within a second of each other.
+    fn fork_copy(&mut self, ts: i64) -> bool {
+        if !self.suppress_forks {
+            return false;
+        }
+        if ts - self.fork_anchor < 1000 {
+            self.fork_anchor = ts;
+            return true;
+        }
+        self.suppress_forks = false;
+        self.last_sig = None;
+        false
+    }
+
+    fn req(&self, ts: i64, usage: Tok) -> CodexReq {
+        CodexReq { ts, model: self.model.clone(), speed: self.speed, usage }
+    }
+
+    /// One parsed line; returns the billed calls it completes (with a dedupe key or not).
+    fn line(&mut self, v: &Value) -> Vec<(CodexReq, Option<String>)> {
+        let Some(payload) = v.get("payload").filter(|p| p.is_object()) else { return Vec::new() };
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts = v.get("timestamp").and_then(Value::as_str).and_then(ms_from_iso);
+        if let Some(c) = payload.get("cwd").and_then(Value::as_str)
+            && (kind == "session_meta" || kind == "turn_context") {
+                self.cwd = c.to_string();
+            }
+        if kind == "session_meta" {
+            if self.saw_meta {
+                return Vec::new();
+            }
+            self.saw_meta = true;
+            if let Some(id) = payload.get("id").or_else(|| payload.get("session_id")).and_then(Value::as_str) {
+                self.session = id.to_string();
+            }
+            let forked = payload.get("forked_from_id").is_some_and(Value::is_string)
+                || payload.pointer("/source/subagent/thread_spawn/parent_thread_id").is_some_and(Value::is_string);
+            if let (Some(ts), true) = (ts, forked) {
+                self.suppress_forks = true;
+                self.fork_anchor = ts;
+            }
+            return Vec::new();
+        }
+        if kind == "turn_context" {
+            self.ledger = false;
+            if let Some(m) = payload.get("model").and_then(Value::as_str) {
+                self.model = m.to_string();
+            }
+            return Vec::new();
+        }
+        if kind == "token_usage_record" {
+            let (Some(ts), Some(usage)) = (ts, payload.get("usage").and_then(read_tok)) else { return Vec::new() };
+            if self.model.is_empty() || self.fork_copy(ts) {
+                return Vec::new();
+            }
+            if let Some(rid) = payload.get("response_id").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+                let pending = self.pending.take().unwrap_or_default();
+                self.ledger = true;
+                for r in &pending {
+                    self.last_cum = tok_add(self.last_cum, &r.usage);
+                }
+                self.last_cum = tok_add(self.last_cum, &usage);
+                self.date(ts);
+                let key = format!("codex:{}:{rid}", self.session);
+                let mut out: Vec<_> = pending.into_iter().map(|r| (r, None)).collect();
+                out.push((self.req(ts, usage), Some(key)));
+                return out;
+            }
+            self.ledger = false;
+            let r = self.req(ts, usage);
+            self.pending.get_or_insert_with(Vec::new).push(r);
+            return Vec::new();
+        }
+        if ptype == "thread_settings_applied" {
+            if let Some(tier) = payload.pointer("/thread_settings/service_tier") {
+                self.speed = match tier.as_str() {
+                    Some("priority" | "fast") => 1,
+                    Some("ultrafast") => 2,
+                    _ => 0,
+                };
+            }
+            return Vec::new();
+        }
+        if ptype != "token_count" {
+            return Vec::new();
+        }
+        let Some(info) = payload.get("info").filter(|i| i.is_object()) else { return Vec::new() };
+        let Some(ts) = ts else { return Vec::new() };
+        if self.model.is_empty() {
+            return Vec::new();
+        }
+        let last = info.get("last_token_usage").and_then(read_tok);
+        let has_cum = info.get("total_token_usage").is_some_and(|c| !c.is_null());
+        let cum = if has_cum { info.get("total_token_usage").and_then(read_tok) } else { None };
+        if self.fork_copy(ts) {
+            if let Some(c) = cum {
+                self.rebase(c, ts);
+            } else if let (false, Some(l)) = (has_cum, last)
+                && Some(l) != self.last_sig {
+                    self.last_cum = tok_add(self.last_cum, &l);
+                    self.date(ts);
+                }
+            self.last_sig = last;
+            return Vec::new();
+        }
+        if self.ledger {
+            if let Some(c) = cum {
+                self.rebase(c, ts);
+            }
+            return Vec::new();
+        }
+        let previous = self.last_cum;
+        let latest_at = self.latest_cum_at;
+        let pending = self.pending.clone();
+        if let Some(c) = cum {
+            self.rebase(c, ts);
+        }
+        let Some(last) = last else { return Vec::new() };
+        if has_cum && cum.is_none() {
+            return Vec::new();
+        }
+        if last[0] + last[3] == 0 {
+            self.last_sig = None;
+            return Vec::new();
+        }
+        if let (Some(c), Some(p)) = (cum, previous)
+            && c == p {
+                return Vec::new();
+            }
+        if last[5] != last[0] + last[3] {
+            return Vec::new();
+        }
+        let mut unreported: Vec<CodexReq> = Vec::new();
+        if let Some(c) = cum {
+            let restarted = c == last;
+            if restarted && self.seq_start == Some((ts, last)) {
+                self.last_cum = previous;
+                if latest_at.is_none() {
+                    self.latest_cum_at = None;
+                }
+                return Vec::new();
+            }
+            let lowered = previous.is_some_and(|p| (0..6).any(|i| c[i] < p[i]));
+            let rewound = lowered && latest_at.is_some_and(|at| ts > at);
+            let reconciled = match previous {
+                Some(p) if !rewound => (0..6).all(|i| c[i] as i128 - p[i] as i128 == last[i] as i128),
+                _ => tok_sub(&c, &last).is_some(),
+            };
+            if !restarted && !reconciled {
+                match bridge(previous, &c, &last, pending.as_deref()) {
+                    Some(b) => unreported = b,
+                    None => {
+                        let replayed = latest_at.is_some_and(|at| ts < at || (ts == at && lowered && c[0] + c[3] > 0));
+                        if replayed {
+                            self.last_cum = previous;
+                            if pending.is_some() {
+                                self.pending = pending;
+                            }
+                        }
+                        return Vec::new();
+                    }
+                }
+            }
+            if restarted {
+                self.seq_start = Some((ts, last));
+            }
+        } else {
+            if Some(last) == self.last_sig {
+                return Vec::new();
+            }
+            let Some(adv) = tok_add(previous, &last) else { return Vec::new() };
+            self.last_cum = Some(adv);
+            self.date(ts);
+        }
+        self.last_sig = Some(last);
+        let mut out: Vec<_> = unreported.into_iter().map(|r| (r, None)).collect();
+        out.push((self.req(ts, last), None));
+        out
+    }
+}
+
+/// Calls logged only as `token_usage_record`s with no response id, recovered when the
+/// cumulative jump equals their sum (t3code's `unreportedRequests`).
+fn bridge(previous: Option<Tok>, cum: &Tok, last: &Tok, pending: Option<&[CodexReq]>) -> Option<Vec<CodexReq>> {
+    let (p, pending) = (previous?, pending?);
+    for i in 0..6 {
+        let sum: u64 = pending.iter().map(|r| r.usage[i]).sum();
+        if cum[i] as i128 - p[i] as i128 != sum as i128 {
+            return None;
+        }
+    }
+    let (fin, rest) = pending.split_last()?;
+    let remainder = tok_sub(&fin.usage, last)?;
+    let mut out: Vec<CodexReq> = rest.to_vec();
+    out.push(CodexReq { usage: remainder, ..fin.clone() });
+    out.retain(|r| r.usage[0] + r.usage[3] > 0);
+    Some(out)
+}
+
+/// A session file's lines, decompressing `.jsonl.zst`.
+fn open_lines(path: &Path) -> Option<Box<dyn BufRead>> {
+    let file = fs::File::open(path).ok()?;
+    if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+        let dec = ruzstd::decoding::StreamingDecoder::new(BufReader::new(file)).ok()?;
+        Some(Box::new(BufReader::new(dec)))
+    } else {
+        Some(Box::new(BufReader::new(file)))
+    }
+}
 
 fn parse_codex_logs(
     home: &Path,
@@ -417,121 +719,50 @@ fn parse_codex_logs(
     counted: &mut HashSet<String>,
 ) {
     let mut files = Vec::new();
-    walk_ext(&home.join(".codex").join("sessions"), "jsonl", &mut files);
+    let dir = home.join(".codex").join("sessions");
+    walk_ext(&dir, "jsonl", &mut files);
+    walk_ext(&dir, "zst", &mut files);
     for file in files {
-        let Ok(reader) = fs::File::open(&file).map(BufReader::new) else {
-            continue;
-        };
-        // Model/cwd arrive in session_meta and turn_context lines; token_count
-        // events carry either a per-call `last_token_usage` or cumulative
-        // `total_token_usage`, from which we take deltas.
-        let mut model = String::new();
-        let mut cwd = String::new();
-        let mut session_id = String::new();
-        let mut prev_total: Option<[u64; 5]> = None;
+        let Some(reader) = open_lines(&file) else { continue };
+        let mut scan = CodexScan::default();
         for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            if !line.contains("token_count") && !line.contains("session_meta") && !line.contains("turn_context") {
+            let Ok(line) = line else { break };
+            if !(line.contains("token_count")
+                || line.contains("token_usage_record")
+                || line.contains("session_meta")
+                || line.contains("turn_context")
+                || line.contains("thread_settings_applied"))
+            {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
-            match kind {
-                "session_meta" => {
-                    if let Some(c) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                        cwd = c.to_string();
-                    }
-                    if session_id.is_empty() {
-                        session_id = v
-                            .pointer("/payload/id")
-                            .or_else(|| v.pointer("/payload/session_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                    }
-                }
-                "turn_context" => {
-                    if let Some(m) = v.pointer("/payload/model").and_then(Value::as_str) {
-                        if !m.is_empty() {
-                            model = m.to_string();
-                        }
-                    }
-                    if let Some(c) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                        cwd = c.to_string();
-                    }
-                }
-                "event_msg" => {
-                    if v.pointer("/payload/type").and_then(Value::as_str) == Some("token_count") {
-                        let info = v.pointer("/payload/info").unwrap_or(&v["payload"]);
-                        if let Some(toks) = codex_tokens(info, &mut prev_total) {
-                            add(
-                                acc,
-                                seen,
-                                counted,
-                                RawUse {
-                                    provider: "codex",
-                                    model: if model.is_empty() { "unknown".into() } else { model.clone() },
-                                    day: day_from_timestamp(
-                                        v.get("timestamp").and_then(Value::as_str).unwrap_or(""),
-                                    ),
-                                    project: project_from_cwd(&cwd),
-                                    // Codex's `input_tokens` is inclusive of the cached and
-                                    // cache-write portions; bill those only once.
-                                    input: toks[0].saturating_sub(toks[2]).saturating_sub(toks[3]),
-                                    output: toks[1],
-                                    cache_read: toks[2],
-                                    cache_write: toks[3],
-                                    cache_write_1h: 0,
-                                    // Reported inside `output_tokens`, never charged twice.
-                                    reasoning: toks[4],
-                                    cost: None, // Codex logs carry no cost
-                                    session_id: session_id.clone(),
-                                    dedupe: None,
-                                },
-                            );
-                        }
-                    }
-                }
-                _ => {}
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            for (r, dedupe) in scan.line(&v) {
+                let u = r.usage;
+                add(
+                    acc,
+                    seen,
+                    counted,
+                    RawUse {
+                        provider: "codex",
+                        model: r.model,
+                        day: local_day_from_epoch(r.ts.div_euclid(1000)),
+                        project: project_from_cwd(&scan.cwd),
+                        // Codex's `input_tokens` includes the cached and cache-write portions.
+                        input: u[0] - u[1] - u[2],
+                        output: u[3],
+                        cache_read: u[1],
+                        cache_write: u[2],
+                        cache_write_1h: 0,
+                        reasoning: u[4],
+                        cost: None,
+                        session_id: scan.session.clone(),
+                        dedupe,
+                        speed: r.speed,
+                    },
+                );
             }
         }
     }
-}
-
-/// Field order: input, output, cache_read (cached_input), cache_write, reasoning.
-fn codex_tokens(info: &Value, prev_total: &mut Option<[u64; 5]>) -> Option<[u64; 5]> {
-    let read = |obj: &Value, name: &str| {
-        obj.get(name)
-            .and_then(Value::as_u64)
-            .or_else(|| obj.get(name).and_then(Value::as_i64).map(|n| n.max(0) as u64))
-            .unwrap_or(0)
-    };
-    let total = |obj: &Value| {
-        [
-            read(obj, "input_tokens"),
-            read(obj, "output_tokens"),
-            read(obj, "cached_input_tokens"),
-            read(obj, "cache_write_input_tokens"),
-            read(obj, "reasoning_output_tokens"),
-        ]
-    };
-    if let Some(last) = info.get("last_token_usage") {
-        let toks = total(last);
-        if let Some(t) = info.get("total_token_usage") {
-            *prev_total = Some(total(t));
-        }
-        return Some(toks);
-    }
-    let totals = info.get("total_token_usage")?;
-    let toks = total(totals);
-    let delta = match *prev_total {
-        Some(prev) => std::array::from_fn(|i| toks[i].saturating_sub(prev[i])),
-        None => toks, // first cumulative event: assume it is all we have seen
-    };
-    *prev_total = Some(toks);
-    Some(delta)
 }
 
 // ------------------------------------------------------------------- OpenCode
@@ -574,8 +805,8 @@ fn parse_opencode_logs(
     let mut files = Vec::new();
     walk_ext(&storage.join("session"), "json", &mut files);
     for file in &files {
-        if let Some(v) = read_json(&file) {
-            if let (Some(id), Some(dir)) = (
+        if let Some(v) = read_json(file)
+            && let (Some(id), Some(dir)) = (
                 v.get("id").and_then(Value::as_str),
                 v.get("directory")
                     .or_else(|| v.get("cwd"))
@@ -583,12 +814,11 @@ fn parse_opencode_logs(
             ) {
                 projects.entry(id.to_string()).or_insert_with(|| dir.to_string());
             }
-        }
     }
     files.clear();
     walk_ext(&storage.join("message"), "json", &mut files);
     for file in &files {
-        let Some(v) = read_json(&file) else { continue };
+        let Some(v) = read_json(file) else { continue };
         // Legacy message files are named by message id; newer records carry it inline.
         let id = file
             .file_stem()
@@ -682,6 +912,7 @@ fn opencode_record(
         cost,
         session_id,
         dedupe: id.map(|id| format!("opencode:{id}")),
+        speed: 0,
     })
 }
 
@@ -772,18 +1003,16 @@ fn read_opencode_database(
 /// older ones use a top-level `modelID` or `model` string.
 fn opencode_model(v: &Value) -> String {
     for pointer in ["/model/id", "/model/modelID"] {
-        if let Some(m) = v.pointer(pointer).and_then(Value::as_str) {
-            if !m.is_empty() {
+        if let Some(m) = v.pointer(pointer).and_then(Value::as_str)
+            && !m.is_empty() {
                 return m.to_string();
             }
-        }
     }
     for key in ["modelID", "model"] {
-        if let Some(m) = v.get(key).and_then(Value::as_str) {
-            if !m.is_empty() {
+        if let Some(m) = v.get(key).and_then(Value::as_str)
+            && !m.is_empty() {
                 return m.to_string();
             }
-        }
     }
     String::new()
 }
@@ -874,6 +1103,7 @@ fn parse_pi_logs(
                             cost,
                             session_id: session_id.clone(),
                             dedupe: Some(format!("pi:{id}:{ts}")),
+                            speed: 0,
                         },
                     );
                 }
@@ -892,6 +1122,13 @@ fn read_json(path: &Path) -> Option<Value> {
 
 /// USD per million tokens. `write_5m`/`write_1h` are the cache-creation rates;
 /// when a model has no distinct 1-hour rate it equals `write_5m`.
+///
+/// `fast`/`ultra` scale every rate for priority service tiers (LiteLLM's
+/// `provider_specific_entry.fast` or `*_priority` / `*_ultrafast` rates).
+///
+/// The shipped t3code build bills every cache write at the single
+/// `cache_creation_input_token_cost` and has no long-context tiers, so
+/// `rates_at` does the same and `write_1h` is kept only as table data.
 #[derive(Clone, Copy)]
 struct Price {
     input: f64,
@@ -899,10 +1136,25 @@ struct Price {
     read: f64,
     write_5m: f64,
     write_1h: f64,
+    fast: f64,
+    ultra: f64,
 }
 
 const fn p(input: f64, output: f64, read: f64, write_5m: f64, write_1h: f64) -> Price {
-    Price { input, output, read, write_5m, write_1h }
+    Price { input, output, read, write_5m, write_1h, fast: 1.0, ultra: 1.0 }
+}
+
+impl Price {
+    const fn fast(mut self, k: f64, ultra: f64) -> Price {
+        self.fast = k;
+        self.ultra = ultra;
+        self
+    }
+}
+
+/// OpenAI lists one cache-write rate.
+const fn gpt(input: f64, output: f64, read: f64, write: f64) -> Price {
+    p(input, output, read, write, write)
 }
 
 /// Matched case-insensitively by substring, most specific first; unknown
@@ -910,31 +1162,31 @@ const fn p(input: f64, output: f64, read: f64, write_5m: f64, write_1h: f64) -> 
 /// from LiteLLM, the source t3code parses for its price table.
 const PRICES: &[(&str, Price)] = &[
     // Claude 5 family
-    ("claude-opus-5-5", p(4.0, 20.0, 0.2, 5.0, 8.0)),
+    ("claude-opus-5-5", p(4.0, 20.0, 0.2, 5.0, 8.0).fast(2.0, 2.0)),
     ("claude-sonnet-5-5", p(2.0, 10.0, 0.1, 2.5, 4.0)),
     ("claude-haiku-5-5", p(0.1, 0.5, 0.01, 0.125, 0.2)),
-    ("claude-fable-5-2", p(8.0, 40.0, 0.2, 10.0, 16.0)),
-    ("claude-opus-5", p(5.0, 25.0, 0.5, 6.25, 10.0)),
+    ("claude-fable-5-2", p(8.0, 40.0, 0.2, 10.0, 16.0).fast(2.0, 2.0)),
+    ("claude-opus-5", p(5.0, 25.0, 0.5, 6.25, 10.0).fast(2.0, 2.0)),
     ("claude-sonnet-5", p(2.0, 10.0, 0.2, 2.5, 4.0)),
     // GPT-6 family (OpenAI has no distinct 1-hour cache-write rate)
-    ("gpt-5.6-luna", p(0.2, 1.2, 0.02, 0.25, 0.25)),
+    ("gpt-5.6-luna", gpt(0.2, 1.2, 0.02, 0.25).fast(2.0, 2.0)),
     ("gpt-6-astra-law", p(10.0, 50.0, 1.0, 10.0, 10.0)),
-    ("gpt-6-rosalind", p(15.0, 75.0, 1.5, 18.75, 18.75)),
-    ("gpt-6-cyber", p(20.0, 100.0, 2.0, 25.0, 25.0)),
-    ("gpt-6-astra", p(10.0, 50.0, 1.0, 12.5, 12.5)),
-    ("gpt-6-luna", p(0.1, 0.5, 0.01, 0.125, 0.125)),
-    ("gpt-6.1-terra", p(1.0, 5.0, 0.05, 1.25, 1.25)),
-    ("gpt-6.1-sol", p(2.0, 10.0, 0.1, 2.5, 2.5)),
-    ("gpt-6-sol", p(2.0, 10.0, 0.2, 2.5, 2.5)),
+    ("gpt-6-rosalind", gpt(15.0, 75.0, 1.5, 18.75)),
+    ("gpt-6-cyber", gpt(20.0, 100.0, 2.0, 25.0)),
+    ("gpt-6-astra", gpt(10.0, 50.0, 1.0, 12.5).fast(2.0, 6.0)),
+    ("gpt-6-luna", gpt(0.1, 0.5, 0.01, 0.125).fast(2.0, 2.0)),
+    ("gpt-6.1-terra", gpt(1.0, 5.0, 0.05, 1.25).fast(2.0, 2.0)),
+    ("gpt-6.1-sol", gpt(2.0, 10.0, 0.1, 2.5).fast(2.0, 6.0)),
+    ("gpt-6-sol", gpt(2.0, 10.0, 0.2, 2.5).fast(2.0, 2.0)),
     // Older Claude (Anthropic list prices)
-    ("claude-haiku-4", p(1.0, 5.0, 0.1, 1.25, 1.25)),
-    ("claude-haiku", p(0.8, 4.0, 0.08, 1.0, 1.0)),
-    ("claude-opus", p(15.0, 75.0, 1.5, 18.75, 18.75)),
-    ("claude-sonnet", p(3.0, 15.0, 0.3, 3.75, 3.75)),
+    ("claude-haiku-4", p(1.0, 5.0, 0.1, 1.25, 2.0)),
+    ("claude-haiku", p(0.8, 4.0, 0.08, 1.0, 1.6)),
+    ("claude-opus", p(15.0, 75.0, 1.5, 18.75, 30.0)),
+    ("claude-sonnet", p(3.0, 15.0, 0.3, 3.75, 6.0)),
     // Older OpenAI
     ("gpt-5-nano", p(0.05, 0.4, 0.005, 0.05, 0.05)),
-    ("gpt-5-mini", p(0.25, 2.0, 0.025, 0.25, 0.25)),
-    ("gpt-5", p(1.25, 10.0, 0.125, 1.25, 1.25)),
+    ("gpt-5-mini", p(0.25, 2.0, 0.025, 0.25, 0.25).fast(1.8, 1.8)),
+    ("gpt-5", p(1.25, 10.0, 0.125, 1.25, 1.25).fast(2.0, 2.0)),
     ("gpt-4.1-mini", p(0.4, 1.6, 0.1, 0.4, 0.4)),
     ("gpt-4.1", p(2.0, 8.0, 0.5, 2.0, 2.0)),
     ("gpt-4o-mini", p(0.15, 0.6, 0.075, 0.15, 0.15)),
@@ -978,29 +1230,20 @@ fn price_for(model: &str) -> Option<Price> {
     PRICES.iter().find_map(|(needle, rates)| m.contains(needle).then_some(*rates))
 }
 
-/// Whether the built-in table has a list price for this model.
-pub fn has_price(model: &str) -> bool {
-    price_for(model).is_some()
-}
-
-/// Estimated cost in USD for the given usage at list prices, 0.0 if unknown.
-/// Reasoning is already inside `output` and is deliberately not charged again.
-fn price(
-    model: &str,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write_5m: u64,
-    cache_write_1h: u64,
-) -> f64 {
-    match price_for(model) {
-        Some(r) => (input as f64 * r.input
-            + output as f64 * r.output
-            + cache_read as f64 * r.read
-            + cache_write_5m as f64 * r.write_5m
-            + cache_write_1h as f64 * r.write_1h)
-            / 1_000_000.0,
-        None => 0.0,
+/// The rates one record pays at its speed tier.
+fn rates_at(r: Price, speed: u8) -> Price {
+    let k = match speed {
+        1 => r.fast,
+        2 => r.ultra,
+        _ => 1.0,
+    };
+    Price {
+        input: r.input * k,
+        output: r.output * k,
+        read: r.read * k,
+        write_5m: r.write_5m * k,
+        write_1h: r.write_5m * k,
+        ..r
     }
 }
 
@@ -1081,6 +1324,24 @@ fn epoch_from_iso(ts: &str) -> Option<i64> {
     Some(epoch)
 }
 
+/// Epoch milliseconds for an ISO-8601 timestamp, keeping up to three fraction digits.
+fn ms_from_iso(ts: &str) -> Option<i64> {
+    let secs = epoch_from_iso(ts)?;
+    let frac = match ts.as_bytes().get(19) {
+        Some(b'.') => {
+            let digits: String = ts[20..].chars().take_while(char::is_ascii_digit).take(3).collect();
+            format!("{digits:0<3}").parse::<i64>().unwrap_or(0)
+        }
+        _ => 0,
+    };
+    Some(secs * 1000 + frac)
+}
+
+/// Epoch seconds for an ISO-8601 timestamp; the limits page reads reset times with it.
+pub(crate) fn epoch_secs(ts: &str) -> Option<i64> {
+    epoch_from_iso(ts)
+}
+
 /// Howard Hinnant's civil-date algorithms (public domain).
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -1158,7 +1419,7 @@ mod tests {
         assert_eq!(raw.reasoning, 0);
         // No logged cost: priced from the table (10*3 + 200*15 + 300*0.3 + 40*3.75)/1e6.
         assert!(raw.cost.is_none());
-        let cost = price(&raw.model, raw.input, raw.output, raw.cache_read, raw.cache_write, 0);
+        let cost = list_cost(&raw.model, raw.input, raw.output, raw.cache_read, raw.cache_write, 0);
         assert!((cost - 0.00327).abs() < 1e-9);
         assert_eq!(raw.day.len(), 10);
         assert_eq!(&raw.day[4..5], "-");
@@ -1177,7 +1438,7 @@ mod tests {
         assert_eq!(raws[1].dedupe.as_deref(), Some("claude:m:r:advisor:0"));
         // 5m at $5/M and 1h at $8/M, output at $20/M.
         let cost = 10.0 / 1e6 * 4.0 + 20.0 / 1e6 * 20.0 + 40.0 / 1e6 * 5.0 + 60.0 / 1e6 * 8.0;
-        let computed = price(&raws[0].model, raws[0].input, raws[0].output, 0, 40, 60);
+        let computed = list_cost(&raws[0].model, raws[0].input, raws[0].output, 0, 40, 60);
         assert!((computed - cost).abs() < 1e-12);
     }
 
@@ -1199,6 +1460,7 @@ mod tests {
             cost: None,
             session_id: "s1".into(),
             dedupe: Some("claude:m:r".into()),
+            speed: 0,
         };
         let mut counted = HashSet::new();
         add(&mut acc, &mut seen, &mut counted, mk(10, 20));
@@ -1214,42 +1476,62 @@ mod tests {
     #[test]
     fn new_models_are_priced_and_unknowns_are_not() {
         for m in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
-            assert!(has_price(m), "{m} should be priced");
+            assert!(price_for(m).is_some(), "{m} should be priced");
         }
         for m in ["some-future-model", "opus", "<synthetic>", "unknown"] {
-            assert!(!has_price(m), "{m} should be unpriced");
+            assert!(price_for(m).is_none(), "{m} should be unpriced");
         }
     }
 
-    #[test]
-    fn parses_codex_last_token_usage() {
-        let mut state: Option<[u64; 5]> = None;
-        let info: Value = serde_json::from_str(
-            r#"{"total_token_usage":{"input_tokens":21491,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":47,"reasoning_output_tokens":10,"total_tokens":21538},"last_token_usage":{"input_tokens":21491,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":47,"reasoning_output_tokens":10,"total_tokens":21538}}"#,
+    fn list_cost(model: &str, i: u64, o: u64, r: u64, w5: u64, w1: u64) -> f64 {
+        let p = price_for(model).unwrap();
+        (i as f64 * p.input + o as f64 * p.output + r as f64 * p.read + w5 as f64 * p.write_5m + w1 as f64 * p.write_1h) / 1e6
+    }
+
+    fn codex_lines(lines: &[&str]) -> Vec<(CodexReq, Option<String>)> {
+        let mut scan = CodexScan::default();
+        lines.iter().flat_map(|l| scan.line(&serde_json::from_str::<Value>(l).unwrap())).collect()
+    }
+
+    const META: &str = r#"{"timestamp":"2026-11-13T06:21:30.163Z","type":"session_meta","payload":{"id":"s1","cwd":"C:\\x\\app"}}"#;
+    const TURN: &str = r#"{"timestamp":"2026-11-13T06:21:31.000Z","type":"turn_context","payload":{"model":"gpt-6-sol","turn_id":"t1"}}"#;
+
+    fn count(ts: &str, total: [u64; 2], last: [u64; 2]) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{},"output_tokens":{}}},"last_token_usage":{{"input_tokens":{},"output_tokens":{}}}}}}}}}"#,
+            total[0], total[1], last[0], last[1]
         )
-        .unwrap();
-        let first = codex_tokens(&info, &mut state).unwrap();
-        assert_eq!(first, [21491, 47, 0, 0, 10]);
-        // Next event: cumulative grows, last_token_usage covers only the new call.
-        let info2: Value = serde_json::from_str(
-            r#"{"total_token_usage":{"input_tokens":24991,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":347},"last_token_usage":{"input_tokens":3500,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":300}}"#,
-        )
-        .unwrap();
-        let second = codex_tokens(&info2, &mut state).unwrap();
-        assert_eq!(second, [3500, 300, 0, 0, 0]);
     }
 
     #[test]
-    fn codex_totals_delta_when_last_missing() {
-        let mut state: Option<[u64; 5]> = None;
-        let mk = |i: u64, o: u64| {
-            serde_json::from_str::<Value>(&format!(
-                r#"{{"total_token_usage":{{"input_tokens":{i},"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":{o}}}}}"#
-            ))
-            .unwrap()
-        };
-        assert_eq!(codex_tokens(&mk(100, 20), &mut state).unwrap(), [100, 20, 0, 0, 0]);
-        assert_eq!(codex_tokens(&mk(150, 70), &mut state).unwrap(), [50, 50, 0, 0, 0]);
+    fn codex_counts_each_call_once() {
+        let a = count("2026-11-13T06:22:00.000Z", [100, 10], [100, 10]);
+        let again = count("2026-11-13T06:22:01.000Z", [100, 10], [100, 10]); // repeat: total unchanged
+        let b = count("2026-11-13T06:23:00.000Z", [150, 30], [50, 20]);
+        let recs = codex_lines(&[META, TURN, &a, &again, &b]);
+        let got: Vec<[u64; 2]> = recs.iter().map(|(r, _)| [r.usage[0], r.usage[3]]).collect();
+        assert_eq!(got, vec![[100, 10], [50, 20]]);
+        assert_eq!(recs[0].0.model, "gpt-6-sol");
+    }
+
+    #[test]
+    fn codex_forked_session_skips_the_replayed_parent() {
+        let meta = r#"{"timestamp":"2026-11-13T06:21:30.000Z","type":"session_meta","payload":{"id":"s2","forked_from_id":"s1"}}"#;
+        let turn = r#"{"timestamp":"2026-11-13T06:21:30.100Z","type":"turn_context","payload":{"model":"gpt-6-sol"}}"#;
+        let copy = count("2026-11-13T06:21:30.200Z", [100, 10], [100, 10]);
+        let own = count("2026-11-13T06:25:00.000Z", [160, 15], [60, 5]);
+        let recs = codex_lines(&[meta, turn, &copy, &own]);
+        assert_eq!(recs.len(), 1);
+        assert_eq!([recs[0].0.usage[0], recs[0].0.usage[3]], [60, 5]);
+    }
+
+    #[test]
+    fn fast_tier_costs_more() {
+        let r = price_for("gpt-6-sol").unwrap();
+        assert_eq!(rates_at(r, 0).input, 2.0);
+        assert_eq!(rates_at(r, 1).output, 20.0);
+        assert_eq!(rates_at(price_for("claude-sonnet-5-5").unwrap(), 1).output, 10.0);
+        assert_eq!(ms_from_iso("2026-11-13T06:21:30.163Z").unwrap() % 1000, 163);
     }
 
     #[test]
