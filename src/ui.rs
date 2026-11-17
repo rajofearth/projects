@@ -39,7 +39,6 @@ pub(crate) struct Ink {
     pub(crate) amber: Color,
     /// A row under the pointer, and the row that is picked: the two mouse-only cues.
     pub(crate) hover: Color,
-    pub(crate) picked: Color,
     /// Surfaces, darkest to lightest: the sidebar, the page, a card, something raised on a card.
     pub(crate) side: Color,
     pub(crate) bg: Color,
@@ -51,7 +50,6 @@ pub(crate) struct Ink {
     /// The one accent, the text drawn on it, and a faint wash of it for a selected surface.
     pub(crate) accent: Color,
     pub(crate) on_accent: Color,
-    pub(crate) accent_soft: Color,
 }
 
 pub(crate) fn rgb(v: [u8; 3]) -> Color {
@@ -85,7 +83,6 @@ impl Ink {
             amber: rgb(ACCENT),
             row: rgb([196, 196, 202]),
             hover: rgba([255, 255, 255], 0.045),
-            picked: rgba([255, 255, 255], 0.075),
             side: rgb([12, 12, 14]),
             bg: rgb(BG),
             card: rgb([24, 24, 27]),
@@ -94,7 +91,6 @@ impl Ink {
             line_strong: rgba([255, 255, 255], 0.12),
             accent: rgb(ACCENT),
             on_accent: rgb([24, 18, 8]),
-            accent_soft: rgba(ACCENT, 0.12),
         }
     }
 
@@ -130,7 +126,6 @@ pub(crate) const S4: f32 = 16.0;
 pub(crate) const S5: f32 = 20.0;
 pub(crate) const S6: f32 = 24.0;
 pub(crate) const S8: f32 = 32.0;
-pub(crate) const R_SM: f32 = 6.0;
 pub(crate) const R_CTRL: f32 = 8.0;
 pub(crate) const R_CARD: f32 = 12.0;
 

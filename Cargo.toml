@@ -10,6 +10,7 @@ serde = { version = "1", features = ["derive"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c" }
 serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+ruzstd = "0.8"
 # Update verification: the release exe's SHA-256 and its Ed25519 signature.
 sha2 = "0.10"
 ed25519-dalek = "2"

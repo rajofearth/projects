@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod antigravity;
 mod art;
 mod browse;
 mod cats;
@@ -18,6 +19,9 @@ mod icons;
 mod inspect;
 mod install;
 mod launch;
+mod cursor;
+mod limits;
+mod logos;
 mod meter;
 mod model;
 mod net;
@@ -653,13 +657,13 @@ fn wallclock() -> String {
         use windows_sys::Win32::System::SystemInformation::GetLocalTime;
         let mut st = unsafe { std::mem::zeroed() };
         unsafe { GetLocalTime(&mut st) };
-        return format!(
+        format!(
             "{} {} {:02}:{:02}",
             MONTHS[(st.wMonth.max(1) - 1) as usize % 12],
             st.wDay,
             st.wHour,
             st.wMinute
-        );
+        )
     }
     #[cfg(not(windows))]
     {
@@ -742,6 +746,33 @@ fn scene_usage(s: &mut State) {
     s.page = shell::Page::Usage;
     // Hold the chart crosshair on a day, so the scene shows the tooltip.
     s.usage.hover = Some(22);
+}
+
+fn scene_usage_tokens(s: &mut State) {
+    scene_usage(s);
+    s.usage.tab = usage_ui::Tab::Tokens;
+    s.usage.range = usage_ui::Range::Quarter;
+    s.usage.hover = None;
+}
+
+fn scene_usage_day(s: &mut State) {
+    scene_usage(s);
+    s.usage.range = usage_ui::Range::Day;
+    s.usage.hover = Some(20);
+}
+
+fn scene_usage_limits(s: &mut State) {
+    scene_usage(s);
+    s.usage.tab = usage_ui::Tab::Limits;
+    s.usage.start_limits(None);
+    s.usage.limit_hover = Some(("claude", 1));
+}
+
+fn scene_usage_menu(s: &mut State) {
+    scene_usage(s);
+    s.usage.hover = None;
+    s.usage.menu = true;
+    s.usage.hidden = vec!["pi"];
 }
 
 fn scene_templates(s: &mut State) {
@@ -840,6 +871,10 @@ fn main() {
             ("demo-storage", scene_storage),
             ("demo-storage-open", scene_storage_open),
             ("demo-usage", scene_usage),
+            ("demo-usage-tokens", scene_usage_tokens),
+            ("demo-usage-day", scene_usage_day),
+            ("demo-usage-limits", scene_usage_limits),
+            ("demo-usage-menu", scene_usage_menu),
             ("demo-templates", scene_templates),
             ("demo-settings", scene_settings),
             ("demo-update", scene_update),

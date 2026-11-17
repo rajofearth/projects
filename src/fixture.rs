@@ -451,6 +451,7 @@ pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
     ];
     let projects = ["projects-stats", "ply", "yotes", "messenger", "clai", "rune"];
     let mut out = Vec::new();
+    let now_hour = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64) / 3600;
     for back in 0..44i64 {
         let day = today - back;
         let (y, m, d) = crate::usage_ui::civil_from_days(day);
@@ -464,7 +465,13 @@ pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
                 continue;
             }
             let project = projects[(back as usize + mi) % projects.len()];
+            // Today's usage lands in a few recent hours, for the Past 24h view.
+            let parts = if back == 0 { 6 } else { 1 };
+            let tokens = tokens / parts;
+            for j in 0..parts {
+            let hour = if back == 0 { now_hour - (mi as i64 + 3 * j as i64) } else { -1 };
             out.push(Usage {
+                hour,
                 provider,
                 model: model.to_string(),
                 day: format!("{y:04}-{m:02}-{d:02}"),
@@ -482,6 +489,7 @@ pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
                 sessions: 1,
                 priced: *priced,
             });
+            }
         }
         if back % 9 == 2 {
             out.push(Usage {
@@ -489,6 +497,7 @@ pub fn demo_usage(today: i64) -> Vec<crate::usage::Usage> {
                 model: "qwen3-coder-local".into(),
                 day: format!("{y:04}-{m:02}-{d:02}"),
                 project: "ply".into(),
+                hour: -1,
                 input: 300_000,
                 output: 80_000,
                 cache_read: 0,

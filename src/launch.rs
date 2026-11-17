@@ -1,6 +1,7 @@
 //! Opening a project folder in the user's tools: detected editors and terminals, and
 //! creating a new project folder. Launches are detached; nothing waits on the child.
 
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -197,40 +198,6 @@ pub fn open_url(url: &str) -> io::Result<()> {
     spawn_detached(&mut cmd, 0)
 }
 
-/// Create `parent\name` as a new folder, optionally running `git init` in it.
-///
-/// Fails if `name` is not a valid Windows folder name, if `parent` is not a folder, or if
-/// the target already exists. If `git init` fails, the folder is left in place.
-pub fn create_project(parent: &Path, name: &str, git_init: bool) -> io::Result<PathBuf> {
-    validate_name(name)?;
-    require_dir(parent)?;
-    let target = parent.join(name);
-    if target.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("already exists: {}", target.display()),
-        ));
-    }
-    fs::create_dir(&target)?;
-    if git_init {
-        let mut cmd = Command::new("git");
-        cmd.arg("init").current_dir(&target);
-        hide_window(&mut cmd);
-        let status = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "git init failed in {}",
-                target.display()
-            )));
-        }
-    }
-    Ok(target)
-}
-
 // ---- detection ----
 
 fn detected() -> &'static [Found] {
@@ -383,101 +350,6 @@ fn require_dir(path: &Path) -> io::Result<()> {
             io::ErrorKind::NotFound,
             format!("not a folder: {}", path.display()),
         ))
-    }
-}
-
-// ---- name validation ----
-
-const RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
-/// Checks a folder name against Windows rules: no reserved characters or control
-/// characters, no trailing dot or space, not `.`/`..`, not a reserved device name, and at
-/// most 255 characters.
-fn validate_name(name: &str) -> io::Result<()> {
-    let bad = |why: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid project name {name:?}: {why}"),
-        )
-    };
-    if name.trim().is_empty() {
-        return Err(bad("empty"));
-    }
-    if name != name.trim() {
-        return Err(bad("leading or trailing spaces"));
-    }
-    if name.ends_with('.') {
-        return Err(bad("ends with a dot"));
-    }
-    if name.chars().count() > 255 {
-        return Err(bad("longer than 255 characters"));
-    }
-    if name
-        .chars()
-        .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
-    {
-        return Err(bad("contains a character Windows does not allow"));
-    }
-    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-    if RESERVED.contains(&stem.as_str()) {
-        return Err(bad("reserved device name"));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_ordinary_names() {
-        for name in ["my-app", "Project 2", "a.b", "naïve", "CONSOLE", "com10", "_x"] {
-            assert!(validate_name(name).is_ok(), "should accept {name:?}");
-        }
-    }
-
-    #[test]
-    fn rejects_bad_names() {
-        let long = "x".repeat(256);
-        let bad = [
-            "", "   ", " lead", "trail ", "x.", ".", "..", "a/b", "a\\b", "a:b", "a*b", "a?b",
-            "a|b", "a\"b", "a<b", "a\u{7}b", "CON", "nul.txt", "com1", "LPT9.md", long.as_str(),
-        ];
-        for name in bad {
-            let err = validate_name(name).expect_err(&format!("should reject {name:?}"));
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}");
-        }
-    }
-
-    #[test]
-    fn create_project_makes_folder_and_rejects_duplicates() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let parent = std::env::temp_dir().join(format!(
-            "launch-test-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&parent).unwrap();
-
-        let made = create_project(&parent, "demo", false).unwrap();
-        assert!(made.is_dir());
-        assert_eq!(made, parent.join("demo"));
-
-        let dup = create_project(&parent, "demo", false).unwrap_err();
-        assert_eq!(dup.kind(), io::ErrorKind::AlreadyExists);
-
-        let bad = create_project(&parent, "a/b", false).unwrap_err();
-        assert_eq!(bad.kind(), io::ErrorKind::InvalidInput);
-
-        let missing = create_project(&parent.join("nope"), "x", false).unwrap_err();
-        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
-
-        fs::remove_dir_all(&parent).unwrap();
     }
 }
 
