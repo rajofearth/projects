@@ -95,7 +95,6 @@ pub fn toggle_archived(s: &mut State, name: &str) {
 pub fn script_line(pm: Option<&str>, name: &str, command: &str) -> String {
     match pm {
         Some(pm @ ("npm" | "pnpm" | "yarn" | "bun")) => format!("{pm} run {name}"),
-        _ if command.starts_with("cargo ") => command.to_string(),
         _ => command.to_string(),
     }
 }

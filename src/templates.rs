@@ -311,8 +311,9 @@ fn subst(cmd: &str, name: &str, project: &Path) -> String {
         .replace("{path}", &project.to_string_lossy())
 }
 
-/// Windows-invalid filename characters.
-const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+/// Windows-invalid filename characters, plus the ones `cmd` treats specially
+/// (the name is substituted into `cmd /C` steps).
+const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*', '&', '^', '%', '!'];
 
 const RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
