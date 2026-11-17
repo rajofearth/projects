@@ -79,6 +79,8 @@ pub struct UsageState {
     pub limits: Vec<Limits>,
     pub limits_loading: bool,
     pub limits_loaded: bool,
+    /// The limit bar under the pointer: (provider, window index).
+    pub limit_hover: Option<(&'static str, usize)>,
     /// The demo scene reads the fixture instead of the logs.
     pub demo: bool,
     rx: Option<Receiver<Vec<Usage>>>,
@@ -100,6 +102,7 @@ impl UsageState {
             limits: Vec::new(),
             limits_loading: false,
             limits_loaded: false,
+            limit_hover: None,
             demo: false,
             rx: None,
             limits_rx: None,
@@ -210,11 +213,19 @@ fn demo_limits() -> Vec<Limits> {
         minutes: Some(mins),
     };
     vec![
-        Limits { provider: "codex", windows: vec![w("Monthly", 2.0, 7 * 86_400 + 19 * 3600, 43_200)], error: None },
+        Limits {
+            provider: "codex",
+            windows: vec![w("Monthly", 2.0, 7 * 86_400 + 19 * 3600, 43_200)],
+            error: None,
+            email: Some("you@example.com".into()),
+            plan: Some("ChatGPT Free Subscription".into()),
+        },
         Limits {
             provider: "claude",
             windows: vec![w("Session", 5.0, 3 * 3600 + 49 * 60, 300), w("Weekly", 65.0, 2 * 86_400 + 5 * 3600, 10_080)],
             error: None,
+            email: Some("you@example.com".into()),
+            plan: Some("Claude Pro Subscription".into()),
         },
     ]
 }
@@ -775,9 +786,91 @@ fn breakdown(u: &UsageState, ink: &Ink, k: &Kit, now: i64) -> El {
 const HATCH_W: f32 = 2400.0;
 const BAR_H: f32 = 32.0;
 
-/// One plan window: "NN% left", then a bar filled to what is left, hatched where it is used,
-/// with a marker at the share of the window's time still to run and the reset countdown.
-fn limit_window(ink: &Ink, color: Color, w: &limits::Window, now: i64, key: String) -> El {
+/// Share of the window's time still to run, 0–1.
+fn time_left(w: &limits::Window, now: i64) -> Option<f32> {
+    match (w.resets_at, w.minutes) {
+        (Some(t), Some(mins)) if mins > 0 => Some(((t - now) as f32 / (mins as f32 * 60.0)).clamp(0.0, 1.0)),
+        _ => None,
+    }
+}
+
+/// t3code's pace: spending faster than the window elapses, with it, or under it.
+fn pace_icon(w: &limits::Window, now: i64) -> Option<&'static Icon> {
+    let elapsed = 100.0 * (1.0 - time_left(w, now)? as f64);
+    Some(if w.used_pct > elapsed + 5.0 {
+        &icons::TREND_UP
+    } else if w.used_pct < elapsed - 5.0 {
+        &icons::TREND_DOWN
+    } else {
+        &icons::GAUGE
+    })
+}
+
+/// "11/25 11:17 AM".
+fn local_stamp(secs: i64) -> String {
+    let Some((_, mo, d, h, mi)) = usage::local_parts(secs) else { return String::new() };
+    let (h12, ampm) = match h {
+        0 => (12, "AM"),
+        1..=11 => (h, "AM"),
+        12 => (12, "PM"),
+        _ => (h - 12, "PM"),
+    };
+    format!("{mo}/{d} {h12}:{mi:02} {ampm}")
+}
+
+/// The hover card t3code shows over a limit bar: account, plan, machine, then the window.
+fn limit_card(ink: &Ink, l: &Limits, w: &limits::Window, now: i64, anchor: String) -> El {
+    let (name, glyph, color) = provider(l.provider);
+    let name = if l.provider == "claude" { "Claude".to_string() } else { name };
+    let row_ = |k: &str, v: String| {
+        row().w_full().gap(S3).child(label(k, 12.0, 400.0, ink.muted).w(76.0)).child(label(v, 12.0, 500.0, ink.fg).truncate().shrink())
+    };
+    let host = limits::host();
+    let left = (100.0 - w.used_pct).clamp(0.0, 100.0);
+    let mut first = col().w_full().gap(S1).pt(S3).border_sides([1.0, 0.0, 0.0, 0.0], ink.line);
+    if let Some(p) = &l.plan {
+        first = first.child(row_("Plan", p.clone()));
+    }
+    if !host.is_empty() {
+        first = first.child(row_("Signed in", host));
+    }
+    let mut second = col().w_full().gap(S1).pt(S3).border_sides([1.0, 0.0, 0.0, 0.0], ink.line).child(row_("Left", format!("{left:.0}%")));
+    if let Some(t) = w.resets_at {
+        second = second.child(row_("Resets", format!("{} · in {}", local_stamp(t), limits::countdown(t - now))));
+    }
+    if let Some(f) = time_left(w, now) {
+        second = second.child(row_("Even pace", format!("{:.0}% left by now", f * 100.0)));
+    }
+    if w.used_pct.round() > 0.0 && w.resets_at.is_some() {
+        second = second.child(row_("Restores", format!("+{:.0}% of pool", w.used_pct)));
+    }
+    col()
+        .key("limit-card")
+        .anchored(anchor, Side::Bottom, Align::Center, S2)
+        .instant_changes()
+        .w(300.0)
+        .padding(S4)
+        .gap(S3)
+        .fill(ink.raised)
+        .radius(R_CTRL + 2.0)
+        .border(1.0, ink.line_strong)
+        .child(
+            col()
+                .gap(2.0)
+                .child(row().gap(S2).items_center().child(icon(glyph, 15.0).color(color)).child(label(name, 14.0, 600.0, ink.fg)))
+                .children(l.email.as_ref().map(|e| data(e.clone(), 11.0, ink.muted))),
+        )
+        .child(first)
+        .child(second)
+}
+
+/// One plan window: "NN% left" with its pace, then a bar filled to what is left, hatched where
+/// it is used, with a marker at the share of the window's time still to run and the reset
+/// countdown. Hovering the bar opens the account card.
+fn limit_window(u: &UsageState, ink: &Ink, l: &Limits, i: usize, now: i64, layer: &mut Vec<El>) -> El {
+    let w = &l.windows[i];
+    let (_, _, color) = provider(l.provider);
+    let key = format!("lim/{}/{i}", l.provider);
     let left = (100.0 - w.used_pct).clamp(0.0, 100.0);
     let mut hatch = Shape::new();
     let mut x = -BAR_H;
@@ -786,10 +879,6 @@ fn limit_window(ink: &Ink, color: Color, w: &limits::Window, now: i64, key: Stri
         x += 7.0;
     }
     let remaining = w.resets_at.map(|t| t - now);
-    let time_left = match (remaining, w.minutes) {
-        (Some(r), Some(mins)) if mins > 0 => Some((r as f32 / (mins as f32 * 60.0)).clamp(0.0, 1.0)),
-        _ => None,
-    };
     let pill = remaining.map(|r| {
         row()
             .h(20.0)
@@ -801,19 +890,32 @@ fn limit_window(ink: &Ink, color: Color, w: &limits::Window, now: i64, key: Stri
             .child(icon(&icons::REFRESH, 10.0).color(ink.fg))
             .child(data(limits::countdown(r), 11.0, ink.fg))
     });
+    let provider_id = l.provider;
+    let bar_key = format!("{key}/bar");
+    if u.limit_hover == Some((provider_id, i)) {
+        layer.push(limit_card(ink, l, w, now, bar_key.clone()));
+    }
     let bar = el()
-        .key(format!("{key}/bar"))
+        .key(bar_key)
         .grow(1.0)
         .min_w(0.0)
         .h(BAR_H)
         .clip_rounded(6.0)
+        .on_hover_change(move |s: &mut State, inside, tx: &mut Tx| {
+            tx.instant();
+            if inside {
+                s.usage.limit_hover = Some((provider_id, i));
+            } else if s.usage.limit_hover == Some((provider_id, i)) {
+                s.usage.limit_hover = None;
+            }
+        })
         .child(canvas(hatch).absolute(0.0, 0.0).size(HATCH_W, BAR_H))
         .child(
             row()
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .child(el().w_frac(left as f32 / 100.0).h_full().fill(ink.card).child(el().w_full().h_full().fill(color.alpha(0.42)))),
         )
-        .children(time_left.map(|f| {
+        .children(time_left(w, now).map(|f| {
             row()
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .child(el().w_frac(f).h_full())
@@ -835,13 +937,14 @@ fn limit_window(ink: &Ink, color: Color, w: &limits::Window, now: i64, key: Stri
                     .gap(S2)
                     .items_end()
                     .child(label(format!("{left:.0}%"), 30.0, 700.0, ink.fg))
-                    .child(label("left", 13.0, 400.0, ink.muted).pb(5.0)),
+                    .child(label("left", 13.0, 400.0, ink.muted).pb(5.0))
+                    .children(pace_icon(w, now).map(|g| icon(g, 13.0).color(ink.muted).mb(7.0))),
             ),
         )
         .child(bar)
 }
 
-fn limits_view(u: &UsageState, ink: &Ink, k: &Kit) -> El {
+fn limits_view(u: &UsageState, ink: &Ink, k: &Kit, layer: &mut Vec<El>) -> El {
     if !u.limits_loaded {
         return col().w_full().pt(120.0).gap(S3).items_center().child(Spinner::new().build(k)).child(label("Reading plan limits", 15.0, 500.0, ink.fg));
     }
@@ -854,7 +957,7 @@ fn limits_view(u: &UsageState, ink: &Ink, k: &Kit) -> El {
             .w_full()
             .gap(S3)
             .child(row().gap(S2).items_center().child(icon(glyph, 15.0).color(color)).child(label(name, 14.0, 600.0, ink.fg)))
-            .children(l.windows.iter().enumerate().map(|(i, w)| limit_window(ink, color, w, now, format!("lim/{}/{i}", l.provider))))
+            .children((0..l.windows.len()).map(|i| limit_window(u, ink, l, i, now, layer)).collect::<Vec<_>>())
             .children(l.error.as_ref().map(|e| {
                 row()
                     .w_full()
@@ -1000,7 +1103,7 @@ pub fn view(s: &State, ink: &Ink, k: &Kit, layer: &mut Vec<El>) -> El {
         )
     };
     if u.tab == Tab::Limits {
-        return page(limits_view(u, ink, k));
+        return page(limits_view(u, ink, k, layer));
     }
     let empty = |title: &str, body: &str, button: bool| {
         page(

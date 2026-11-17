@@ -723,6 +723,7 @@ fn scene_usage_limits(s: &mut State) {
     scene_usage(s);
     s.usage.tab = usage_ui::Tab::Limits;
     s.usage.start_limits(None);
+    s.usage.limit_hover = Some(("claude", 1));
 }
 
 fn scene_usage_menu(s: &mut State) {

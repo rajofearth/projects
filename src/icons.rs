@@ -49,3 +49,6 @@ lucide!(MORE, "ellipsis", r#"<circle cx="12" cy="12" r="1"/><circle cx="19" cy="
 lucide!(KEYBOARD, "keyboard", r#"<path d="M10 8h.01"/><path d="M12 12h.01"/><path d="M14 8h.01"/><path d="M16 12h.01"/><path d="M18 8h.01"/><path d="M6 8h.01"/><path d="M7 16h10"/><path d="M8 12h.01"/><rect width="20" height="16" x="2" y="4" rx="2"/>"#);
 lucide!(CODE, "code", r#"<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>"#);
 lucide!(ALERT, "circle-alert", r#"<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>"#);
+lucide!(GAUGE, "gauge", r#"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"#);
+lucide!(TREND_UP, "trending-up", r#"<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>"#);
+lucide!(TREND_DOWN, "trending-down", r#"<polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/>"#);

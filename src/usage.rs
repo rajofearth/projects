@@ -165,6 +165,7 @@ fn load_inner(cutoff_ms: i64) -> Vec<Usage> {
     parse_claude_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_codex_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_pi_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
+    parse_grok_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_opencode_logs(&home, &mut acc, &mut seen, &mut counted_sessions, cutoff_ms);
     // Keyed copies are counted once, after every copy has been folded in.
     for raw in seen.into_values() {
@@ -1118,6 +1119,137 @@ fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&s).ok()
 }
 
+// ----------------------------------------------------------------------- Grok
+//
+// t3code's `provider-grok/src/server/usage.ts`: `~/.grok/sessions/**/updates.jsonl`,
+// `turn_completed` updates with per-model usage and a cost in 1e-10 USD ticks.
+
+const GROK_TICKS_PER_USD: f64 = 10_000_000_000.0;
+
+fn token_count(v: Option<&Value>) -> u64 {
+    v.and_then(Value::as_f64).filter(|n| n.is_finite() && *n > 0.0).map_or(0, |n| n.trunc() as u64)
+}
+
+/// (uncached input, cached, cache write, output, reasoning, cost ticks)
+fn grok_totals(v: &Value) -> Option<([u64; 5], Option<f64>)> {
+    let o = v.as_object()?;
+    let input = token_count(o.get("inputTokens"));
+    let cached = token_count(o.get("cachedReadTokens"));
+    let write = token_count(o.get("cacheCreationTokens"));
+    let output = token_count(o.get("outputTokens"));
+    let reasoning = token_count(o.get("reasoningTokens")).min(output);
+    let ticks = o.get("costUsdTicks").and_then(Value::as_f64).filter(|t| t.is_finite());
+    Some(([input.saturating_sub(cached + write), cached, write, output, reasoning], ticks))
+}
+
+fn grok_usd(ticks: Option<f64>) -> Option<f64> {
+    ticks.filter(|t| *t >= 0.0).map(|t| t / GROK_TICKS_PER_USD)
+}
+
+fn parse_grok_value(v: &Value) -> Vec<(String, [u64; 5], Option<f64>, Option<String>, i64, String)> {
+    let Some(params) = v.get("params").filter(|p| p.is_object()) else { return Vec::new() };
+    let Some(update) = params.get("update").filter(|u| u.is_object()) else { return Vec::new() };
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("turn_completed") {
+        return Vec::new();
+    }
+    let Some(usage) = update.get("usage").filter(|u| u.is_object()) else { return Vec::new() };
+    let session = params.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
+    let prompt = update.get("prompt_id").and_then(Value::as_str);
+    let ts = params
+        .pointer("/_meta/agentTimestampMs")
+        .and_then(Value::as_f64)
+        .filter(|t| t.is_finite())
+        .or_else(|| v.get("timestamp").and_then(Value::as_f64).filter(|t| t.is_finite()).map(|t| if t > 1e12 { t } else { t * 1000.0 }));
+    let Some(ts) = ts else { return Vec::new() };
+    let ts = ts as i64;
+    let Some((top, top_ticks)) = grok_totals(usage) else { return Vec::new() };
+    let key = |model: &str| prompt.map(|p| format!("grok:{session}:{p}:{ts}:{model}"));
+    let total = |t: &[u64; 5]| t[0] + t[1] + t[2] + t[3];
+    let entries: Vec<(String, [u64; 5], Option<f64>)> = usage
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| !k.is_empty())
+                .filter_map(|(k, raw)| grok_totals(raw).map(|(t, c)| (k.clone(), t, c)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        if total(&top) == 0 {
+            return Vec::new();
+        }
+        return vec![("grok".into(), top, grok_usd(top_ticks), key("grok"), ts, session)];
+    }
+    let top_usd = grok_usd(top_ticks);
+    let (mut ticked, mut unticked) = (0.0, 0u64);
+    for (_, t, c) in &entries {
+        if total(t) == 0 {
+            continue;
+        }
+        match c {
+            Some(_) => ticked += grok_usd(*c).unwrap_or(0.0),
+            None => unticked += total(t),
+        }
+    }
+    let remaining = top_usd.map(|u| (u - ticked).max(0.0));
+    entries
+        .into_iter()
+        .filter(|(_, t, _)| total(t) > 0)
+        .map(|(model, t, c)| {
+            let mut cost = grok_usd(c);
+            if let (None, Some(r), true) = (cost, remaining, unticked > 0) {
+                cost = Some(r * total(&t) as f64 / unticked as f64);
+            }
+            let k = key(&model);
+            (model, t, cost, k, ts, session.clone())
+        })
+        .collect()
+}
+
+fn parse_grok_logs(
+    home: &Path,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+) {
+    let mut files = Vec::new();
+    walk_ext(&home.join(".grok").join("sessions"), "jsonl", &mut files);
+    files.retain(|f| f.file_name().and_then(|n| n.to_str()) == Some("updates.jsonl"));
+    for file in files {
+        let Ok(reader) = fs::File::open(&file).map(BufReader::new) else { continue };
+        for line in reader.lines().map_while(Result::ok) {
+            if !line.contains("\"turn_completed\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            for (model, t, cost, dedupe, ts, session) in parse_grok_value(&v) {
+                add(
+                    acc,
+                    seen,
+                    counted,
+                    RawUse {
+                        provider: "grok",
+                        model,
+                        day: local_day_from_epoch(ts.div_euclid(1000)),
+                        project: String::new(),
+                        input: t[0],
+                        output: t[3],
+                        cache_read: t[1],
+                        cache_write: t[2],
+                        cache_write_1h: 0,
+                        reasoning: t[4],
+                        cost,
+                        session_id: session,
+                        dedupe,
+                        speed: 0,
+                    },
+                );
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------- cost table
 
 /// USD per million tokens. `write_5m`/`write_1h` are the cache-creation rates;
@@ -1374,6 +1506,24 @@ fn utc_day_from_epoch(secs: i64) -> String {
 /// Windows: apply the user's timezone rules via SystemTimeToTzSpecificLocalTime.
 #[cfg(windows)]
 fn local_day_windows(secs: i64) -> Option<String> {
+    let (y, m, d, _, _) = local_parts(secs)?;
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// Local (year, month, day, hour, minute) of epoch seconds; UTC off Windows.
+pub(crate) fn local_parts(secs: i64) -> Option<(i64, u32, u32, u32, u32)> {
+    #[cfg(not(windows))]
+    {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+        let r = secs.rem_euclid(86_400);
+        return Some((y, m, d, (r / 3600) as u32, (r % 3600 / 60) as u32));
+    }
+    #[cfg(windows)]
+    local_parts_windows(secs)
+}
+
+#[cfg(windows)]
+fn local_parts_windows(secs: i64) -> Option<(i64, u32, u32, u32, u32)> {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
     use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
     if secs < 0 {
@@ -1398,7 +1548,7 @@ fn local_day_windows(secs: i64) -> Option<String> {
     if ok == 0 {
         return None;
     }
-    Some(format!("{:04}-{:02}-{:02}", local.wYear, local.wMonth, local.wDay))
+    Some((local.wYear as i64, local.wMonth as u32, local.wDay as u32, local.wHour as u32, local.wMinute as u32))
 }
 
 #[cfg(test)]
@@ -1535,6 +1685,16 @@ mod tests {
     }
 
     #[test]
+    fn grok_splits_the_turn_cost_across_models() {
+        let v: Value = serde_json::from_str(r#"{"params":{"sessionId":"s","_meta":{"agentTimestampMs":1794865335210},"update":{"sessionUpdate":"turn_completed","prompt_id":"p","usage":{"inputTokens":100,"outputTokens":10,"costUsdTicks":20000000000,"modelUsage":{"grok-4":{"inputTokens":60,"cachedReadTokens":20,"outputTokens":5},"grok-mini":{"inputTokens":40,"outputTokens":5}}}}}}"#).unwrap();
+        let recs = parse_grok_value(&v);
+        assert_eq!(recs.len(), 2);
+        let cost: f64 = recs.iter().map(|r| r.2.unwrap()).sum();
+        assert!((cost - 2.0).abs() < 1e-9);
+        assert_eq!(recs.iter().find(|r| r.0 == "grok-4").unwrap().1, [40, 20, 0, 5, 0]);
+    }
+
+    #[test]
     fn opencode_nested_model_and_reasoning() {
         let v: Value = serde_json::from_str(
             r#"{"role":"assistant","id":"msg_x","model":{"id":"claude-sonnet-5-5","providerID":"anthropic"},"time":{"created":1763323260206},"tokens":{"input":100,"output":50,"reasoning":10,"cache":{"read":20,"write":5}},"cost":0.001}"#,
@@ -1569,7 +1729,7 @@ mod tests {
             .iter()
             .filter(|u| u.day >= cutoff && u.day <= today)
             .collect();
-        for provider in ["opencode", "claude", "codex", "pi"] {
+        for provider in ["opencode", "claude", "codex", "pi", "grok"] {
             let rs: Vec<&&Usage> = rows.iter().filter(|u| u.provider == provider).collect();
             if rs.is_empty() { continue; }
             let sum = |f: fn(&Usage) -> u64| rs.iter().map(|u| f(u)).sum::<u64>();
