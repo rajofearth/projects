@@ -18,7 +18,7 @@ env:
 
 jobs:
   release:
-    name: Build and publish (Windows)
+    name: Build, sign and publish (Windows)
     runs-on: windows-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -32,23 +32,36 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release exe
-        run: cargo build --release
-
-      - name: Package zip
+      # The updater compares the tag against the version built into the exe, so they must agree.
+      - name: Check the tag matches Cargo.toml
         shell: pwsh
         run: |
-          $stage = "dist/projects-$env:TAG-windows-x64"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target/release/projects-stats.exe $stage/
-          Copy-Item README.md $stage/
-          if (Test-Path LICENSE) { Copy-Item LICENSE $stage/ }
-          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
-          echo "ZIP=$stage.zip" >> $env:GITHUB_ENV
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG doesn't match Cargo.toml version $version" }
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build release exe
+        run: cargo build --release --bins
+
+      # The app downloads these two files. The names carry no version, so
+      # releases/latest/download/projects-windows-x64.exe always serves the newest build.
+      - name: Sign
+        shell: pwsh
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if (-not $env:RELEASE_SIGNING_KEY) { throw "The RELEASE_SIGNING_KEY secret isn't set" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/projects-stats.exe dist/projects-windows-x64.exe
+          target/release/release-sign.exe sign dist/projects-windows-x64.exe $env:VERSION | Set-Content -NoNewline -Encoding ascii dist/projects-windows-x64.exe.sig
+          if ($LASTEXITCODE -ne 0) { throw "Signing failed" }
+          # Checks with the public key compiled into the app, so a key mismatch fails here, not on users' machines.
+          target/release/release-sign.exe verify dist/projects-windows-x64.exe dist/projects-windows-x64.exe.sig
+          if ($LASTEXITCODE -ne 0) { throw "The signature doesn't verify" }
 
       - name: Create GitHub release
         shell: pwsh
         run: |
-          gh release create $env:TAG $env:ZIP `
+          gh release create $env:TAG dist/projects-windows-x64.exe dist/projects-windows-x64.exe.sig `
             --title "Projects $env:TAG" `
             --generate-notes

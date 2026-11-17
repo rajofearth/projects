@@ -56,3 +56,4 @@ lucide!(P_CLAUDE, "asterisk", r#"<path d="M12 6v12"/><path d="M17.196 9 6.804 15
 lucide!(P_CODEX, "hexagon", r#"<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>"#);
 lucide!(P_OPENCODE, "square-code", r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/>"#);
 lucide!(P_PI, "pi", r#"<line x1="9" x2="9" y1="4" y2="20"/><path d="M4 7c0-1.7 1.3-3 3-3h13"/><path d="M18 20c-1.7 0-3-1.3-3-3V4"/>"#);
+lucide!(DOWNLOAD, "download", r#"<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>"#);
