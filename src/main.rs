@@ -15,6 +15,7 @@ mod icons;
 mod inspect;
 mod launch;
 mod limits;
+mod logos;
 mod meter;
 mod model;
 mod newproj;

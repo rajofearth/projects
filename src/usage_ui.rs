@@ -14,6 +14,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 use crate::fmt::{count, usd};
 use crate::icons;
 use crate::limits::{self, Limits};
+use crate::logos;
 use crate::ui::{data, label, rgb, Ink, R_CTRL, S1, S2, S3, S4, S5, S6, S8};
 use crate::usage::{self, Usage};
 use crate::State;
@@ -60,7 +61,7 @@ pub enum Tab {
 }
 
 /// The providers the page reads, in t3code's menu order.
-const PROVIDERS: [&str; 4] = ["codex", "claude", "opencode", "pi"];
+const PROVIDERS: [&str; 8] = ["codex", "claude", "grok", "cursor", "opencode", "antigravity", "pi", "muse"];
 
 pub struct UsageState {
     pub rows: Vec<Usage>,
@@ -386,13 +387,17 @@ pub fn short_model(m: &str) -> String {
     m.split('-').filter(|p| !(p.len() == 8 && p.chars().all(|c| c.is_ascii_digit()))).collect::<Vec<_>>().join("-")
 }
 
-/// A provider's name, mark and series colour.
+/// A provider's name, logo and series colour, as t3code's `PROVIDER_PRESENTATION` has them.
 fn provider(p: &str) -> (String, &'static Icon, Color) {
     match p {
-        "claude" => ("Claude Code".into(), &icons::P_CLAUDE, rgb([222, 128, 92])),
-        "codex" => ("Codex".into(), &icons::P_CODEX, rgb([214, 214, 220])),
-        "opencode" => ("OpenCode".into(), &icons::P_OPENCODE, rgb([96, 165, 250])),
-        "pi" => ("Pi".into(), &icons::P_PI, rgb([110, 208, 140])),
+        "codex" => ("Codex".into(), &logos::CODEX, rgb([236, 236, 238])),
+        "claude" => ("Claude Code".into(), &logos::CLAUDE, rgb([217, 119, 87])),
+        "grok" => ("Grok Build".into(), &logos::GROK, rgb([175, 175, 180])),
+        "cursor" => ("Cursor".into(), &logos::CURSOR, rgb([139, 139, 139])),
+        "opencode" => ("OpenCode".into(), &logos::OPENCODE, rgb([91, 155, 189])),
+        "antigravity" => ("Antigravity".into(), &logos::ANTIGRAVITY, rgb([140, 123, 209])),
+        "pi" => ("Pi".into(), &logos::PI, rgb([77, 159, 138])),
+        "muse" => ("Muse Code".into(), &logos::MUSE, rgb([8, 102, 255])),
         other => (other.to_string(), &icons::CODE, rgb([160, 160, 166])),
     }
 }
