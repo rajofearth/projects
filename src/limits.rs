@@ -66,6 +66,7 @@ pub fn load() -> Vec<Limits> {
     let Some(home) = home() else { return Vec::new() };
     let mut out = vec![codex(&home), claude(&home)];
     out.extend(grok(&home));
+    out.extend(cursor(&home));
     out.extend(opencode_go(&home));
     out
 }
@@ -203,6 +204,12 @@ fn jwt_claims(token: &str) -> Option<Value> {
 
 /// One read-only GET through `curl`, the bearer token passed on stdin. (status, body)
 fn get_json(url: &str, token: &str, extra: &[&str]) -> Option<(u16, Value)> {
+    http_json("GET", url, token, extra, None)
+}
+
+/// One request through `curl` with the bearer token and any body passed on stdin, never on
+/// the command line. Only read-only endpoints are called with it. (status, body)
+pub(crate) fn http_json(method: &str, url: &str, token: &str, extra: &[&str], body: Option<&str>) -> Option<(u16, Value)> {
     if token.contains(['"', '\n', '\r', '\\']) {
         return None;
     }
@@ -218,6 +225,12 @@ fn get_json(url: &str, token: &str, extra: &[&str]) -> Option<(u16, Value)> {
         let mut config = format!("url = \"{url}\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"Accept: application/json\"\nuser-agent = \"projects-stats\"\n");
         for h in extra {
             config.push_str(&format!("header = \"{h}\"\n"));
+        }
+        if method != "GET" {
+            config.push_str(&format!("request = \"{method}\"\nheader = \"Content-Type: application/json\"\n"));
+        }
+        if let Some(b) = body {
+            config.push_str(&format!("data = {}\n", serde_json::Value::from(b)));
         }
         let _ = stdin.write_all(config.as_bytes());
     }
@@ -287,6 +300,14 @@ fn grok(home: &Path) -> Option<Limits> {
     }
 }
 
+// ---- Cursor -------------------------------------------------------------------
+
+fn cursor(home: &Path) -> Option<Limits> {
+    let token = crate::cursor::token(home)?;
+    let windows = crate::cursor::limits(&token);
+    (!windows.is_empty()).then(|| Limits { provider: "cursor", windows, error: None, email: crate::cursor::email(home), plan: None })
+}
+
 // ---- OpenCode Go ----------------------------------------------------------------
 
 fn opencode_keys(home: &Path) -> Vec<String> {
@@ -305,10 +326,10 @@ fn opencode_keys(home: &Path) -> Vec<String> {
                 .ok();
             let stored = row.and_then(|v| serde_json::from_str::<Value>(&v).ok());
             let Some(stored) = stored.filter(|v| v.get("type").and_then(Value::as_str) == Some("key")) else { continue };
-            if let Some(server) = stored.pointer("/metadata/server").and_then(Value::as_str) {
-                if server.trim_end_matches('/') != "https://opencode.ai/console" {
-                    continue;
-                }
+            if let Some(server) = stored.pointer("/metadata/server").and_then(Value::as_str)
+                && server.trim_end_matches('/') != "https://opencode.ai/console"
+            {
+                continue;
             }
             if let Some(k) = stored.get("key").and_then(Value::as_str) {
                 keys.push(k.trim().to_string());

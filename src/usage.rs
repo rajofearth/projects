@@ -177,6 +177,7 @@ fn load_inner(cutoff_ms: i64) -> Vec<Usage> {
     parse_codex_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_pi_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_grok_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
+    read_cursor_account(&home, &mut acc, &mut seen, &mut counted_sessions, cutoff_ms, now * 1000);
     parse_opencode_logs(&home, &mut acc, &mut seen, &mut counted_sessions, cutoff_ms);
     // Keyed copies are counted once, after every copy has been folded in.
     for raw in seen.into_values() {
@@ -1163,7 +1164,10 @@ fn grok_usd(ticks: Option<f64>) -> Option<f64> {
     ticks.filter(|t| *t >= 0.0).map(|t| t / GROK_TICKS_PER_USD)
 }
 
-fn parse_grok_value(v: &Value) -> Vec<(String, [u64; 5], Option<f64>, Option<String>, i64, String)> {
+/// (model, tokens, cost, dedupe key, timestamp ms, session)
+type GrokRecord = (String, [u64; 5], Option<f64>, Option<String>, i64, String);
+
+fn parse_grok_value(v: &Value) -> Vec<GrokRecord> {
     let Some(params) = v.get("params").filter(|p| p.is_object()) else { return Vec::new() };
     let Some(update) = params.get("update").filter(|u| u.is_object()) else { return Vec::new() };
     if update.get("sessionUpdate").and_then(Value::as_str) != Some("turn_completed") {
@@ -1265,6 +1269,45 @@ fn parse_grok_logs(
                 );
             }
         }
+    }
+}
+
+// --------------------------------------------------------------------- Cursor
+
+/// Cursor's billed events from its account API (`crate::cursor`), with the cost Cursor reports.
+fn read_cursor_account(
+    home: &Path,
+    acc: &mut HashMap<Key, Acc>,
+    seen: &mut HashMap<String, RawUse>,
+    counted: &mut HashSet<String>,
+    since_ms: i64,
+    end_ms: i64,
+) {
+    let Some(token) = crate::cursor::token(home) else { return };
+    let Some(events) = crate::cursor::usage(&token, since_ms.max(0), end_ms) else { return };
+    for e in events {
+        add(
+            acc,
+            seen,
+            counted,
+            RawUse {
+                provider: "cursor",
+                model: e.model,
+                day: local_day_from_epoch(e.ts_ms.div_euclid(1000)),
+                project: String::new(),
+                input: e.tokens[0],
+                output: e.tokens[3],
+                cache_read: e.tokens[1],
+                cache_write: e.tokens[2],
+                cache_write_1h: 0,
+                reasoning: 0,
+                cost: e.cost_usd,
+                session_id: e.session,
+                dedupe: Some(e.dedupe),
+                ts: e.ts_ms.div_euclid(1000),
+                speed: 0,
+            },
+        );
     }
 }
 
@@ -1748,7 +1791,7 @@ mod tests {
             .iter()
             .filter(|u| u.day >= cutoff && u.day <= today)
             .collect();
-        for provider in ["opencode", "claude", "codex", "pi", "grok"] {
+        for provider in ["opencode", "claude", "codex", "pi", "grok", "cursor"] {
             let rs: Vec<&&Usage> = rows.iter().filter(|u| u.provider == provider).collect();
             if rs.is_empty() { continue; }
             let sum = |f: fn(&Usage) -> u64| rs.iter().map(|u| f(u)).sum::<u64>();

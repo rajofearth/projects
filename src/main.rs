@@ -14,6 +14,7 @@ mod home;
 mod icons;
 mod inspect;
 mod launch;
+mod cursor;
 mod limits;
 mod logos;
 mod meter;

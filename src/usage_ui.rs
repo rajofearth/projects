@@ -377,7 +377,7 @@ fn now_hour() -> i64 {
 
 /// Rows of the shown providers in the range: the last 24 hours by the hour for Past 24h,
 /// else from `days` days ago through today.
-fn within<'a>(u: &'a UsageState, now: i64, hour: i64, range: Range) -> impl Iterator<Item = &'a Usage> {
+fn within(u: &UsageState, now: i64, hour: i64, range: Range) -> impl Iterator<Item = &Usage> {
     u.rows.iter().filter(move |r| {
         u.shown(r.provider)
             && match range {
