@@ -177,6 +177,30 @@ fn load_inner(cutoff_ms: i64) -> Vec<Usage> {
     parse_codex_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_pi_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
     parse_grok_logs(&home, &mut acc, &mut seen, &mut counted_sessions);
+    for r in crate::antigravity::read(&home, cutoff_ms) {
+        add(
+            &mut acc,
+            &mut seen,
+            &mut counted_sessions,
+            RawUse {
+                provider: "antigravity",
+                model: r.model,
+                day: local_day_from_epoch(r.ts_ms.div_euclid(1000)),
+                project: String::new(),
+                input: r.tokens[0],
+                output: r.tokens[3],
+                cache_read: r.tokens[1],
+                cache_write: r.tokens[2],
+                cache_write_1h: 0,
+                reasoning: r.tokens[4],
+                cost: None,
+                session_id: r.session,
+                dedupe: Some(r.dedupe),
+                ts: r.ts_ms.div_euclid(1000),
+                speed: 0,
+            },
+        );
+    }
     read_cursor_account(&home, &mut acc, &mut seen, &mut counted_sessions, cutoff_ms, now * 1000);
     parse_opencode_logs(&home, &mut acc, &mut seen, &mut counted_sessions, cutoff_ms);
     // Keyed copies are counted once, after every copy has been folded in.
@@ -245,7 +269,9 @@ fn add(
 /// it is split across token categories in proportion to the model's list price.
 /// With no list price the logged cost is "unsplit" and lands in `cost_other`.
 fn accumulate(acc: &mut HashMap<Key, Acc>, raw: RawUse, counted: &mut HashSet<String>) {
-    let rate = price_for(&raw.model);
+    // Antigravity names effort variants; the list price is the base model's.
+    let rate = price_for(&raw.model)
+        .or_else(|| (raw.provider == "antigravity").then(|| price_for(&crate::antigravity::rate_model(&raw.model))).flatten());
     let tiered = rate.map(|r| rates_at(r, raw.speed));
     let one_hour = raw.cache_write_1h.min(raw.cache_write);
     let list = tiered.map(|r| {
@@ -1791,7 +1817,7 @@ mod tests {
             .iter()
             .filter(|u| u.day >= cutoff && u.day <= today)
             .collect();
-        for provider in ["opencode", "claude", "codex", "pi", "grok", "cursor"] {
+        for provider in ["opencode", "claude", "codex", "pi", "grok", "cursor", "antigravity"] {
             let rs: Vec<&&Usage> = rows.iter().filter(|u| u.provider == provider).collect();
             if rs.is_empty() { continue; }
             let sum = |f: fn(&Usage) -> u64| rs.iter().map(|u| f(u)).sum::<u64>();

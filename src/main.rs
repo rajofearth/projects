@@ -3,6 +3,7 @@
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
 mod actions;
+mod antigravity;
 mod art;
 mod browse;
 mod cats;
