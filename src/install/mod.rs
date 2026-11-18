@@ -162,8 +162,18 @@ impl Step {
 /// without changing anything when the copy can't be made; puts the old exe back if the final
 /// rename fails. Returns where the old exe went.
 pub fn place_exe(source: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    place_exe_checked(source, target, |_| Ok(()))
+}
+
+/// [`place_exe`], running `check` on the copy beside the target before it takes the name, so
+/// what was checked is exactly what runs.
+pub fn place_exe_checked(source: &Path, target: &Path, check: impl Fn(&Path) -> Result<(), String>) -> Result<Option<PathBuf>, String> {
     let new = target.with_extension("exe.new");
     std::fs::copy(source, &new).map_err(|e| denied(e, "copy Projects.exe"))?;
+    if let Err(e) = check(&new) {
+        let _ = std::fs::remove_file(&new);
+        return Err(e);
+    }
     let old = if target.exists() {
         let old = (0..10)
             .map(|i| target.with_extension(if i == 0 { "exe.old".to_string() } else { format!("exe.old{i}") }))
@@ -278,9 +288,13 @@ pub fn launch(exe: &Path) -> Result<u32, String> {
 pub fn uninstall() {
     let Ok(exe) = std::env::current_exe() else { return };
     let Some(dir) = exe.parent().map(Path::to_path_buf) else { return };
+    if !dir.join(MARKER).is_file() {
+        sys::tell("Uninstall Projects", "This copy of Projects isn't installed. Uninstall it from Settings, Apps.", true);
+        return;
+    }
     if !sys::ask(
         "Uninstall Projects",
-        "Remove Projects from this PC?\n\nYour settings and templates stay, so reinstalling picks up where you left off.",
+        "Remove Projects from this PC? Close any open Projects windows first.\n\nYour settings and templates stay, so reinstalling picks up where you left off.",
     ) {
         return;
     }

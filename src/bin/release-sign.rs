@@ -1,7 +1,7 @@
 //! Signs release exes for the updater.
 //!
 //! release-sign keygen                      prints a new key pair
-//! release-sign sign <exe> <version>        prints the .sig file; the key comes from RELEASE_SIGNING_KEY
+//! release-sign sign <exe> <version> <out>  writes the .sig file; the key comes from RELEASE_SIGNING_KEY
 //! release-sign verify <exe> <sig>          checks a .sig against the exe and the key built into the app
 //!
 //! The format is the one the app checks, from `src/update/verify.rs`.
@@ -39,14 +39,15 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("public [{}]", public.join(", "));
             Ok(())
         }
-        ["sign", exe, version] => {
+        ["sign", exe, version, out] => {
             let key = signing_key()?;
             if key.verifying_key().to_bytes() != verify::PUBLIC_KEY {
                 return Err("RELEASE_SIGNING_KEY doesn't match the public key in src/update/verify.rs".into());
             }
             let sha256 = sha256_file(exe)?;
             let signature = key.sign(verify::message(version, &sha256).as_bytes()).to_bytes();
-            print!("{}", verify::SigFile { version: version.to_string(), sha256, signature }.render());
+            let text = verify::SigFile { version: version.to_string(), sha256, signature }.render();
+            std::fs::write(out, text).map_err(|e| format!("can't write {out}: {e}"))?;
             Ok(())
         }
         ["verify", exe, sig] => {
@@ -59,7 +60,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{exe} {}: signature good", file.version);
             Ok(())
         }
-        _ => Err("usage: release-sign keygen | sign <exe> <version> | verify <exe> <sig>".into()),
+        _ => Err("usage: release-sign keygen | sign <exe> <version> <out> | verify <exe> <sig>".into()),
     }
 }
 

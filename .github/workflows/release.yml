@@ -20,6 +20,8 @@ jobs:
   release:
     name: Build, sign and publish (Windows)
     runs-on: windows-latest
+    # RELEASE_SIGNING_KEY lives in this environment; give it required reviewers and limit it to v* tags.
+    environment: release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
@@ -28,9 +30,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       # The updater compares the tag against the version built into the exe, so they must agree.
       - name: Check the tag matches Cargo.toml
@@ -53,7 +52,7 @@ jobs:
           if (-not $env:RELEASE_SIGNING_KEY) { throw "The RELEASE_SIGNING_KEY secret isn't set" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/projects-stats.exe dist/projects-windows-x64.exe
-          target/release/release-sign.exe sign dist/projects-windows-x64.exe $env:VERSION | Set-Content -NoNewline -Encoding ascii dist/projects-windows-x64.exe.sig
+          target/release/release-sign.exe sign dist/projects-windows-x64.exe $env:VERSION dist/projects-windows-x64.exe.sig
           if ($LASTEXITCODE -ne 0) { throw "Signing failed" }
           # Checks with the public key compiled into the app, so a key mismatch fails here, not on users' machines.
           target/release/release-sign.exe verify dist/projects-windows-x64.exe dist/projects-windows-x64.exe.sig

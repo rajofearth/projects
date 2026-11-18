@@ -142,19 +142,29 @@ pub fn attach_parent_console() {
     unsafe { windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS) };
 }
 
-/// Waits up to `ms` for process `pid` to exit; true once it has. An unknown pid counts as exited.
+/// A process held open by handle, so its id can't be reused while it is watched.
 #[cfg(windows)]
-pub fn wait_exit(pid: u32, ms: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-    unsafe {
-        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if h.is_null() {
-            return true;
-        }
-        let done = WaitForSingleObject(h, ms) == WAIT_OBJECT_0;
-        CloseHandle(h);
-        done
+pub struct Process(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Process {
+    pub fn open(pid: u32) -> Option<Process> {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+        let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        (!h.is_null()).then_some(Process(h))
+    }
+
+    /// Waits up to `ms`; true once the process has exited.
+    pub fn wait(&self, ms: u32) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Process {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 
@@ -176,8 +186,14 @@ mod stubs {
     }
     pub fn tell(_: &str, _: &str, _: bool) {}
     pub fn attach_parent_console() {}
-    pub fn wait_exit(_: u32, _: u32) -> bool {
-        true
+    pub struct Process;
+    impl Process {
+        pub fn open(_: u32) -> Option<Process> {
+            None
+        }
+        pub fn wait(&self, _: u32) -> bool {
+            true
+        }
     }
 }
 #[cfg(not(windows))]

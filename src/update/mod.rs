@@ -194,11 +194,22 @@ fn download(rel: &Release, dir: &Path, progress: impl Fn(u64, u64)) -> Result<St
 /// Swaps `staged` in at `target`, starts it, and leaves the old exe watching it.
 fn apply(staged: &Staged, target: &Path, dir: &Path) -> Result<(), String> {
     verify_staged(staged)?;
+    // Another installer may have put a newer version in place while this one ran.
+    if install::existing().and_then(|e| e.version).is_some_and(|v| v >= staged.version) {
+        return Err(format!("a version at least as new as {} is already installed", staged.version));
+    }
     let from = Version::current();
     write_json(&dir.join("install.json"), &Record { from: from.to_string(), to: staged.version.to_string() })?;
-    let old = match install::place_exe(&staged.exe, target) {
+    // The copy beside the target is checked again, so the bytes verified are the bytes that run.
+    let check = |copy: &Path| {
+        if sha256_file(copy)? == staged.sha256 { Ok(()) } else { Err("the update changed while it was being installed".to_string()) }
+    };
+    let old = match install::place_exe_checked(&staged.exe, target, check) {
         Ok(Some(old)) => old,
-        Ok(None) => return Err("the installed Projects.exe is missing".into()),
+        Ok(None) => {
+            let _ = std::fs::remove_file(dir.join("install.json"));
+            return Err("the installed Projects.exe was missing".into());
+        }
         Err(e) => {
             let _ = std::fs::remove_file(dir.join("install.json"));
             return Err(e);
@@ -256,12 +267,22 @@ pub fn watch(args: &[String]) {
     };
     let Some(dir) = updates_dir() else { return };
     let record = dir.join("install.json");
+    // Act only on the update this exe just handed over: the target is the exe beside it, and
+    // the version is the one the record names.
+    let Ok(me) = std::env::current_exe() else { return };
+    let beside = me.parent().map(|d| d.join(install::EXE_NAME));
+    let expected = read_json::<Record>(&record).map(|r| r.to);
+    if beside.as_deref() != Some(target.as_path()) || expected.as_deref() != Some(version.as_str()) {
+        return;
+    }
+    // One handle for the whole wait, so a reused process id can't stand in for the new exe.
+    let Some(child) = install::sys::Process::open(pid) else { return };
     let start = std::time::Instant::now();
     let failed = loop {
         if !record.exists() {
             break false;
         }
-        if install::sys::wait_exit(pid, 250) {
+        if child.wait(250) {
             break record.exists();
         }
         if start.elapsed().as_secs() >= WATCH_SECS {
@@ -272,7 +293,6 @@ pub fn watch(args: &[String]) {
     if !failed {
         return;
     }
-    let Ok(me) = std::env::current_exe() else { return };
     let _ = std::fs::remove_file(target.with_extension("exe.failed"));
     if std::fs::rename(&target, target.with_extension("exe.failed")).is_ok() && std::fs::rename(&me, &target).is_ok() {
         let from = read_json::<Record>(&record).map(|r| r.from).unwrap_or_default();
@@ -301,8 +321,13 @@ fn confirm_started(exe: &Path, dir: &Path) -> Option<Outcome> {
             clear_staged(dir);
             let _ = std::fs::remove_file(dir.join("failed.json"));
             outcome = Some(Outcome::Updated(current));
+        } else {
+            // Left by an install that never started: nothing waits on it.
+            let _ = std::fs::remove_file(&record);
         }
-    } else if let Some(f) = read_json::<Failed>(&dir.join("failed.json")).filter(|f| Version::parse(&f.from) == Some(current)) {
+    }
+    if outcome.is_none()
+        && let Some(f) = read_json::<Failed>(&dir.join("failed.json")).filter(|f| Version::parse(&f.from) == Some(current)) {
         if let Some(v) = Version::parse(&f.version) {
             outcome = Some(Outcome::RolledBack(v));
         }
