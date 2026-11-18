@@ -6,30 +6,32 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish, e.g. v0.2.0 (created at the selected branch if it does not exist)"
+        description: "Tag to publish, e.g. v0.2.0 (created at the selected commit if it does not exist)"
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
 
 jobs:
-  release:
-    name: Build, sign and publish (Windows)
-    runs-on: windows-latest
-    # RELEASE_SIGNING_KEY lives in this environment; give it required reviewers and limit it to v* tags.
-    environment: release
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  # Each architecture builds on its own native runner, in parallel. These jobs never see the
+  # signing key.
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
 
       # The updater compares the tag against the version built into the exe, so they must agree.
       - name: Check the tag matches Cargo.toml
@@ -37,30 +39,76 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG doesn't match Cargo.toml version $version" }
-          echo "VERSION=$version" >> $env:GITHUB_ENV
 
-      - name: Build release exe
-        run: cargo build --release --bins
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      # The app downloads these two files. The names carry no version, so
-      # releases/latest/download/projects-windows-x64.exe always serves the newest build.
+      # Only release runs write this cache, so pull request code can't put anything in it.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --release --locked --bins
+
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item target/release/projects-stats.exe out/projects-windows-${{ matrix.arch }}.exe
+          Copy-Item target/release/release-sign.exe out/release-sign-${{ matrix.arch }}.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.arch }}
+          path: out/
+          retention-days: 1
+
+  # Signs both exes and publishes them. The key lives in the `release` environment, which
+  # needs a reviewer and is limited to v* tags.
+  publish:
+    name: Sign and publish
+    needs: build
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist
+
       - name: Sign
         shell: pwsh
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
           if (-not $env:RELEASE_SIGNING_KEY) { throw "The RELEASE_SIGNING_KEY secret isn't set" }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/projects-stats.exe dist/projects-windows-x64.exe
-          target/release/release-sign.exe sign dist/projects-windows-x64.exe $env:VERSION dist/projects-windows-x64.exe.sig
-          if ($LASTEXITCODE -ne 0) { throw "Signing failed" }
-          # Checks with the public key compiled into the app, so a key mismatch fails here, not on users' machines.
-          target/release/release-sign.exe verify dist/projects-windows-x64.exe dist/projects-windows-x64.exe.sig
-          if ($LASTEXITCODE -ne 0) { throw "The signature doesn't verify" }
+          $version = $env:TAG.TrimStart('v')
+          $sign = "dist/release-sign-x64.exe"
+          foreach ($arch in 'x64', 'arm64') {
+            $exe = "dist/projects-windows-$arch.exe"
+            & $sign sign $exe $version "$exe.sig"
+            if ($LASTEXITCODE -ne 0) { throw "Signing $arch failed" }
+            # Checks with the public key compiled into the app, so a key mismatch fails here.
+            & $sign verify $exe "$exe.sig"
+            if ($LASTEXITCODE -ne 0) { throw "The $arch signature doesn't verify" }
+          }
 
+      # The app downloads the exe and .sig for its own architecture. The names carry no
+      # version, so releases/latest/download/projects-windows-x64.exe always serves the newest.
       - name: Create GitHub release
         shell: pwsh
         run: |
-          gh release create $env:TAG dist/projects-windows-x64.exe dist/projects-windows-x64.exe.sig `
+          gh release create $env:TAG `
+            dist/projects-windows-x64.exe dist/projects-windows-x64.exe.sig `
+            dist/projects-windows-arm64.exe dist/projects-windows-arm64.exe.sig `
+            --repo ${{ github.repository }} `
+            --target ${{ github.sha }} `
             --title "Projects $env:TAG" `
             --generate-notes

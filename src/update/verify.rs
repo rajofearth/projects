@@ -11,10 +11,16 @@ use ed25519_dalek::{Signature, VerifyingKey};
 /// `RELEASE_SIGNING_KEY` secret; `release-sign verify` in CI fails the release if they differ.
 pub const PUBLIC_KEY: [u8; 32] = [0x78, 0x1a, 0x0e, 0x4f, 0x7d, 0x18, 0xf3, 0xd4, 0x90, 0x6f, 0x19, 0x78, 0xd0, 0xc6, 0xfd, 0xd1, 0x3a, 0x63, 0x31, 0x74, 0xf4, 0x6c, 0xbf, 0x2b, 0x28, 0x97, 0x5c, 0x0d, 0x61, 0x5d, 0x02, 0xe5];
 
-/// The release asset names. Version-less, so
+/// The release asset names for the architecture this exe was built for. Version-less, so
 /// `releases/latest/download/projects-windows-x64.exe` always serves the newest build.
+#[cfg(not(target_arch = "aarch64"))]
 pub const ASSET_EXE: &str = "projects-windows-x64.exe";
+#[cfg(not(target_arch = "aarch64"))]
 pub const ASSET_SIG: &str = "projects-windows-x64.exe.sig";
+#[cfg(target_arch = "aarch64")]
+pub const ASSET_EXE: &str = "projects-windows-arm64.exe";
+#[cfg(target_arch = "aarch64")]
+pub const ASSET_SIG: &str = "projects-windows-arm64.exe.sig";
 
 /// The bytes the signature covers.
 pub fn message(version: &str, sha256_hex: &str) -> String {
