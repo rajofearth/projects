@@ -327,6 +327,13 @@ pub fn view(s: &State, ink: &Ink, k: &Kit, _layer: &mut Vec<El>) -> El {
         ))
         .child(group("home", "Home", "How the project grid looks and stays up to date.", home_prefs(s, ink, k), ink))
         .child(group("memory", "Remembered", "Recently opened projects lead Home; archived ones leave it.", memory(s, ink, k), ink))
+        .child(group(
+            "updates",
+            "Updates",
+            "New versions come from GitHub releases and are checked against the release signature before they install.",
+            crate::update_ui::settings(s, ink, k),
+            ink,
+        ))
         .child(group("files", "Files", "Plain JSON, safe to edit or back up.", files(s, ink, k), ink));
     col()
         .key("settings")

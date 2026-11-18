@@ -52,3 +52,4 @@ lucide!(ALERT, "circle-alert", r#"<circle cx="12" cy="12" r="10"/><line x1="12" 
 lucide!(GAUGE, "gauge", r#"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"#);
 lucide!(TREND_UP, "trending-up", r#"<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>"#);
 lucide!(TREND_DOWN, "trending-down", r#"<polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/>"#);
+lucide!(DOWNLOAD, "download", r#"<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>"#);

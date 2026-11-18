@@ -2,6 +2,9 @@
 //! `cargo run -p projects-stats` opens the window and starts scanning;
 //! `--scene demo` opens the window on the built-in fixture instead of scanning.
 
+// Release builds are GUI programs, so opening Projects shows no console window.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod actions;
 mod antigravity;
 mod art;
@@ -14,12 +17,14 @@ mod fmt;
 mod home;
 mod icons;
 mod inspect;
+mod install;
 mod launch;
 mod cursor;
 mod limits;
 mod logos;
 mod meter;
 mod model;
+mod net;
 mod newproj;
 mod saved;
 mod scan;
@@ -30,13 +35,15 @@ mod store;
 mod templates;
 mod templates_ui;
 mod ui;
+mod update;
+mod update_ui;
 mod usage;
 mod usage_ui;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use model::ScanEvent;
 use rune::{AppSpec, Waker};
@@ -101,7 +108,12 @@ pub struct State {
     pub shortcuts: bool,
     /// The window's width, for menus opened from a button.
     pub window_w: f32,
+    /// Checking for, downloading and installing new versions.
+    pub updates: update::Updater,
 }
+
+/// What `main` decided this process is, for `State::new`.
+static MODE: OnceLock<install::Mode> = OnceLock::new();
 
 const RESCAN_EVERY: f64 = 300.0; // seconds
 
@@ -149,6 +161,9 @@ impl State {
             note_seq: 0,
             shortcuts: false,
             window_w: 1200.0,
+            updates: update::Updater::new(
+                MODE.get().unwrap_or(&install::Mode::Portable("Updates are off for this run".into())),
+            ),
         }
     }
 
@@ -221,6 +236,7 @@ impl State {
 
     fn load_demo(&mut self) {
         self.demo = true;
+        self.updates = update::Updater::demo();
         self.inspect.demo = true;
         self.usage.demo = true;
         self.saved.opened.clear();
@@ -521,6 +537,17 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     if s.usage.drain() {
         changed = true;
     }
+    if !s.demo {
+        let waker = s.waker.clone();
+        if s.updates.tick(clock, s.saved.auto_update, waker.as_ref()) {
+            changed = true;
+        }
+        let drained = s.updates.drain(waker.as_ref());
+        if let Some(v) = drained.ready {
+            s.toast(format!("Version {v} downloaded. Restart Projects to install it"));
+        }
+        changed |= drained.changed;
+    }
     // The meter keeps drawing while shares ease, the scan runs, or the pointer moves over it.
     if s.tick_meter(clock) {
         changed = true;
@@ -668,6 +695,13 @@ fn wallclock() -> String {
 fn setup(s: &mut State, waker: Waker) {
     s.art.start(waker.clone());
     s.waker = Some(waker);
+    match s.updates.started() {
+        Some(update::Outcome::Updated(v)) => s.toast(format!("Updated to {v}")),
+        Some(update::Outcome::RolledBack(v)) => {
+            s.toast_error(format!("Version {v} didn't start, so Projects stayed on {}", update::version::Version::current()))
+        }
+        None => {}
+    }
     s.apps = launch::installed();
     if !s.demo {
         s.request_scan();
@@ -759,6 +793,24 @@ fn scene_settings(s: &mut State) {
     s.saved.archived.insert("llama.cpp".into());
 }
 
+/// Settings with a downloaded update waiting: the sidebar line and the Updates group.
+fn scene_update(s: &mut State) {
+    scene_settings(s);
+    let st = &mut s.updates.state;
+    st.disabled = None;
+    st.checked_at = Some(saved::now_unix() - 1500);
+    st.ready = Some(update::machine::Staged {
+        version: update::version::Version { major: st.current.major, minor: st.current.minor + 1, patch: 0 },
+        exe: PathBuf::new(),
+        sha256: String::new(),
+        sig: String::new(),
+        notes: vec![
+            "Storage groups node_modules by package manager".into(),
+            "Fix a scan stalling on folders without read access".into(),
+        ],
+    });
+}
+
 fn scene_new(s: &mut State) {
     scene_home(s);
     let root = s.root.clone();
@@ -790,8 +842,27 @@ fn scene_empty(s: &mut State) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        // What Settings, Apps runs.
+        Some("--uninstall") => return install::uninstall(),
+        // The old exe, watching the new one start after an update.
+        Some("--update-watch") => return update::watch(&args[1..]),
+        _ => {}
+    }
+    if !args.is_empty() {
+        install::sys::attach_parent_console();
+    }
     // The window and taskbar icon (Windows); a no-op elsewhere. The exe's own icon comes from build.rs.
     let _ = rune::set_app_icon(include_bytes!("../assets/icon-256.png").to_vec());
+    let mode = install::mode(&args);
+    match &mode {
+        install::Mode::Setup => return install::ui::run(),
+        // An update downloaded last time and not installed then goes in before the window opens.
+        install::Mode::Installed(exe) if update::apply_pending_at_launch(exe) => return,
+        _ => {}
+    }
+    let _ = MODE.set(mode);
     rune::run(AppSpec::<State> {
         scenes: &[
             ("demo", scene_home),
@@ -806,6 +877,7 @@ fn main() {
             ("demo-usage-menu", scene_usage_menu),
             ("demo-templates", scene_templates),
             ("demo-settings", scene_settings),
+            ("demo-update", scene_update),
             ("demo-new", scene_new),
             ("demo-running", scene_running),
             ("demo-empty", scene_empty),

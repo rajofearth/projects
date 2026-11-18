@@ -60,6 +60,8 @@ pub struct Saved {
     /// The app id Enter and double-click open a project in; `None` is the first one found.
     pub editor: Option<String>,
     pub auto_rescan: bool,
+    /// Check GitHub and download new versions in the background.
+    pub auto_update: bool,
     /// The last error writing the file, for a toast.
     pub error: Option<String>,
 }
@@ -105,6 +107,7 @@ impl Saved {
             root,
             editor: prefs.get("editor"),
             auto_rescan: prefs.get("auto_rescan").unwrap_or(true),
+            auto_update: prefs.get("auto_update").unwrap_or(true),
             error: None,
             prefs,
         }
@@ -177,6 +180,11 @@ impl Saved {
     pub fn set_auto_rescan(&mut self, on: bool) {
         self.auto_rescan = on;
         self.put("auto_rescan", &on);
+    }
+
+    pub fn set_auto_update(&mut self, on: bool) {
+        self.auto_update = on;
+        self.put("auto_update", &on);
     }
 
     pub fn add_root(&mut self, root: &str) -> bool {

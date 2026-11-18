@@ -104,7 +104,7 @@ fn toasts(s: &State, ink: &Ink, k: &Kit) -> El {
 // ---- sidebar ----------------------------------------------------------------
 
 /// The app's mark: three lit dots of the meter, the one picture the app has.
-fn mark(ink: &Ink) -> El {
+pub(crate) fn mark(ink: &Ink) -> El {
     let dot = |c: Color| el().size(5.0, 5.0).radius(2.5).fill(c);
     col()
         .gap(2.0)
@@ -244,6 +244,8 @@ fn sidebar(s: &State, ink: &Ink, k: &Kit) -> El {
                 .px(S2 + 2.0)
                 .pt(S3)
                 .border_sides([1.0, 0.0, 0.0, 0.0], ink.line)
+                .gap(S3)
+                .children(crate::update_ui::sidebar_line(s, ink, k))
                 .child(scan_status(s, ink, k)),
         )
 }
