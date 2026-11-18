@@ -276,9 +276,11 @@ pub fn watch(args: &[String]) {
         return;
     }
     // One handle for the whole wait, so a reused process id can't stand in for the new exe.
-    let Some(child) = install::sys::Process::open(pid) else { return };
+    // The new exe can exit before this process starts. If it never removed the record, it failed.
+    let child = install::sys::Process::open(pid);
     let start = std::time::Instant::now();
     let failed = loop {
+        let Some(child) = &child else { break record.exists() };
         if !record.exists() {
             break false;
         }
