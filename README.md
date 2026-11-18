@@ -56,7 +56,7 @@ A Windows desktop project manager built with [Rune](https://github.com/anomalyco
 
 ## Install
 
-Download `projects-windows-x64.exe` from the [latest release](https://github.com/rajofearth/projects/releases/latest/download/projects-windows-x64.exe) and open it. The install window asks for a folder (by default `%LOCALAPPDATA%\Programs\Projects`), copies the exe there, adds a Start menu shortcut and an entry under Settings, Apps, then opens the installed copy. It installs for your account only, so it needs no admin rights. Folders under Program Files or Windows are refused for that reason. A folder that already holds other files gets a `Projects` folder inside it.
+Download [`projects-windows-x64.exe`](https://github.com/rajofearth/projects/releases/latest/download/projects-windows-x64.exe), or [`projects-windows-arm64.exe`](https://github.com/rajofearth/projects/releases/latest/download/projects-windows-arm64.exe) for ARM PCs, from the latest release and open it. The install window asks for a folder (by default `%LOCALAPPDATA%\Programs\Projects`), copies the exe there, adds a Start menu shortcut and an entry under Settings, Apps, then opens the installed copy. It installs for your account only, so it needs no admin rights. Folders under Program Files or Windows are refused for that reason. A folder that already holds other files gets a `Projects` folder inside it.
 
 The exe is not Authenticode-signed, so Windows SmartScreen warns the first time it runs. Choose More info, then Run anyway.
 
@@ -68,7 +68,7 @@ To uninstall, use Settings, Apps, Projects. That removes the exe, the shortcut a
 
 An installed copy checks the repository's latest GitHub release six seconds after it opens and every four hours after that. A newer version downloads in the background to `%LOCALAPPDATA%\Projects\updates`. The sidebar then shows the version and a Restart button, and Settings, Updates lists what changed. If you close Projects instead of restarting, the update installs the next time Projects opens, before its window appears.
 
-Each release carries `projects-windows-x64.exe.sig`: the version, the exe's SHA-256, and an Ed25519 signature over both. The app checks the signature against the public key compiled into it (`src/update/verify.rs`) before it downloads the exe, checks the downloaded bytes against the SHA-256, and checks both again just before installing. A release whose files were swapped, or an older signed exe relabelled as a newer version, is refused.
+Each exe on a release has a `.sig` file beside it, such as `projects-windows-x64.exe.sig`: the version, the exe's SHA-256, and an Ed25519 signature over both. The app checks the signature against the public key compiled into it (`src/update/verify.rs`) before it downloads the exe, checks the downloaded bytes against the SHA-256, and checks both again just before installing. A release whose files were swapped, or an older signed exe relabelled as a newer version, is refused.
 
 Installing renames the running exe to `Projects.exe.old`, moves the new one into its place and starts it, while the old exe waits for the new one to finish starting. If the new version exits before then, the old exe moves back and starts again, and that version is skipped until a newer one is released.
 
@@ -93,7 +93,7 @@ The version lives in `version` under `[package]` in `Cargo.toml`. To cut a relea
 git tag vX.Y.Z && git push --tags
 ```
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`. It fails if the tag doesn't match `Cargo.toml`, builds the release exe, signs it with the `RELEASE_SIGNING_KEY` repository secret, checks the signature against the key compiled into the app, and publishes `projects-windows-x64.exe` and its `.sig` with notes generated from the merged PRs since the previous tag (grouped by label, as set in `.github/release.yml`). The workflow can also be started by hand from the Actions tab.
+Pushing a `v*` tag runs `.github/workflows/release.yml`. It fails if the tag doesn't match `Cargo.toml`, builds the x64 and ARM64 exes in parallel on native runners, signs both with the `RELEASE_SIGNING_KEY` repository secret, checks the signature against the key compiled into the app, and publishes each exe with its `.sig` with notes generated from the merged PRs since the previous tag (grouped by label, as set in `.github/release.yml`). The workflow can also be started by hand from the Actions tab.
 
 The updater reads releases without signing in to GitHub, so it only finds them while the repository is public.
 
