@@ -29,6 +29,9 @@ pub struct Project {
 pub enum ScanEvent {
     Start { total: usize },
     Project(Box<Project>),
+    /// Names whose folder changed this scan: their cached description/git facts are dropped
+    /// so the inspector re-reads them, while unchanged folders keep theirs.
+    Reinspect(Vec<String>),
     Done { seconds: f64 },
     Failed(String),
 }
