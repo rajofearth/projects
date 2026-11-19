@@ -124,6 +124,76 @@ impl Inspector {
         }
         any
     }
+
+    /// Drop the cached facts for a folder that changed, so `want` re-reads them. A request
+    /// already on the queue is dropped too; the scan's row is the one that matters now.
+    pub fn invalidate(&mut self, name: &str) {
+        self.info.remove(name);
+        self.stacks.remove(name);
+        self.queued.remove(name);
+        let queue = self.queue.0.lock().unwrap();
+        let mut queue = queue;
+        queue.retain(|(n, _)| n != name);
+    }
+
+    /// Restore facts from the disk cache. They are treated as fresh so a startup does not
+    /// re-read every description; only folders the scan reports as changed are invalidated.
+    pub fn restore(&mut self, entries: Vec<(String, Info)>) {
+        for (name, info) in entries {
+            self.stacks.insert(name.clone(), info.stack.clone());
+            self.info.insert(name, (Arc::new(info), Instant::now()));
+        }
+    }
+
+    /// Everything already read, except folders whose facts are still in flight. The cache
+    /// writer uses this so a half-finished inspection is never persisted as final.
+    pub fn snapshot(&self) -> Vec<(String, Info)> {
+        self.info
+            .iter()
+            .filter(|(name, _)| !self.queued.contains(*name))
+            .map(|(name, (info, _))| (name.clone(), (**info).clone()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(desc: &str) -> Info {
+        Info {
+            description: Some(desc.into()),
+            stack: vec!["Rust"],
+            ..Info::default()
+        }
+    }
+
+    #[test]
+    fn restored_facts_are_reused_until_invalidated() {
+        let mut inspector = Inspector::new();
+        inspector.restore(vec![("ply".into(), info("cached"))]);
+        assert_eq!(inspector.get("ply").unwrap().description.as_deref(), Some("cached"));
+        assert!(inspector.has_stack("ply"));
+        // A normal request does not re-read a restored folder.
+        inspector.want("ply", PathBuf::from("ply"), false, None);
+        assert!(!inspector.pending("ply"));
+
+        inspector.invalidate("ply");
+        assert!(inspector.get("ply").is_none(), "a changed folder loses its old facts");
+        assert!(!inspector.has_stack("ply"));
+        inspector.want("ply", PathBuf::from("ply"), false, None);
+        assert!(inspector.pending("ply"), "and is queued for a fresh read");
+    }
+
+    #[test]
+    fn a_snapshot_leaves_out_facts_still_in_flight() {
+        let mut inspector = Inspector::new();
+        inspector.restore(vec![("ready".into(), info("ready"))]);
+        // A changed folder has no facts yet and a read for it is on the way.
+        inspector.want("pending", PathBuf::from("pending"), false, None);
+        let names: Vec<String> = inspector.snapshot().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["ready"], "in-flight facts are not written to the cache");
+    }
 }
 
 fn worker(queue: Queue, tx: Sender<(String, Info)>, waker: Waker) {

@@ -58,7 +58,7 @@ A Windows desktop project manager built with [Rune](https://github.com/anomalyco
 
 Download [`projects-windows-x64.exe`](https://github.com/rajofearth/projects/releases/latest/download/projects-windows-x64.exe), or [`projects-windows-arm64.exe`](https://github.com/rajofearth/projects/releases/latest/download/projects-windows-arm64.exe) for ARM PCs, from the latest release and open it. The install window asks for a folder (by default `%LOCALAPPDATA%\Programs\Projects`), copies the exe there, adds a Start menu shortcut and an entry under Settings, Apps, then opens the installed copy. It installs for your account only, so it needs no admin rights. Folders under Program Files or Windows are refused for that reason. A folder that already holds other files gets a `Projects` folder inside it.
 
-The exe is not Authenticode-signed, so Windows SmartScreen warns the first time it runs. Choose More info, then Run anyway.
+The exe is not Authenticode-signed, so Windows SmartScreen warns the first time it runs. Choose More info, then Run anyway; for a download you want to keep, right-click → Properties → Unblock removes the web mark that causes the prompt.
 
 "Run without installing" opens the downloaded copy once, with updates off.
 
@@ -80,9 +80,13 @@ Updates are off for debug builds, builds run from a `target` folder, command-lin
 cargo run --release
 ```
 
-The app scans the root folder on startup and fills in projects as they finish. Use `--scene demo` for built-in sample data with no disk scan, `--scene demo-update` for the update controls, and `PROJECTS_SHOW_INSTALLER=1` with `--scene setup` (or `setup-working`, `setup-existing`, `setup-error`) for the install window.
+On startup the app shows the previous scan immediately from an on-disk cache, then checks folders in the background and only measures what changed. Ctrl+R forces a full rescan. Use `--scene demo` for built-in sample data with no disk scan, `--scene demo-update` for the update controls, and `PROJECTS_SHOW_INSTALLER=1` with `--scene setup` (or `setup-working`, `setup-existing`, `setup-error`) for the install window.
 
 Set `RUNE_STATS_ROOT` to point at a different projects folder for a run; it defaults to `P:\Projects`.
+
+### Startup cache
+
+The last scan — disk numbers, git facts, descriptions, scripts and languages — is written to `%APPDATA%\projects\cache.json`. Each folder gets a cheap fingerprint from its directory entries, manifests and git refs, so an ordinary launch does no file walk and no `git` or description reads: unchanged folders are carried over as-is. A changed folder is walked and inspected on the next background pass; deleted folders disappear; a different cache version or projects root is treated as a cold start. `Ctrl+R` ignores the cache and scans everything.
 
 ### Releasing a version
 
@@ -153,6 +157,7 @@ You can edit this file by hand or use the Templates page in the app.
 - Projects, disk usage, languages, scripts, git facts and commits: read from the folders under the root. The scanner walks each project in parallel, buckets disk space into source, dependencies, build output and other, counts code lines by file extension, and asks `git` for branch, history and working-tree state. Project descriptions and stack labels come from manifests and README files.
 - Usage: parsed from local log files. Claude Code from `%USERPROFILE%\.claude\projects\**\*.jsonl`, Codex from `%USERPROFILE%\.codex\sessions\**\*.jsonl`, and OpenCode from `%USERPROFILE%\.local\share\opencode\storage\message\**\*.json`. Cost uses the value in the log when present, otherwise a built-in list-price table; unknown models are counted as zero cost and flagged as unpriced.
 - Settings and pins: a Rune preferences file named `projects`, written whenever something changes.
+- Startup cache: `%APPDATA%\projects\cache.json`, the last scan and its per-folder fingerprints and descriptions.
 - Templates: `%APPDATA%\projects\templates.json`.
 
 ## Credits

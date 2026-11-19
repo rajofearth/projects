@@ -9,6 +9,7 @@ mod actions;
 mod antigravity;
 mod art;
 mod browse;
+mod cache;
 mod cats;
 mod detail;
 mod detect;
@@ -86,6 +87,12 @@ pub struct State {
     /// Git facts carried between scans, keyed by project path with a refs-mtime validity
     /// key — rescans skip the history walk for repos that haven't moved.
     pub git_cache: GitCache,
+    /// The last scan's fingerprint and row per folder, loaded from disk and refreshed after
+    /// every scan. The scanner uses it to carry unchanged folders over instead of walking them.
+    pub scan_cache: cache::ScanCache,
+    /// The on-disk cache is behind what is on screen; a poll writes it once things settle.
+    cache_dirty: bool,
+    cache_saved: f64,
     /// Which page the window shows.
     pub page: shell::Page,
     pub home: home::Home,
@@ -147,6 +154,9 @@ impl State {
             fps_since: 0.0,
             last_trim: 0.0,
             git_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            scan_cache: Arc::new(HashMap::new()),
+            cache_dirty: false,
+            cache_saved: 0.0,
             page: shell::Page::Home,
             home: home::Home::new(),
             usage: usage_ui::UsageState::new(),
@@ -192,7 +202,8 @@ impl State {
             return;
         }
         self.inspect.clear();
-        self.request_scan();
+        // An explicit rescan is a request for fresh numbers, not a cache check.
+        self.request_scan_with(true);
     }
 
     /// Shows another projects folder: a new scan, and nothing carried over from the old one.
@@ -212,7 +223,19 @@ impl State {
         self.rx = None;
         self.last_done = None;
         if !self.demo {
-            self.request_scan();
+            // A folder that was shown before has its own cache, so switching back is quick.
+            let cached = cache::load(root);
+            if let Some(loaded) = cached {
+                self.projects = loaded.projects;
+                self.scan_cache = loaded.scan_map;
+                self.inspect.restore(loaded.info);
+                self.done_at = loaded.done_at;
+                self.scan_secs = loaded.scan_secs;
+                self.request_scan();
+            } else {
+                self.scan_cache = Arc::new(HashMap::new());
+                self.request_scan_with(true);
+            }
         }
         self.toast(format!("Showing {root}"));
     }
@@ -259,8 +282,13 @@ impl State {
         }
     }
 
-    /// Start a scan unless one is already running or demo mode holds the data.
+    /// Start an incremental scan unless one is already running or demo mode holds the data.
     fn request_scan(&mut self) {
+        self.request_scan_with(false);
+    }
+
+    /// `force` ignores the fingerprint cache and measures every folder (Ctrl+R, a new root).
+    fn request_scan_with(&mut self, force: bool) {
         if self.scanning || self.demo {
             return;
         }
@@ -279,8 +307,11 @@ impl State {
         // Tests and headless fixture runs have no loop to wake; a no-op waker is fine there.
         let waker: Waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| ()));
         let root = PathBuf::from(&self.root);
-        let cache = self.git_cache.clone();
-        std::thread::spawn(move || scan::scan(root, tx, cache, move || waker()));
+        let git_cache = self.git_cache.clone();
+        let scan_cache = self.scan_cache.clone();
+        std::thread::spawn(move || {
+            scan::scan(root, tx, git_cache, scan_cache, force, move || waker())
+        });
     }
 }
 
@@ -313,6 +344,14 @@ impl State {
                     }
                     changed = true;
                 }
+                Ok(ScanEvent::Reinspect(names)) => {
+                    // These folders changed this scan: their cached description and git facts
+                    // no longer describe them, so poll re-reads just those.
+                    for name in names {
+                        self.inspect.invalidate(&name);
+                    }
+                    changed = true;
+                }
                 Ok(ScanEvent::Done { seconds }) => {
                     eprintln!("scan done in {seconds:.1}s");
                     self.scanning = false;
@@ -334,6 +373,10 @@ impl State {
                     self.scan_secs = seconds;
                     self.last_done = Some(clock);
                     self.done_at = Some(wallclock());
+                    // The numbers just measured become the baseline for the next scan, and
+                    // the disk cache catches up once the inspector has answered for them.
+                    self.scan_cache = cache::scan_map(&self.root, &self.projects);
+                    self.cache_dirty = true;
                     // The scan's walkers and buffers just peaked the working set; hand
                     // those pages back so the app idles small.
                     trim_ram();
@@ -487,6 +530,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     }
     if s.inspect.drain() {
         changed = true;
+        s.cache_dirty = true;
     }
     // Stack labels from the manifests, a few folders a frame, then every project's full
     // facts on the inspector's thread once the scan has settled.
@@ -588,6 +632,24 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
     if !s.scanning && clock - s.last_trim >= 30.0 {
         trim_ram();
         s.last_trim = clock;
+    }
+
+    // Write the cache in bursts, not on every frame: it is small, but the inspector answers
+    // one project at a time and each answer would otherwise be its own disk write.
+    if !s.demo
+        && s.cache_dirty
+        && !s.scanning
+        && (s.cache_saved == 0.0 || clock - s.cache_saved >= 2.0)
+    {
+        cache::save(
+            &s.root,
+            &s.projects,
+            &s.inspect,
+            s.done_at.clone(),
+            s.scan_secs,
+        );
+        s.cache_dirty = false;
+        s.cache_saved = clock;
     }
 
     let due = match s.last_done {
@@ -704,6 +766,15 @@ fn setup(s: &mut State, waker: Waker) {
     }
     s.apps = launch::installed();
     if !s.demo {
+        // Show the last scan at once, then let the background scan check for changes. The
+        // window never waits on a full walk, and unchanged folders keep their old numbers.
+        if let Some(loaded) = cache::load(&s.root) {
+            s.projects = loaded.projects;
+            s.scan_cache = loaded.scan_map;
+            s.inspect.restore(loaded.info);
+            s.done_at = loaded.done_at;
+            s.scan_secs = loaded.scan_secs;
+        }
         s.request_scan();
     }
 }
@@ -1357,7 +1428,7 @@ mod scan_flow_tests {
         let (tx, rx) = channel();
         let walked = root.clone();
         std::thread::spawn(move || {
-            scan::scan(walked, tx, GitCache::default(), || {});
+            scan::scan(walked, tx, GitCache::default(), Arc::new(HashMap::new()), true, || {});
         });
         s.rx = Some(rx);
         // Long enough that a loaded machine still finishes: the walk is one tiny folder, but
@@ -1428,6 +1499,46 @@ mod scan_flow_tests {
             "the list grows as the scan runs: {:?}",
             seen
         );
+    }
+
+    #[test]
+    fn a_warm_scan_carries_unchanged_folders_forward() {
+        let root = std::env::temp_dir().join(format!("ps-warm-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("keep");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let root_str = root.to_string_lossy().to_string();
+        // A scan can send a row twice (once from the walk, then again with git facts), so
+        // take the last one, the way `drain` upserts a row in place.
+        let collect = |force: bool, cache: cache::ScanCache| -> model::Project {
+            let (tx, rx) = channel();
+            scan::scan(root.clone(), tx, GitCache::default(), cache, force, || {});
+            rx.into_iter()
+                .filter_map(|event| match event {
+                    ScanEvent::Project(p) => Some(*p),
+                    _ => None,
+                })
+                .last()
+                .expect("the folder was reported")
+        };
+
+        // First scan measures the folder from disk.
+        let cold = collect(true, Arc::new(HashMap::new()));
+        assert_eq!(cold.name, "keep");
+        let mut cached = cold;
+        cached.bytes = 999_999; // a value only the cache could have produced
+        let map = cache::scan_map(&root_str, std::slice::from_ref(&cached));
+
+        // Nothing changed, so the warm scan must reuse the cached row instead of walking.
+        let warm = collect(false, map.clone());
+        assert_eq!(warm.bytes, 999_999, "the unchanged folder came from the cache");
+
+        // An explicit rescan ignores the cache and measures the folder again.
+        let forced = collect(true, map);
+        assert_ne!(forced.bytes, 999_999, "Ctrl+R re-reads the folder");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

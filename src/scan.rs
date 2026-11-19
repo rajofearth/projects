@@ -514,18 +514,21 @@ pub fn list_projects(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Full scan of `root`. The walk and git run concurrently; results stream once both finish.
-/// `git_cache` carries facts between scans so rescans skip the history work. Runs on its own
-/// thread.
+/// Scan of `root`. The walk and git run concurrently; results stream once both finish.
+/// Folders whose cheap fingerprint still matches the last scan are carried over from `cache`
+/// untouched, so an ordinary startup only measures what actually changed. `force` (Ctrl+R)
+/// ignores the cache and measures everything. Runs on its own thread.
 pub fn scan(
     root: PathBuf,
     tx: Sender<ScanEvent>,
     git_cache: GitCache,
+    cache: crate::cache::ScanCache,
+    force: bool,
     wake: impl Fn() + Send + Sync + 'static,
 ) {
     let started = Instant::now();
-    let dirs = list_projects(&root);
-    if dirs.is_empty() {
+    let all_dirs = list_projects(&root);
+    if all_dirs.is_empty() {
         let _ = tx.send(ScanEvent::Failed(format!(
             "no folders under {}",
             root.display()
@@ -533,121 +536,147 @@ pub fn scan(
         wake();
         return;
     }
-    let _ = tx.send(ScanEvent::Start { total: dirs.len() });
+    let _ = tx.send(ScanEvent::Start { total: all_dirs.len() });
+
+    // Reuse every folder whose fingerprint is unchanged, then walk only the rest. Both kinds
+    // still send a row so the list and its progress count describe the whole root.
+    let mut refresh: Vec<String> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for d in &all_dirs {
+        let name = d
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let fp = crate::cache::fingerprint(d);
+        let reuse = !force && cache.get(&name).is_some_and(|(old, _)| *old == fp);
+        if reuse {
+            if let Some((_, project)) = cache.get(&name) {
+                let _ = tx.send(ScanEvent::Project(Box::new(project.clone())));
+            }
+        } else {
+            refresh.push(name);
+            dirs.push(d.clone());
+        }
+    }
     wake();
 
-    std::thread::scope(|scope| {
-        // Git facts: repos round-robined over 8 workers.
-        let git_results: std::sync::Arc<std::sync::Mutex<Vec<Option<GitFacts>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(
-                (0..dirs.len()).map(|_| None).collect(),
-            ));
-        let git_handle = {
-            let git_results = git_results.clone();
-            let cache = git_cache.clone();
-            let dirs = dirs.clone();
-            scope.spawn(move || {
-                let repos: Vec<(usize, PathBuf)> = dirs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| d.join(".git").exists())
-                    .map(|(i, d)| (i, d.clone()))
-                    .collect();
-                let workers = 4.min(repos.len().max(1));
-                let locals: Vec<(Vec<(usize, GitFacts)>, HashMap<PathBuf, GitFactsKeyed>)> =
-                    std::thread::scope(|s| {
-                        let mut handles = Vec::new();
-                        for w in 0..workers {
-                            let mine: Vec<(usize, PathBuf)> = repos
-                                .iter()
-                                .enumerate()
-                                .filter(|(j, _)| j % workers == w)
-                                .map(|(_, (i, d))| (*i, d.clone()))
-                                .collect();
-                            let cache = cache.clone();
-                            handles.push(s.spawn(move || {
-                                enter_background_priority();
-                                // Seed from the shared cache so rescans skip the history
-                                // work; entries written this scan land in `local` and are
-                                // merged back when the workers join.
-                                let mut local: HashMap<PathBuf, GitFactsKeyed> =
-                                    cache.lock().unwrap().clone();
-                                let mut out: Vec<(usize, GitFacts)> =
-                                    Vec::with_capacity(mine.len());
-                                for (i, d) in mine {
-                                    out.push((i, git_facts(&d, &mut local)));
-                                }
-                                (out, local)
-                            }));
+    if !dirs.is_empty() {
+        std::thread::scope(|scope| {
+            // Git facts: repos round-robined over 4 workers.
+            let git_results: std::sync::Arc<std::sync::Mutex<Vec<Option<GitFacts>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    (0..dirs.len()).map(|_| None).collect(),
+                ));
+            let git_handle = {
+                let git_results = git_results.clone();
+                let cache = git_cache.clone();
+                let dirs = dirs.clone();
+                scope.spawn(move || {
+                    let repos: Vec<(usize, PathBuf)> = dirs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.join(".git").exists())
+                        .map(|(i, d)| (i, d.clone()))
+                        .collect();
+                    let workers = 4.min(repos.len().max(1));
+                    let locals: Vec<(Vec<(usize, GitFacts)>, HashMap<PathBuf, GitFactsKeyed>)> =
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            for w in 0..workers {
+                                let mine: Vec<(usize, PathBuf)> = repos
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(j, _)| j % workers == w)
+                                    .map(|(_, (i, d))| (*i, d.clone()))
+                                    .collect();
+                                let cache = cache.clone();
+                                handles.push(s.spawn(move || {
+                                    enter_background_priority();
+                                    // Seed from the shared cache so rescans skip the history
+                                    // work; entries written this scan land in `local` and are
+                                    // merged back when the workers join.
+                                    let mut local: HashMap<PathBuf, GitFactsKeyed> =
+                                        cache.lock().unwrap().clone();
+                                    let mut out: Vec<(usize, GitFacts)> =
+                                        Vec::with_capacity(mine.len());
+                                    for (i, d) in mine {
+                                        out.push((i, git_facts(&d, &mut local)));
+                                    }
+                                    (out, local)
+                                }));
+                            }
+                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                        });
+                    let mut results = git_results.lock().unwrap();
+                    let mut cache = cache.lock().unwrap();
+                    for (out, local) in locals {
+                        for (i, facts) in out {
+                            results[i] = Some(facts);
                         }
-                        handles.into_iter().map(|h| h.join().unwrap()).collect()
-                    });
-                let mut results = git_results.lock().unwrap();
-                let mut cache = cache.lock().unwrap();
-                for (out, local) in locals {
-                    for (i, facts) in out {
-                        results[i] = Some(facts);
+                        cache.extend(local);
                     }
-                    cache.extend(local);
-                }
-            })
-        };
-        // A row per project, the moment its walk finishes. Git runs alongside, so a row
-        // usually lands without history facts and gets them patched in once git catches up:
-        // the window fills while the scan runs instead of after it.
-        let send_row = |i: usize, agg: &Agg, facts: Option<GitFacts>| {
-            let dir = &dirs[i];
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let (cat, stack) = classify(dir, agg);
-            let mut langs: Vec<(String, u64)> =
-                agg.langs.iter().map(|(l, n)| (l.to_string(), *n)).collect();
-            langs.sort_by(|a, b| b.1.cmp(&a.1));
-            langs.truncate(8);
-            let facts = facts.unwrap_or_default();
-            let project = Project {
-                name,
-                cat,
-                stack,
-                bytes: agg.bytes,
-                files: agg.files,
-                loc: agg.loc,
-                src: agg.src,
-                nm: agg.nm,
-                target: agg.target,
-                other: agg.other,
-                langs,
-                git: facts.repo,
-                commits: facts.commits,
-                days: facts.days,
-                dirty: facts.dirty,
+                })
             };
-            let _ = tx.send(ScanEvent::Project(Box::new(project)));
-            wake();
-        };
-        // Which rows were sent before git knew anything about them.
-        let waiting: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-        let on_project = |i: usize, agg: Agg| {
-            let facts = git_results.lock().unwrap()[i].clone();
-            if facts.is_none() {
-                waiting.lock().unwrap().push(i);
+            // A row per changed project, the moment its walk finishes. Git runs alongside, so
+            // a row usually lands without history facts and gets them patched in once git
+            // catches up: the window fills while the scan runs instead of after it.
+            let send_row = |i: usize, agg: &Agg, facts: Option<GitFacts>| {
+                let dir = &dirs[i];
+                let name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let (cat, stack) = classify(dir, agg);
+                let mut langs: Vec<(String, u64)> =
+                    agg.langs.iter().map(|(l, n)| (l.to_string(), *n)).collect();
+                langs.sort_by(|a, b| b.1.cmp(&a.1));
+                langs.truncate(8);
+                let facts = facts.unwrap_or_default();
+                let project = Project {
+                    name,
+                    cat,
+                    stack,
+                    bytes: agg.bytes,
+                    files: agg.files,
+                    loc: agg.loc,
+                    src: agg.src,
+                    nm: agg.nm,
+                    target: agg.target,
+                    other: agg.other,
+                    langs,
+                    git: facts.repo,
+                    commits: facts.commits,
+                    days: facts.days,
+                    dirty: facts.dirty,
+                };
+                let _ = tx.send(ScanEvent::Project(Box::new(project)));
+                wake();
+            };
+            // Which rows were sent before git knew anything about them.
+            let waiting: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            let on_project = |i: usize, agg: Agg| {
+                let facts = git_results.lock().unwrap()[i].clone();
+                if facts.is_none() {
+                    waiting.lock().unwrap().push(i);
+                }
+                send_row(i, &agg, facts);
+            };
+            // The walk, on its own threads, concurrent with git; join git before reading its
+            // results, or the patch below would race the writers.
+            let aggs = walk_all(&dirs, &on_project);
+            git_handle.join().unwrap();
+            let git_all = std::sync::Arc::try_unwrap(git_results)
+                .map(|m| m.into_inner().unwrap())
+                .unwrap_or_else(|a| std::mem::take(&mut a.lock().unwrap()));
+            // Rows that landed before their history was read get it now, in place.
+            for i in waiting.into_inner().unwrap() {
+                send_row(i, &aggs[i], git_all[i].clone());
             }
-            send_row(i, &agg, facts);
-        };
-        // The walk, on its own threads, concurrent with git; join git before reading its
-        // results, or the patch below would race the writers.
-        let aggs = walk_all(&dirs, &on_project);
-        git_handle.join().unwrap();
-        let git_all = std::sync::Arc::try_unwrap(git_results)
-            .map(|m| m.into_inner().unwrap())
-            .unwrap_or_else(|a| std::mem::take(&mut a.lock().unwrap()));
-        // Rows that landed before their history was read get it now, in place.
-        for i in waiting.into_inner().unwrap() {
-            send_row(i, &aggs[i], git_all[i].clone());
-        }
-    });
+        });
+    }
+    if !refresh.is_empty() {
+        let _ = tx.send(ScanEvent::Reinspect(refresh));
+    }
     let _ = tx.send(ScanEvent::Done {
         seconds: started.elapsed().as_secs_f64(),
     });
@@ -872,7 +901,7 @@ fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -
 
 /// Non-Windows fallback: plain recursive traversal, same accounting.
 #[cfg(not(windows))]
-fn walk_all(dirs: &[PathBuf]) -> Vec<Agg> {
+fn walk_all(dirs: &[PathBuf], on_project: &(dyn Fn(usize, Agg) + Send + Sync)) -> Vec<Agg> {
     fn rec(dir: &Path, proj: usize, bucket: Bucket, aggs: &mut Vec<Agg>) {
         let Ok(rd) = fs::read_dir(dir) else { return };
         for e in rd.flatten() {
