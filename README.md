@@ -66,7 +66,7 @@ To uninstall, use Settings, Apps, Projects. That removes the exe, the shortcut a
 
 ## Updates
 
-An installed copy checks the repository's latest GitHub release six seconds after it opens and every four hours after that. A newer version downloads in the background to `%LOCALAPPDATA%\Projects\updates`. The sidebar then shows the version and a Restart button, and Settings, Updates lists what changed. If you close Projects instead of restarting, the update installs the next time Projects opens, before its window appears.
+An installed copy checks the repository's latest GitHub release six seconds after it opens and every four hours after that. A check that fails is tried again after two minutes, then ten, so a connection that isn't up yet when Projects opens doesn't leave an error on screen until the next four-hour check. A newer version downloads in the background to `%LOCALAPPDATA%\Projects\updates`. The sidebar then shows the version and a Restart button, and Settings, Updates lists what changed. If you close Projects instead of restarting, the update installs the next time Projects opens, before its window appears.
 
 Each exe on a release has a `.sig` file beside it, such as `projects-windows-x64.exe.sig`: the version, the exe's SHA-256, and an Ed25519 signature over both. The app checks the signature against the public key compiled into it (`src/update/verify.rs`) before it downloads the exe, checks the downloaded bytes against the SHA-256, and checks both again just before installing. A release whose files were swapped, or an older signed exe relabelled as a newer version, is refused.
 
