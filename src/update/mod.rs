@@ -32,6 +32,9 @@ use version::Version;
 
 const FIRST_CHECK_SECS: f64 = 6.0;
 const CHECK_EVERY_SECS: f64 = 4.0 * 3600.0;
+/// A failed check or download is tried again after two minutes, then ten, so a connection that
+/// isn't up yet when Projects opens recovers on its own; after that the four-hour gap returns.
+const RETRY_SECS: [f64; 2] = [120.0, 600.0];
 /// How long the old exe waits for the new one to finish starting.
 const WATCH_SECS: u64 = 90;
 
@@ -359,6 +362,8 @@ pub struct Updater {
     dir: Option<PathBuf>,
     rx: Option<Receiver<Msg>>,
     next_check: f64,
+    /// Checks or downloads that failed since the last good one; picks the retry gap.
+    failures: u8,
     cleaned: bool,
 }
 
@@ -394,7 +399,7 @@ impl Updater {
                 clear_staged(d);
             }
         }
-        Updater { state, exe, dir, rx: None, next_check: FIRST_CHECK_SECS, cleaned: false }
+        Updater { state, exe, dir, rx: None, next_check: FIRST_CHECK_SECS, failures: 0, cleaned: false }
     }
 
     /// The fixture's updater: off, with a reason that reads naturally in screenshots.
@@ -425,7 +430,6 @@ impl Updater {
         if !auto || clock < self.next_check || !self.state.can_check() {
             return false;
         }
-        self.next_check = clock + CHECK_EVERY_SECS;
         self.check_now(waker)
     }
 
@@ -473,7 +477,20 @@ impl Updater {
         });
     }
 
-    pub fn drain(&mut self, waker: Option<&Waker>) -> Drained {
+    /// Sets when the next automatic check is due: the regular gap after a good result, a short
+    /// one after a failure, so a dropped connection doesn't wait four hours for a retry.
+    fn schedule_after(&mut self, clock: f64, ok: bool) {
+        if ok {
+            self.failures = 0;
+            self.next_check = clock + CHECK_EVERY_SECS;
+            return;
+        }
+        let gap = RETRY_SECS.get(self.failures as usize).copied().unwrap_or(CHECK_EVERY_SECS);
+        self.failures = self.failures.saturating_add(1);
+        self.next_check = clock + gap;
+    }
+
+    pub fn drain(&mut self, clock: f64, waker: Option<&Waker>) -> Drained {
         let mut out = Drained::default();
         let now = crate::saved::now_unix();
         while let Some(rx) = &self.rx {
@@ -484,6 +501,7 @@ impl Updater {
                     self.rx = None;
                     if self.state.busy() {
                         self.state.check_finished(Err("the update thread stopped".into()), now);
+                        self.schedule_after(clock, false);
                         out.changed = true;
                     }
                     break;
@@ -493,6 +511,7 @@ impl Updater {
             match msg {
                 Msg::Checked(r) => {
                     self.rx = None;
+                    self.schedule_after(clock, r.is_ok());
                     if let Next::Download(rel) = self.state.check_finished(r, now) {
                         self.start_download(rel, waker);
                     }
@@ -500,6 +519,7 @@ impl Updater {
                 Msg::Progress(done, total) => self.state.progress(done, total),
                 Msg::Downloaded(r) => {
                     self.rx = None;
+                    self.schedule_after(clock, r.is_ok());
                     if let Next::Announce(v) = self.state.download_finished(r) {
                         out.ready = Some(v);
                     }
@@ -519,5 +539,25 @@ impl Updater {
             clear_staged(&dir);
             self.state.ready = None;
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failures_retry_soon_then_return_to_the_regular_gap() {
+        let mut u = Updater::new(&Mode::Portable("test".into()));
+        u.schedule_after(100.0, false);
+        assert_eq!(u.next_check, 100.0 + RETRY_SECS[0]);
+        u.schedule_after(200.0, false);
+        assert_eq!(u.next_check, 200.0 + RETRY_SECS[1]);
+        u.schedule_after(900.0, false);
+        assert_eq!(u.next_check, 900.0 + CHECK_EVERY_SECS, "the short gaps are spent");
+        u.schedule_after(1000.0, true);
+        assert_eq!(u.next_check, 1000.0 + CHECK_EVERY_SECS);
+        u.schedule_after(1000.0, false);
+        assert_eq!(u.next_check, 1000.0 + RETRY_SECS[0], "a good check resets the backoff");
     }
 }

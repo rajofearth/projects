@@ -2,6 +2,24 @@
 //! and redirects that may not drop from HTTPS to HTTP. No TLS library ships in the exe, and
 //! certificate revocation and root updates come with Windows Update.
 
+/// What a WinINet error means in words. Windows keeps no text for these codes in its message
+/// table (`FormatMessageW` answers 317), so an `io::Error`'s Display prints the number twice.
+#[cfg(windows)]
+fn reason(code: i32) -> Option<&'static str> {
+    Some(match code {
+        12002 => "GitHub didn't answer in time; check the connection and try again",
+        12007 => "GitHub's address couldn't be found; check the internet connection",
+        12029 => "couldn't connect to GitHub; a firewall, VPN or proxy may be blocking it",
+        12030 | 12031 => "the connection to GitHub dropped; try again",
+        12037 => "Windows thinks GitHub's certificate has expired; check the date and time",
+        12038 => "GitHub's certificate is for a different name; something may be intercepting the connection",
+        12057 => "Windows couldn't check GitHub's certificate; check the date and time",
+        12157 | 12175 => "the encrypted connection to GitHub failed; a proxy or antivirus may be intercepting it",
+        12169 => "Windows rejected GitHub's certificate; something may be intercepting the connection",
+        _ => return None,
+    })
+}
+
 /// Streams the body of `url` to `on_chunk`, with the Content-Length when the server sent one.
 /// Fails on anything but a 200, and once more than `max_bytes` arrive.
 #[cfg(windows)]
@@ -25,7 +43,12 @@ pub fn get(
         s.encode_utf16().chain(Some(0)).collect()
     }
     fn fail(what: &str) -> String {
-        format!("{what} failed ({})", std::io::Error::last_os_error())
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error().and_then(reason) {
+            Some(why) => why.to_string(),
+            // Keep the raw error for the codes not worth a sentence, so bug reports stay useful.
+            None => format!("{what} failed ({e})"),
+        }
     }
     fn open(h: *mut c_void, what: &str) -> Result<Handle, String> {
         if h.is_null() { Err(fail(what)) } else { Ok(Handle(h)) }
@@ -145,6 +168,16 @@ pub fn get_text(url: &str, accept: &str, max_bytes: u64) -> Result<String, Strin
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn wininet_codes_read_as_sentences() {
+        assert!(super::reason(12002).unwrap().contains("didn't answer in time"));
+        assert!(super::reason(12029).unwrap().contains("firewall"));
+        assert!(super::reason(12175).unwrap().contains("encrypted connection"));
+        // Codes with real system text keep their raw error instead.
+        assert_eq!(super::reason(5), None);
+    }
+
     /// Reaches GitHub over the network; run with `cargo test -- --ignored`.
     #[test]
     #[ignore]

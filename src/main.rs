@@ -586,7 +586,7 @@ fn poll(s: &mut State, clock: f64, tx: &mut rune::Tx) -> bool {
         if s.updates.tick(clock, s.saved.auto_update, waker.as_ref()) {
             changed = true;
         }
-        let drained = s.updates.drain(waker.as_ref());
+        let drained = s.updates.drain(clock, waker.as_ref());
         if let Some(v) = drained.ready {
             s.toast(format!("Version {v} downloaded. Restart Projects to install it"));
         }
